@@ -1,0 +1,19 @@
+{
+  "model": "local-gateway",
+  "instructions": "你是一个简洁助手。",
+  "input": "现在 Asia/Shanghai 时间是多少？",
+  "tools": [
+    {
+      "type": "function",
+      "name": "get_current_time",
+      "description": "获取指定时区当前时间",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "timezone": {"type": "string"}
+        },
+        "required": ["timezone"]
+      }
+    }
+  ]
+}

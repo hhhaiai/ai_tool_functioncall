@@ -1,0 +1,21 @@
+{
+  "model": "local-gateway",
+  "max_tokens": 1024,
+  "system": "你是一个简洁助手。",
+  "messages": [
+    {"role": "user", "content": "计算 (8 + 9) * 7"}
+  ],
+  "tools": [
+    {
+      "name": "calculator",
+      "description": "执行安全的数学四则运算",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "expression": {"type": "string"}
+        },
+        "required": ["expression"]
+      }
+    }
+  ]
+}

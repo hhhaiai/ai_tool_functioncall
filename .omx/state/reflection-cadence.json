@@ -1,0 +1,7 @@
+{
+  "last_reflection_at": "2026-05-14T14:22:11.213041+00:00",
+  "reason": "user_requested_record_into_readme",
+  "current_objective": "把运行和测试方法直接记录到 README.md，而不只是放在 docs 链接里。",
+  "source_of_truth": "latest user message and current README/docs/RUNNING_AND_TESTING.md",
+  "style_adjustment": "直接同步 README，保持可执行命令和完整测试入口。"
+}

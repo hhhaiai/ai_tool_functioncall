@@ -1,0 +1,23 @@
+{
+  "model": "local-gateway",
+  "messages": [
+    {"role": "user", "content": "请计算 123 * 456 + 7，并给出结果。"}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "calculator",
+        "description": "执行安全的数学四则运算",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "expression": {"type": "string"}
+          },
+          "required": ["expression"]
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto"
+}
