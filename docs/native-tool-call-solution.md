@@ -46,22 +46,21 @@
    - 服务端编排模式：网关自己执行外部工具，再用标准 tool-result 协议回传给模型，循环直到最终回答。
 6. 如果后端不支持或没有返回真实 tool call，直接失败，不伪装成功。
 
-### 1.2 不能真正实现的
+### 1.2 文本级工具调用的处理
 
 如果一个上游 API 只支持普通文本对话，完全不支持 native `tools/tool_calls/tool_use`，那么：
 
 - 不能宣称它支持原生 function call。
 - 不能用 prompt JSON 冒充 `tool_calls`。
-- 不能给 Claude Code / Codex 返回“看起来像工具调用但不是模型原生决策”的结果。
+- 不能给 Claude Code / Codex 返回”看起来像工具调用但不是模型原生决策”的结果。
 
-最多只能把它标记为：
+**但是**，Gateway 可以识别模型文本输出中的 Claude-Code-like 标记（如 `<function=Glob>`），执行真实工具，并把结果回填给上游继续生成最终答案。这是真实工具执行，不是伪造。
 
-```text
-chat_only: true
-native_tools: false
-```
-
-然后用于普通对话，不能进入 native tools 路由。
+处理策略：
+1. 优先使用原生 tool_calls/tool_use（如果上游支持）
+2. 如果原生不支持，解析文本中的工具调用标记
+3. 执行真实工具并回填结果
+4. 循环直到最终回答
 
 ---
 
@@ -490,20 +489,22 @@ providers:
 ```text
 请求包含 tools 吗？
   ├─否 → 可走普通 chat provider
-  └─是 → 必须找 native_tools=true 的 provider
-          ├─找不到 → 直接 400/502，说明没有 native tools provider
-          └─找到 → 转发 native tools 请求
-                    ├─返回真实 tool call → 透传/编排
-                    ├─返回最终文本 → 如果 tool_choice=auto，可接受
-                    └─forced tool_choice 但无 tool call → 失败
+  └─是 → 检查 upstream 是否支持原生 tools
+          ├─支持 → 转发 native tools 请求
+          │        ├─返回真实 tool call → 透传/编排
+          │        ├─返回最终文本 → 如果 tool_choice=auto，可接受
+          │        └─forced tool_choice 但无 tool call → 失败
+          └─不支持 → 启用文本级工具调用解析
+                     ├─解析到 Claude-Code-like 标记 → 执行真实工具并回填
+                     └─未解析到 → 返回普通文本回答
 ```
 
 关键点：
 
 - `tool_choice=auto` 时，模型可以选择不调用工具。
 - `tool_choice=required` 或指定工具时，必须返回工具调用，否则失败。
-- provider 标注 `native_tools=false` 时，不能接 tools 请求。
-- provider 标注 `native_tools=unknown` 时，先 probe，不能直接上线。
+- 当上游不支持原生 tools 时，Gateway 可以解析文本中的工具调用标记并执行真实工具。
+- 文本级工具调用解析是 fallback 机制，不是伪造。
 
 ---
 
@@ -514,13 +515,13 @@ providers:
 对外提供 OpenAI-compatible base URL：
 
 ```text
-http://127.0.0.1:8787/v1
+http://127.0.0.1:8885/v1
 ```
 
 客户端调用：
 
 ```bash
-curl http://127.0.0.1:8787/v1/chat/completions \
+curl http://127.0.0.1:8885/v1/chat/completions \
   -H 'Authorization: Bearer local-key' \
   -H 'Content-Type: application/json' \
   -d '{
@@ -555,7 +556,7 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 对外提供 Anthropic-compatible `/v1/messages`：
 
 ```bash
-curl http://127.0.0.1:8787/v1/messages \
+curl http://127.0.0.1:8885/v1/messages \
   -H 'x-api-key: local-key' \
   -H 'anthropic-version: 2023-06-01' \
   -H 'content-type: application/json' \
@@ -711,17 +712,17 @@ tools:
 
 ```bash
 # Chat Completions native probe
-curl http://127.0.0.1:8787/v1/native-tools/probe \
+curl http://127.0.0.1:8885/v1/native-tools/probe \
   -H 'Content-Type: application/json' \
   -d '{"path":"/v1/chat/completions","model":"目标模型"}'
 
 # Responses native probe
-curl http://127.0.0.1:8787/v1/native-tools/probe \
+curl http://127.0.0.1:8885/v1/native-tools/probe \
   -H 'Content-Type: application/json' \
   -d '{"path":"/v1/responses","model":"目标模型"}'
 
 # Anthropic Messages native probe
-curl http://127.0.0.1:8787/v1/native-tools/probe \
+curl http://127.0.0.1:8885/v1/native-tools/probe \
   -H 'Content-Type: application/json' \
   -d '{"path":"/v1/messages","model":"目标模型"}'
 ```
@@ -806,5 +807,5 @@ curl http://127.0.0.1:8787/v1/native-tools/probe \
 1. 对 Claude Code / Codex：默认用 Native Passthrough。
 2. 对业务后端：可选 Server-side Native Tool Orchestration。
 3. 对每个 provider/model/endpoint：必须 probe 后才能标记 native tools 可用。
-4. 对不支持 tools 的普通 chat API：只做普通对话，不允许进入 tools 路由。
+4. 对不支持 tools 的普通 chat API：启用文本级工具调用解析作为 fallback。
 5. 所有失败都显式返回，不假装支持。

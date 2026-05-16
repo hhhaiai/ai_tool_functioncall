@@ -43,10 +43,16 @@ Settings UI
 
 ## 验证
 
-当前已有 native-first/fail-fast 方向的基础测试：
+当前推荐用严格验证脚本一次性覆盖语法、单元、安全、功能 smoke 和并发压力：
 
 ```bash
-python3 -m py_compile src/toolcall_gateway.py tests/test_gateway.py
+./scripts/mimo_gateway.sh verify
+```
+
+也可以只跑基础回归：
+
+```bash
+python3 -m py_compile src/toolcall_gateway.py src/gateway_app.py src/gateway_builtin_tools.py tests/test_gateway.py tests/integration/*.py
 python3 -m unittest discover -s tests -v
 ```
 
@@ -63,26 +69,74 @@ HTTP Action connector 已可把配置里的 HTTP endpoint 暴露为真实 tool/f
 ```text
 /admin/http-actions.json
 ```
----
 
-## 快速运行
+## Claude Code / Codex / OpenCode 本地网关一键启动
 
-进入项目目录：
+公开版本不写入测试地址和真实 key；本地用环境变量或忽略的 `.gateway_service.json` 配置：
+
+```text
+UPSTREAM_BASE_URL=<YOUR_UPSTREAM_BASE_URL>
+UPSTREAM_API_KEY=<YOUR_UPSTREAM_API_KEY>
+UPSTREAM_MODEL=mimo-v2.5-pro
+DOWNSTREAM_API_KEY=local-gateway-key
+```
+
+当前只保留两个用户脚本：
+
+- `scripts/mimo_gateway.sh`：启动/停止本地 Gateway 服务 + Web 配置页面。默认监听 `0.0.0.0:8885`，本机客户端使用 `http://127.0.0.1:8885`。
+- `scripts/claude_m1.sh`：一键启动/复用 Gateway，等待 `/healthz`，然后按你的 `claude_m1` 环境变量启动 `/usr/local/bin/claude --dangerously-skip-permissions`。 优先读取本地忽略的 `.gateway_service.json` 中的下游 key 和模型；没有本地配置时才使用公开示例 `local-gateway-key`。
+
+启动本地 Gateway 服务：
 
 ```bash
 cd /Users/sanbo/Desktop/ai_tool_functioncall
+./scripts/mimo_gateway.sh start
 ```
 
-启动 Gateway：
+或者直接启动 Claude Code：
 
 ```bash
-python3 src/toolcall_gateway.py --host 127.0.0.1 --port 8787
+cd /Users/sanbo/Desktop/ai_tool_functioncall
+./scripts/claude_m1.sh
 ```
 
-管理 UI：
+`claude_m1.sh` 等价于下面这组环境变量，并固定使用 `127.0.0.1` 给本机客户端连接：
+
+```bash
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8885"
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+export ANTHROPIC_AUTH_TOKEN="local-gateway-key"
+export ANTHROPIC_API_KEY=""
+export ANTHROPIC_DEFAULT_OPUS_MODEL="mimo-v2.5-pro"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="mimo-v2.5-pro"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="mimo-v2.5-pro"
+export ANTHROPIC_MODEL="mimo-v2.5-pro"
+export ANTHROPIC_SMALL_FAST_MODEL="mimo-v2.5-pro"
+export ENABLE_LSP_TOOL=1
+/usr/local/bin/claude --dangerously-skip-permissions "$@"
+```
+
+服务脚本默认优先用 `screen + pidfile + healthz` 后台运行（无 screen 时回退 `nohup`）。
+
+如果 8885 被占用，脚本默认会停止旧监听进程后重新启动；如需手工换端口：
+
+```bash
+GATEWAY_PORT=8886 ./scripts/mimo_gateway.sh start
+GATEWAY_PORT=8886 ./scripts/claude_m1.sh
+```
+
+默认监听和下游 key：
 
 ```text
-http://127.0.0.1:8787/ui
+Base URL: http://127.0.0.1:8885
+API Key: local-gateway-key
+```
+
+管理与配置页面：
+
+```text
+http://127.0.0.1:8885/ui
+http://127.0.0.1:8885/client-config
 ```
 
 默认管理员：
@@ -91,20 +145,54 @@ http://127.0.0.1:8787/ui
 admin / admin
 ```
 
-默认下游 API Key：
+Web UI 当前支持：
 
-```text
-dev-gateway-key
+- 点击添加/编辑多个上游 API profile。
+- 勾选上游能力：协议、streaming、tool call、function call、parallel tool calls、识图、网络、网络检索、JSON schema。
+- 配置每个上游的路径映射：models / chat completions / responses / messages。
+- 添加多个下游 key，并限制 key 可访问的协议：models、chat completions、responses、messages、direct tools/functions。
+- 如果上游只支持 OpenAI `/v1/chat/completions`，Gateway 仍可让下游访问 `/v1/chat/completions`、`/v1/responses`、`/v1/messages`，内部统一转换到上游 chat completions。
+
+本地兼容请求示例：
+
+```bash
+curl http://127.0.0.1:8885/v1/models \
+  -H "Authorization: Bearer local-gateway-key"
+
+curl http://127.0.0.1:8885/v1/chat/completions \
+  -H "Authorization: Bearer local-gateway-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"mimo-v2.5-pro","messages":[{"role":"user","content":"Hello!"}]}'
+
+curl http://127.0.0.1:8885/v1/chat/completions \
+  -H "Authorization: Bearer local-gateway-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"mimo-v2.5-pro","messages":[{"role":"user","content":"Hello!"}],"stream":true}'
+
+curl http://127.0.0.1:8885/v1/responses \
+  -H "Authorization: Bearer local-gateway-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"mimo-v2.5-pro","input":[{"role":"user","content":"你好"}]}'
+
+curl http://127.0.0.1:8885/v1/messages \
+  -H "Authorization: Bearer local-gateway-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"mimo-v2.5-pro","messages":[{"role":"user","content":"Hello!"}],"max_tokens":100}'
 ```
 
-生产或长期使用前，请在 UI 中修改管理员密码，并新增正式下游 key。
+兼容点：
 
----
+- `/v1/messages`：Claude Code 主路径，支持 Anthropic `tool_use/tool_result`。
+- `/v1/messages/count_tokens`：本地估算，避免 Claude Code 预检查失败。
+- `/v1/models`：透传上游模型列表；旧 key 即使没有显式 `models` 协议，也允许模型发现。
+- 上游默认按 OpenAI chat completions 调用；responses/messages 下游请求会转换到上游 `/v1/chat/completions`。
+- 管理页面可配置上游 base/model/key、协议路由、timeout、token 上限、并发、识图/网络/tool calls/function calls/parallel tool calls 等能力开关。
+- 超长类/文件：`Read` 默认分块返回（默认 2000 行），返回里会提示下一次 `offset`；超大用户输入可走 context fan-out，启动脚本默认开启，`fanout_max_chunks=0` 表示不限制分片数量。
 
 ## 健康检查
 
 ```bash
-curl http://127.0.0.1:8787/healthz
+curl http://127.0.0.1:8885/healthz
 ```
 
 预期包含：
@@ -120,7 +208,7 @@ curl http://127.0.0.1:8787/healthz
 检查 UI：
 
 ```bash
-curl -u admin:admin -i http://127.0.0.1:8787/ui
+curl -u admin:admin -i http://127.0.0.1:8885/ui
 ```
 
 ---
@@ -136,6 +224,11 @@ Model: 默认模型
 Protocol: openai_chat / openai_responses / anthropic_messages / openai_compatible
 Tool Mode: orchestrate
 Tools Enabled: auto 或 on
+Timeout / Max Input Tokens / Max Output Tokens / Upstream Max Concurrency
+Capabilities: streaming / vision / network / tool calls / function calls / parallel tool calls / JSON schema
+Routes: models / chat_completions / responses / messages
+Gateway Runtime: max concurrent requests / queue timeout / tool timeout / unsupported tool recording
+Context Router: max input tokens / fanout chunk tokens / fanout max chunks / fanout max workers
 ```
 
 也可以通过环境变量启动：
@@ -144,25 +237,27 @@ Tools Enabled: auto 或 on
 UPSTREAM_BASE_URL="http://127.0.0.1:8000" \
 UPSTREAM_API_KEY="your-upstream-key" \
 UPSTREAM_MODEL="your-model" \
-python3 src/toolcall_gateway.py --host 127.0.0.1 --port 8787
+python3 src/toolcall_gateway.py --host 127.0.0.1 --port 8885
 ```
 
 默认配置文件：
 
 ```text
-.gateway_config.json
+.gateway_service.json
 ```
 
 ---
 
 ## 下游客户端接入
 
-Codex / Claude Code / DeepSeek-TUI / OpenCode / SDK 通用配置：
+Codex / Claude Code / DeepSeek-TUI / OpenCode / SDK 使用一键脚本时的通用配置：
 
 ```text
-Base URL: http://127.0.0.1:8787
-API Key: dev-gateway-key
+Base URL: http://127.0.0.1:8885
+API Key: local-gateway-key
 ```
+
+如果你手工改了 `GATEWAY_PORT` 或 `DOWNSTREAM_API_KEY`，客户端配置也要同步修改。
 
 支持接口：
 
@@ -170,18 +265,55 @@ API Key: dev-gateway-key
 /v1/chat/completions
 /v1/responses
 /v1/messages
+/v1/tools/call
+/v1/functions/call
+/tools/call
 ```
+
+协议转换：如果上游只有 OpenAI `/v1/chat/completions`，在 UI 里把 `Protocol` 设为 `openai_chat`，`Chat Completions Path` 设为 `/v1/chat/completions` 即可。下游仍然可以调用 Chat Completions / Responses / Anthropic Messages 三种协议，Gateway 会统一转成上游 Chat Completions 请求，并把结果转换回下游需要的响应格式。
+
+流式与非流式：
+
+- `stream: false`：Gateway 正常编排 tool/function-call 多轮调用后返回最终 JSON。
+- `stream: true` + `tool_mode=orchestrate`：Gateway 内部用非流式上游完成真实工具编排，再向下游输出对应协议的 SSE，避免伪造中间 tool event。
+- `stream: true` + `tool_mode=passthrough/native_passthrough/proxy`：直接透传上游 SSE，适合下游客户端主要以流式调用的场景。
+- 优先级：上游能稳定返回原生 `tool_calls` / `tool_use` 时使用上游原生协议；如果上游退化成文本 `<function=Glob>` / `<parameter=pattern>`，Gateway 会识别这种 Claude-Code-like 标记，调用本地真实工具，再把结果回填给上游继续生成最终答案。
+- 超长 Claude Code 请求会先做 compaction：移除下游巨大 tool schema / metadata / thinking / output_config，替换成 Gateway 精简 system 指令，再由 Gateway 重新暴露自己的工具，避免上游直接返回 “text too long”。
+
+直接 Tool / Function 调用：
+
+- `/v1/tools/call`、`/v1/functions/call`、`/tools/call` 可以不经过上游模型，直接调用 Gateway 真实工具 runtime。
+- 兼容常见输入形态：
+  - OpenAI function：`{"function":{"name":"calculator","arguments":"{\"expression\":\"1+1\"}"}}`
+  - Anthropic tool_use：`{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file":"README.md"}}`
+  - Gateway/MCP：`{"name":"mcp__server__tool","arguments":{...}}` 或 `{"tool_name":"Read","input":{...}}`
+- 返回同时带 `content`、`openai_chat`、`openai_responses`、`anthropic` 三种回填片段，方便 Claude Code / Codex / OpenCode / DeepSeek-TUI 直接接入。
+
+已尽量真实实现的内置工具：
+
+- 文件/代码：`Read`/`view`/`read_file`、`LS`、`Glob`、`Grep`/`file_search`、`Write`、`Edit`/`str_replace_editor`、`MultiEdit`、`NotebookEdit`、`apply_patch`。
+- 执行/编排：`Bash`/`exec_command`/`shell`、`multi_tool_use.parallel`、`update_plan`、`TodoWrite`、`ExitPlanMode`/`EnterPlanMode`。
+- 网络/资源：`WebFetch`/`web_fetch`、`WebSearch`/`web_search`、`view_image`。
+- MCP：`mcp__server__tool`、DeepSeek-TUI 风格 `mcp_server_tool`、`list_mcp_resources`、`list_mcp_resource_templates`、`read_mcp_resource`/`mcp_read_resource`、`mcp_get_prompt`。
+- 已实现常见 Agent/Skill/Memory/代码解释器兼容入口；仍需要外部 runtime 的能力（例如真实电脑控制 `click/type_text/press_key/scroll/computer_use`、图像生成等）会明确返回 `connector_required`，不要伪造成成功；建议通过 MCP 市场安装相应 MCP server 或配置 HTTP Action 补全。
+
+上下文分流：
+
+- 默认开启；也可在管理 UI 的 `Context Router / 分流压缩` 调整或关闭。
+- 超过 `Max Input Tokens` 且开启 `fanout` 时，Gateway 会把最后一条超大用户输入拆成多个子请求分别分析，再发起一次综合请求返回最终答案，适合“分析 N 个类 / 多文件内容后汇总”的场景。
+- 为避免重复执行有副作用工具，强制 `tool_choice` 的请求不会触发 fan-out；子请求会移除 tools，只做文本分析与综合。
+- fan-out 默认会再跑一次质量审查请求，要求“语义分析 -> 调用/证据检查 -> 反思调整 -> 最终结论”，避免只是机械拆分和简单汇总。
 
 认证方式：
 
 ```text
-Authorization: Bearer dev-gateway-key
+Authorization: Bearer local-gateway-key
 ```
 
 或：
 
 ```text
-x-api-key: dev-gateway-key
+x-api-key: local-gateway-key
 ```
 
 ---
@@ -191,8 +323,8 @@ x-api-key: dev-gateway-key
 ### OpenAI Chat Completions
 
 ```bash
-curl http://127.0.0.1:8787/v1/chat/completions \
-  -H 'authorization: Bearer dev-gateway-key' \
+curl http://127.0.0.1:8885/v1/chat/completions \
+  -H 'authorization: Bearer local-gateway-key' \
   -H 'content-type: application/json' \
   -d @examples/chat-with-tool.json
 ```
@@ -200,8 +332,8 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 ### OpenAI Responses
 
 ```bash
-curl http://127.0.0.1:8787/v1/responses \
-  -H 'authorization: Bearer dev-gateway-key' \
+curl http://127.0.0.1:8885/v1/responses \
+  -H 'authorization: Bearer local-gateway-key' \
   -H 'content-type: application/json' \
   -d @examples/responses-with-tool.json
 ```
@@ -209,10 +341,26 @@ curl http://127.0.0.1:8787/v1/responses \
 ### Anthropic Messages
 
 ```bash
-curl http://127.0.0.1:8787/v1/messages \
-  -H 'authorization: Bearer dev-gateway-key' \
+curl http://127.0.0.1:8885/v1/messages \
+  -H 'authorization: Bearer local-gateway-key' \
   -H 'content-type: application/json' \
   -d @examples/messages-with-tool.json
+```
+
+### 直接调用 Tool / Function
+
+```bash
+curl http://127.0.0.1:8885/v1/tools/call \
+  -H 'authorization: Bearer local-gateway-key' \
+  -H 'content-type: application/json' \
+  -d '{"function":{"name":"calculator","arguments":"{\"expression\":\"20+22\"}"},"call_id":"call_1"}'
+```
+
+```bash
+curl http://127.0.0.1:8885/v1/tools/call \
+  -H 'authorization: Bearer local-gateway-key' \
+  -H 'content-type: application/json' \
+  -d '{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file":"README.md"}}'
 ```
 
 如果没有配置上游 API，模型调用会返回上游连接错误，这是正常的。要做不依赖真实模型的完整闭环测试，看下面的 Fake Upstream 测试。
@@ -224,19 +372,19 @@ curl http://127.0.0.1:8787/v1/messages \
 查看 MCP 健康状态：
 
 ```bash
-curl -u admin:admin http://127.0.0.1:8787/admin/mcp-health.json
+curl -u admin:admin http://127.0.0.1:8885/admin/mcp-health.json
 ```
 
 主动 probe：
 
 ```bash
-curl -u admin:admin 'http://127.0.0.1:8787/admin/mcp-health.json?probe=1'
+curl -u admin:admin 'http://127.0.0.1:8885/admin/mcp-health.json?probe=1'
 ```
 
 查看 MCP tools：
 
 ```bash
-curl -u admin:admin http://127.0.0.1:8787/admin/mcp-tools.json
+curl -u admin:admin http://127.0.0.1:8885/admin/mcp-tools.json
 ```
 
 MCP 配置示例，可以填到 UI 的 MCP 配置区域：
@@ -322,7 +470,7 @@ PY
 查看配置：
 
 ```bash
-curl -u admin:admin http://127.0.0.1:8787/admin/http-actions.json
+curl -u admin:admin http://127.0.0.1:8885/admin/http-actions.json
 ```
 
 ---
@@ -398,10 +546,10 @@ PY
 cd /Users/sanbo/Desktop/ai_tool_functioncall
 UPSTREAM_BASE_URL='http://127.0.0.1:18080' \
 UPSTREAM_MODEL='fake-model' \
-python3 src/toolcall_gateway.py --host 127.0.0.1 --port 8787
+python3 src/toolcall_gateway.py --host 127.0.0.1 --port 8885
 ```
 
-如果 `.gateway_config.json` 已经保存过其他上游地址，请在 UI 里把 Base URL 改成：
+如果 `.gateway_service.json` 已经保存过其他上游地址，请在 UI 里把 Base URL 改成：
 
 ```text
 http://127.0.0.1:18080
@@ -410,8 +558,8 @@ http://127.0.0.1:18080
 ### 3. 发送请求
 
 ```bash
-curl http://127.0.0.1:8787/v1/chat/completions \
-  -H 'authorization: Bearer dev-gateway-key' \
+curl http://127.0.0.1:8885/v1/chat/completions \
+  -H 'authorization: Bearer local-gateway-key' \
   -H 'content-type: application/json' \
   -d '{
     "model": "fake-model",
@@ -437,28 +585,27 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 
 ## 自动化测试
 
-语法检查：
+一键严格验证：
 
 ```bash
-python3 -m py_compile src/toolcall_gateway.py tests/test_gateway.py
+./scripts/mimo_gateway.sh verify
 ```
 
-单元测试：
+分开执行：
 
 ```bash
+python3 -m py_compile src/toolcall_gateway.py src/gateway_app.py src/gateway_builtin_tools.py tests/test_gateway.py tests/integration/*.py
 python3 -m unittest discover -s tests -v
-```
-
-严格资源泄漏测试：
-
-```bash
 python3 -W error::ResourceWarning -m unittest discover -s tests -v
+./tests/integration/security_gateway_checks.py
+./tests/integration/smoke_gateway_tools.py
+./tests/integration/stress_gateway_concurrency.py --workers 16 --direct-tool-requests 32 --model-requests 1
 ```
 
-当前预期：
+当前单元测试预期：
 
 ```text
-Ran 17 tests
+以当前测试输出为准；严格验收重点是 `CORE TOOL ACCEPTANCE` 通过
 OK
 ```
 
@@ -467,13 +614,14 @@ OK
 ## 常用管理接口
 
 ```bash
-curl -u admin:admin http://127.0.0.1:8787/admin/config.json
-curl -u admin:admin http://127.0.0.1:8787/admin/stats.json
-curl -u admin:admin http://127.0.0.1:8787/admin/requests.json
-curl -u admin:admin http://127.0.0.1:8787/admin/failures.json
-curl -u admin:admin http://127.0.0.1:8787/admin/mcp-tools.json
-curl -u admin:admin http://127.0.0.1:8787/admin/mcp-health.json
-curl -u admin:admin http://127.0.0.1:8787/admin/http-actions.json
+curl -u admin:admin http://127.0.0.1:8885/admin/config.json
+curl -u admin:admin http://127.0.0.1:8885/admin/stats.json
+curl -u admin:admin http://127.0.0.1:8885/admin/requests.json
+curl -u admin:admin http://127.0.0.1:8885/admin/failures.json
+curl -u admin:admin http://127.0.0.1:8885/admin/tools.json
+curl -u admin:admin http://127.0.0.1:8885/admin/mcp-tools.json
+curl -u admin:admin http://127.0.0.1:8885/admin/mcp-health.json
+curl -u admin:admin http://127.0.0.1:8885/admin/http-actions.json
 ```
 
 ---
@@ -481,13 +629,27 @@ curl -u admin:admin http://127.0.0.1:8787/admin/http-actions.json
 ## 日志和数据文件
 
 ```text
-.gateway_config.json          # Gateway 配置
-.gateway_requests.jsonl       # 下游请求/响应留存
-.gateway_stats.json           # tool 调用统计
-.gateway_tool_failures.jsonl  # tool/function 失败记录
+.gateway_service.json        # Gateway 服务配置
+gateway_log.sqlite3         # 默认日志库；SQLite + WAL，保存请求、失败 tool、统计
+.gateway_requests.jsonl       # 旧日志格式，仅作为历史导入/兼容读取，不再默认写入
+.gateway_stats.json           # 旧统计格式，仅作为历史导入/兼容读取，不再默认写入
+.gateway_tool_failures.jsonl  # 旧失败日志格式，仅作为历史导入/兼容读取，不再默认写入
 ```
 
 ---
+
+### 文本工具调用容错
+
+Gateway 除了识别 `<function=Tool>` / `<parameter=name>`，也兼容弱上游漏掉 `<function=Bash>`、只输出多个 `<parameter=command>` 的情况。对常见空格丢失形态会做保守修复，例如：
+
+```text
+find/Users/... -typef -name '.py' | head-30
+find ... -exec wc -l{} + |sort -n| tail -20
+```
+
+会修复为可执行的 Bash 命令后再调用真实本地 shell。
+
+如果上游返回 “text too long / send it in parts / 内容过长” 这类上下文拒绝，Gateway 会触发 forced fan-out，把原始请求拆片分析、综合后再返回，避免直接把上游拒绝原样返回给 Claude Code。
 
 ## 常见问题
 
@@ -498,7 +660,7 @@ curl -u admin:admin http://127.0.0.1:8787/admin/http-actions.json
 正确示例：
 
 ```bash
--H 'authorization: Bearer dev-gateway-key'
+-H 'authorization: Bearer local-gateway-key'
 ```
 
 ### 返回 upstream connection failed
@@ -508,8 +670,8 @@ curl -u admin:admin http://127.0.0.1:8787/admin/http-actions.json
 检查：
 
 ```bash
-curl http://127.0.0.1:8787/healthz
-curl -u admin:admin http://127.0.0.1:8787/admin/config.json
+curl http://127.0.0.1:8885/healthz
+curl -u admin:admin http://127.0.0.1:8885/admin/config.json
 ```
 
 ### tool_not_found
@@ -519,7 +681,7 @@ curl -u admin:admin http://127.0.0.1:8787/admin/config.json
 查看失败：
 
 ```bash
-curl -u admin:admin http://127.0.0.1:8787/admin/failures.json
+curl -u admin:admin http://127.0.0.1:8885/admin/failures.json
 ```
 
 ### connector_required
@@ -536,3 +698,14 @@ curl -u admin:admin http://127.0.0.1:8787/admin/failures.json
 允许写入工具
 允许 Shell 工具
 ```
+
+### 无限上下文实现反思
+
+最新修正：forced fan-out 不能在综合阶段重新塞回完整原文，否则会二次触发上游 `too long`。现在综合/质量审查阶段只携带：
+
+- 原始问题的压缩摘要。
+- 预算内裁剪后的子分析结果。
+- forced 模式下更小的片段 token 预算。
+- 文本工具回退会把 `Read`/`FileInfo` 等路径参数从弱模型输出的 Markdown/正文噪声里提取成单一路径，避免把整段报告当文件名造成 `File name too long`。
+
+因此路径变为：超大请求或上游 too-long 拒绝 -> 小片段并发子分析 -> 预算内综合 -> 预算内质量审查 -> 最终答案。

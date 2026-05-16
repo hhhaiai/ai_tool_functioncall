@@ -1,0 +1,23 @@
+# Python / tooling caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+
+# macOS
+.DS_Store
+
+# Gateway runtime artifacts (generated locally; keep request history out of git)
+.gateway_*.json
+.gateway_requests.jsonl
+.gateway_tool_failures.jsonl
+gateway_log.sqlite3
+gateway_log.sqlite3-*
+.gateway_runtime/
+.gateway_smoke/
+.gateway_smoke_external_project/
+
+# Ad-hoc local logs
+/tmp/gateway-*.log
+/tmp/ai_tool_functioncall_*.log

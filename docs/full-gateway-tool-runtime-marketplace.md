@@ -337,8 +337,8 @@ def run_model_with_tools(path, request):
 
 关键要求：
 
-- 只解析协议级 tool call。
-- 不解析文本 fake tool call。
+- 优先解析协议级 tool call。
+- 当协议级 tool call 不存在时，解析文本中的 Claude-Code-like 标记（如 `<function=Glob>`），执行真实工具并回填结果。
 - 每轮可执行多个 tool call。
 - 支持并发执行 read-only 工具。
 - 写入/外部副作用工具需要权限策略。
@@ -545,7 +545,7 @@ GATEWAY_AUDIT_LOG
 - Tool execution registry
 - Tool not found error result
 - Non-streaming only
-- 不解析文本 fake function call
+- 文本级 tool call 解析（Claude-Code-like 标记）
 
 ### 11.2 P0：内置工具
 

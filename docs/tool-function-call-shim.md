@@ -67,17 +67,17 @@
 
 ```bash
 export UPSTREAM_BASE_URL="https://api.example.com"
-export UPSTREAM_API_KEY="sk-xxx"
+export UPSTREAM_API_KEY="<YOUR_UPSTREAM_API_KEY>"
 export UPSTREAM_MODEL="model-name"
 export UPSTREAM_KIND="chat"      # chat | responses | messages
 
-python3 src/toolcall_gateway.py --host 127.0.0.1 --port 8787
+python3 src/toolcall_gateway.py --host 127.0.0.1 --port 8885
 ```
 
 ## 通过本地网关调用 Chat Completions + tools
 
 ```bash
-curl http://127.0.0.1:8787/v1/chat/completions \
+curl http://127.0.0.1:8885/v1/chat/completions \
   -H 'Authorization: Bearer local-anything' \
   -H 'Content-Type: application/json' \
   -d @examples/chat-with-tool.json
@@ -86,7 +86,7 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 ## 通过本地网关调用 Responses + tools
 
 ```bash
-curl http://127.0.0.1:8787/v1/responses \
+curl http://127.0.0.1:8885/v1/responses \
   -H 'Authorization: Bearer local-anything' \
   -H 'Content-Type: application/json' \
   -d @examples/responses-with-tool.json
@@ -95,7 +95,7 @@ curl http://127.0.0.1:8787/v1/responses \
 ## 通过本地网关调用 Messages + tools
 
 ```bash
-curl http://127.0.0.1:8787/v1/messages \
+curl http://127.0.0.1:8885/v1/messages \
   -H 'x-api-key: local-anything' \
   -H 'anthropic-version: 2023-06-01' \
   -H 'Content-Type: application/json' \

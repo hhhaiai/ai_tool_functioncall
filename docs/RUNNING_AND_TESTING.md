@@ -20,16 +20,16 @@ python3 --version
 
 ## 2. 启动 Gateway
 
-默认端口：`8787`。
+默认端口：`8885`。
 
 ```bash
-python3 src/toolcall_gateway.py --host 127.0.0.1 --port 8787
+./scripts/mimo_gateway.sh start
 ```
 
 启动后访问管理 UI：
 
 ```text
-http://127.0.0.1:8787/ui
+http://127.0.0.1:8885/ui
 ```
 
 默认管理员账号：
@@ -41,7 +41,7 @@ admin / admin
 默认下游 API Key：
 
 ```text
-dev-gateway-key
+local-gateway-key
 ```
 
 > 第一次正式使用前，必须在 UI 修改管理员密码，并新增正式下游 key。
@@ -53,7 +53,7 @@ dev-gateway-key
 新开一个终端执行：
 
 ```bash
-curl http://127.0.0.1:8787/healthz
+curl http://127.0.0.1:8885/healthz
 ```
 
 预期包含：
@@ -69,7 +69,7 @@ curl http://127.0.0.1:8787/healthz
 检查 Admin UI：
 
 ```bash
-curl -u admin:admin -i http://127.0.0.1:8787/ui
+curl -u admin:admin -i http://127.0.0.1:8885/ui
 ```
 
 预期：
@@ -99,13 +99,13 @@ Tools Enabled: auto 或 on
 UPSTREAM_BASE_URL="http://127.0.0.1:8000" \
 UPSTREAM_API_KEY="your-upstream-key" \
 UPSTREAM_MODEL="your-model" \
-python3 src/toolcall_gateway.py --host 127.0.0.1 --port 8787
+./scripts/mimo_gateway.sh start
 ```
 
 配置文件默认保存到：
 
 ```text
-.gateway_config.json
+.gateway_service.json
 ```
 
 ---
@@ -117,8 +117,8 @@ python3 src/toolcall_gateway.py --host 127.0.0.1 --port 8787
 通用配置：
 
 ```text
-Base URL: http://127.0.0.1:8787
-API Key: dev-gateway-key
+Base URL: http://127.0.0.1:8885
+API Key: local-gateway-key
 ```
 
 支持接口：
@@ -132,13 +132,13 @@ API Key: dev-gateway-key
 认证方式任选一种：
 
 ```text
-Authorization: Bearer dev-gateway-key
+Authorization: Bearer local-gateway-key
 ```
 
 或：
 
 ```text
-x-api-key: dev-gateway-key
+x-api-key: local-gateway-key
 ```
 
 ---
@@ -148,8 +148,8 @@ x-api-key: dev-gateway-key
 ### 6.1 OpenAI Chat Completions
 
 ```bash
-curl http://127.0.0.1:8787/v1/chat/completions \
-  -H 'authorization: Bearer dev-gateway-key' \
+curl http://127.0.0.1:8885/v1/chat/completions \
+  -H 'authorization: Bearer local-gateway-key' \
   -H 'content-type: application/json' \
   -d @examples/chat-with-tool.json
 ```
@@ -157,8 +157,8 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 ### 6.2 OpenAI Responses
 
 ```bash
-curl http://127.0.0.1:8787/v1/responses \
-  -H 'authorization: Bearer dev-gateway-key' \
+curl http://127.0.0.1:8885/v1/responses \
+  -H 'authorization: Bearer local-gateway-key' \
   -H 'content-type: application/json' \
   -d @examples/responses-with-tool.json
 ```
@@ -166,8 +166,8 @@ curl http://127.0.0.1:8787/v1/responses \
 ### 6.3 Anthropic Messages
 
 ```bash
-curl http://127.0.0.1:8787/v1/messages \
-  -H 'authorization: Bearer dev-gateway-key' \
+curl http://127.0.0.1:8885/v1/messages \
+  -H 'authorization: Bearer local-gateway-key' \
   -H 'content-type: application/json' \
   -d @examples/messages-with-tool.json
 ```
@@ -212,7 +212,7 @@ Shell 工具默认关闭
 ```bash
 GATEWAY_ALLOW_WRITE_TOOLS=1 \
 GATEWAY_ALLOW_SHELL_TOOLS=1 \
-python3 src/toolcall_gateway.py --host 127.0.0.1 --port 8787
+./scripts/mimo_gateway.sh start
 ```
 
 ---
@@ -222,19 +222,19 @@ python3 src/toolcall_gateway.py --host 127.0.0.1 --port 8787
 ### 8.1 查看 MCP 健康状态
 
 ```bash
-curl -u admin:admin http://127.0.0.1:8787/admin/mcp-health.json
+curl -u admin:admin http://127.0.0.1:8885/admin/mcp-health.json
 ```
 
 主动 probe：
 
 ```bash
-curl -u admin:admin 'http://127.0.0.1:8787/admin/mcp-health.json?probe=1'
+curl -u admin:admin 'http://127.0.0.1:8885/admin/mcp-health.json?probe=1'
 ```
 
 ### 8.2 查看 MCP tools
 
 ```bash
-curl -u admin:admin http://127.0.0.1:8787/admin/mcp-tools.json
+curl -u admin:admin http://127.0.0.1:8885/admin/mcp-tools.json
 ```
 
 ### 8.3 MCP 配置示例
@@ -309,7 +309,7 @@ PY
 进入：
 
 ```text
-http://127.0.0.1:8787/ui
+http://127.0.0.1:8885/ui
 ```
 
 在 HTTP Actions 区域填入：
@@ -336,7 +336,7 @@ http://127.0.0.1:8787/ui
 保存后查看：
 
 ```bash
-curl -u admin:admin http://127.0.0.1:8787/admin/http-actions.json
+curl -u admin:admin http://127.0.0.1:8885/admin/http-actions.json
 ```
 
 预期包含：
@@ -422,10 +422,10 @@ PY
 cd /Users/sanbo/Desktop/ai_tool_functioncall
 UPSTREAM_BASE_URL='http://127.0.0.1:18080' \
 UPSTREAM_MODEL='fake-model' \
-python3 src/toolcall_gateway.py --host 127.0.0.1 --port 8787
+./scripts/mimo_gateway.sh start
 ```
 
-如果 `.gateway_config.json` 里已经保存了其他上游地址，请在 UI 里把 Base URL 改为：
+如果 `.gateway_service.json` 里已经保存了其他上游地址，请在 UI 里把 Base URL 改为：
 
 ```text
 http://127.0.0.1:18080
@@ -434,8 +434,8 @@ http://127.0.0.1:18080
 ### 10.3 发送请求
 
 ```bash
-curl http://127.0.0.1:8787/v1/chat/completions \
-  -H 'authorization: Bearer dev-gateway-key' \
+curl http://127.0.0.1:8885/v1/chat/completions \
+  -H 'authorization: Bearer local-gateway-key' \
   -H 'content-type: application/json' \
   -d '{
     "model": "fake-model",
@@ -463,30 +463,27 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 
 ## 11. 自动化测试
 
-### 11.1 语法检查
+### 11.1 一键严格验证
 
 ```bash
-python3 -m py_compile src/toolcall_gateway.py tests/test_gateway.py
+./scripts/mimo_gateway.sh verify
 ```
 
-### 11.2 单元测试
+该命令会依次执行：语法检查、单元测试、核心 tools acceptance、安全/auth guardrails、真实工具 smoke、并发压力。
+
+### 11.2 分开执行
 
 ```bash
+python3 -m py_compile src/toolcall_gateway.py src/gateway_app.py src/gateway_builtin_tools.py tests/test_gateway.py tests/integration/*.py
 python3 -m unittest discover -s tests -v
-```
-
-### 11.3 严格资源泄漏测试
-
-```bash
 python3 -W error::ResourceWarning -m unittest discover -s tests -v
+./tests/integration/tool_acceptance.py
+./tests/integration/security_gateway_checks.py
+./tests/integration/smoke_gateway_tools.py
+./tests/integration/stress_gateway_concurrency.py --workers 16 --direct-tool-requests 32 --model-requests 1
 ```
 
-当前预期：
-
-```text
-Ran 17 tests
-OK
-```
+当前预期以实际输出为准；核心验收必须看到 `CORE TOOL ACCEPTANCE` / `acceptance: tools` 通过。
 
 测试覆盖：
 
@@ -509,13 +506,13 @@ OK
 ## 12. 常用管理接口
 
 ```bash
-curl -u admin:admin http://127.0.0.1:8787/admin/config.json
-curl -u admin:admin http://127.0.0.1:8787/admin/stats.json
-curl -u admin:admin http://127.0.0.1:8787/admin/requests.json
-curl -u admin:admin http://127.0.0.1:8787/admin/failures.json
-curl -u admin:admin http://127.0.0.1:8787/admin/mcp-tools.json
-curl -u admin:admin http://127.0.0.1:8787/admin/mcp-health.json
-curl -u admin:admin http://127.0.0.1:8787/admin/http-actions.json
+curl -u admin:admin http://127.0.0.1:8885/admin/config.json
+curl -u admin:admin http://127.0.0.1:8885/admin/stats.json
+curl -u admin:admin http://127.0.0.1:8885/admin/requests.json
+curl -u admin:admin http://127.0.0.1:8885/admin/failures.json
+curl -u admin:admin http://127.0.0.1:8885/admin/mcp-tools.json
+curl -u admin:admin http://127.0.0.1:8885/admin/mcp-health.json
+curl -u admin:admin http://127.0.0.1:8885/admin/http-actions.json
 ```
 
 ---
@@ -523,19 +520,22 @@ curl -u admin:admin http://127.0.0.1:8787/admin/http-actions.json
 ## 13. 日志和数据文件
 
 ```text
-.gateway_config.json          # Gateway 配置
-.gateway_requests.jsonl       # 下游请求/响应留存
-.gateway_stats.json           # tool 调用统计
-.gateway_tool_failures.jsonl  # tool/function 失败记录
+.gateway_service.json        # Gateway 服务配置
+gateway_log.sqlite3         # 默认日志库；SQLite + WAL，保存请求、失败 tool、统计
+.gateway_requests.jsonl       # 旧日志格式，仅历史导入/兼容读取，不再默认写入
+.gateway_stats.json           # 旧统计格式，仅历史导入/兼容读取，不再默认写入
+.gateway_tool_failures.jsonl  # 旧失败日志，仅历史导入/兼容读取，不再默认写入
 ```
 
-这些文件用于：
+其中 `gateway_log.sqlite3` 是默认高频写入路径，用于：
 
 1. 复现下游请求。
 2. 分析 Codex / Claude Code / DeepSeek-TUI / OpenCode 的真实调用行为。
 3. 统计 tool 使用频次。
 4. 记录失败和不支持的 tool/function call。
 5. 后续接入 MCP/OpenAPI/action/plugin marketplace 并持续增强。
+
+隐藏 JSONL/JSON 文件只作为历史兼容读取，不作为默认写入路径。
 
 ---
 
@@ -548,7 +548,7 @@ curl -u admin:admin http://127.0.0.1:8787/admin/http-actions.json
 正确示例：
 
 ```bash
--H 'authorization: Bearer dev-gateway-key'
+-H 'authorization: Bearer local-gateway-key'
 ```
 
 ### 14.2 返回 upstream connection failed
@@ -558,8 +558,8 @@ curl -u admin:admin http://127.0.0.1:8787/admin/http-actions.json
 检查：
 
 ```bash
-curl http://127.0.0.1:8787/healthz
-curl -u admin:admin http://127.0.0.1:8787/admin/config.json
+curl http://127.0.0.1:8885/healthz
+curl -u admin:admin http://127.0.0.1:8885/admin/config.json
 ```
 
 ### 14.3 tool_not_found
@@ -569,7 +569,7 @@ curl -u admin:admin http://127.0.0.1:8787/admin/config.json
 查看失败：
 
 ```bash
-curl -u admin:admin http://127.0.0.1:8787/admin/failures.json
+curl -u admin:admin http://127.0.0.1:8885/admin/failures.json
 ```
 
 后续处理：
@@ -599,4 +599,18 @@ curl -u admin:admin http://127.0.0.1:8787/admin/failures.json
 ```bash
 GATEWAY_ALLOW_WRITE_TOOLS=1
 GATEWAY_ALLOW_SHELL_TOOLS=1
+```
+
+### Tool markup / too-long 回归
+
+已覆盖两类容易导致 Claude Code 卡住的回归：
+
+1. 只有 `<parameter=command>`、没有 `<function=Bash>` 的文本工具调用：Gateway 会推断为 Bash，并修复 `find/Users`、`-typef`、`wc -l{}`、`head-30` 等常见空格丢失问题。
+2. 上游返回 `Sorry, the text you sent is too long` 或类似上下文拒绝：Gateway 会 forced fan-out，而不是把拒绝文本当最终答案返回。
+
+对应单测：
+
+```bash
+python3 -m unittest discover -s tests -p test_gateway.py -k 'parameter_only_bash_markup_repairs_missing_spaces' -v
+python3 -m unittest discover -s tests -p test_gateway.py -k 'upstream_too_long_response_triggers_forced_fanout' -v
 ```
