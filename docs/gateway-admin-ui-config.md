@@ -18,16 +18,16 @@ http://127.0.0.1:8885/ui
 
 ```text
 username: admin
-password: admin
+password: admin（开发/测试用默认值，生产环境必须通过环境变量 GATEWAY_ADMIN_PASSWORD 修改）
 ```
 
 默认下游 API Key：
 
 ```text
-local-gateway-key
+无默认值，必须通过环境变量 GATEWAY_DOWNSTREAM_KEY 设置
 ```
 
-上线前必须在 UI 中修改管理员密码，并新增正式下游 key。
+> **重要**：生产环境必须设置 `GATEWAY_ADMIN_PASSWORD`（管理员密码）和 `GATEWAY_DOWNSTREAM_KEY`（下游 API Key）。开发/测试环境可使用默认值 `admin/admin`，但必须在上线前通过环境变量修改。
 
 ---
 
@@ -134,7 +134,7 @@ OpenCode
 
 ```bash
 curl http://127.0.0.1:8885/v1/chat/completions \
-  -H 'authorization: Bearer local-gateway-key' \
+  -H 'authorization: Bearer <GATEWAY_DOWNSTREAM_KEY>' \
   -H 'content-type: application/json' \
   -d '{"model":"m","messages":[{"role":"user","content":"hello"}]}'
 ```
@@ -142,7 +142,7 @@ curl http://127.0.0.1:8885/v1/chat/completions \
 也支持：
 
 ```text
-x-api-key: <key>
+x-api-key: <GATEWAY_DOWNSTREAM_KEY>
 ```
 
 UI 支持添加多个下游 key，每个 key 记录：

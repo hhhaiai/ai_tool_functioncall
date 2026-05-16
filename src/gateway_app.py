@@ -44,16 +44,35 @@ from typing import Any, Callable
 
 Json = dict[str, Any]
 
-SUPPORTED_PATHS = {"/v1/chat/completions", "/v1/responses", "/v1/messages"}
+# Lazy import for marketplace to avoid circular imports
+_marketplace = None
+
+
+def _get_marketplace():
+    global _marketplace
+    if _marketplace is None:
+        try:
+            from marketplace import list_mcp_marketplace
+            _marketplace = list_mcp_marketplace
+        except Exception:
+            _marketplace = lambda: []
+    return _marketplace
+
+SUPPORTED_PATHS = {
+    "/v1/chat/completions",
+    "/v1/responses",
+    "/v1/messages",
+    "/v1/assistants",  # OpenAI Assistants API
+    "/v1/threads",  # OpenAI Assistants Threads
+}
 MODEL_LIST_PATHS = {"/v1/models"}
-TOKEN_COUNT_PATHS = {"/v1/messages/count_tokens"}
+TOKEN_COUNT_PATHS = {"/v1/messages/count_tokens", "/v1/chat/completions/count_tokens"}
 DIRECT_TOOL_CALL_PATHS = {"/v1/tools/call", "/v1/functions/call", "/tools/call"}
 DEFAULT_MAX_TOOL_ROUNDS = 5
 CONFIG_PATH = pathlib.Path(os.environ.get("GATEWAY_CONFIG_PATH") or ".gateway_service.json")
 REQUEST_LOG_PATH = pathlib.Path(os.environ.get("GATEWAY_REQUEST_LOG") or ".gateway_requests.jsonl")
 STATS_PATH = pathlib.Path(os.environ.get("GATEWAY_STATS_PATH") or ".gateway_stats.json")
 SQLITE_LOG_PATH = pathlib.Path(os.environ.get("GATEWAY_SQLITE_LOG_PATH") or "gateway_log.sqlite3")
-DEFAULT_DOWNSTREAM_KEY = "local-gateway-key"
 MCP_PROTOCOL_VERSION = "2024-11-05"
 MCP_CATALOG_CACHE_TTL_SECONDS = 60
 
@@ -395,11 +414,37 @@ def _sqlite_import_legacy_logs_locked(conn: sqlite3.Connection) -> None:
 
 
 def _default_config() -> Json:
+    # Admin password: use env var if set, otherwise use known default for dev/testing
+    # Production deployments MUST set GATEWAY_ADMIN_PASSWORD or GATEWAY_ADMIN_PASSWORD_HASH
+    admin_password_hash = os.environ.get("GATEWAY_ADMIN_PASSWORD_HASH", "")
+    if not admin_password_hash:
+        admin_password = os.environ.get("GATEWAY_ADMIN_PASSWORD", "")
+        if admin_password:
+            admin_password_hash = _hash_secret(admin_password)
+        else:
+            # Development/testing fallback - MUST be changed before production use
+            admin_password_hash = _hash_secret("admin")
+    # Track if we're using an unconfigured default (should be changed)
+    admin_must_change = not os.environ.get("GATEWAY_ADMIN_PASSWORD") and not os.environ.get("GATEWAY_ADMIN_PASSWORD_HASH")
+
+    # Downstream keys: use env var if set, otherwise no default (must be configured)
+    downstream_keys: list = []
+    downstream_key_env = os.environ.get("GATEWAY_DOWNSTREAM_KEY", "")
+    if downstream_key_env:
+        downstream_keys.append({
+            "name": "default",
+            "key_hash": _hash_secret(downstream_key_env),
+            "prefix": downstream_key_env[:8],
+            "enabled": True,
+            "protocols": ["models", "chat_completions", "responses", "messages", "direct_tools"],
+            "created_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        })
+
     return {
         "admin": {
             "username": "admin",
-            "password_hash": _hash_secret("admin"),
-            "must_change_password": True,
+            "password_hash": admin_password_hash,
+            "must_change_password": admin_must_change,
         },
         "upstream": {
             "base_url": os.environ.get("UPSTREAM_BASE_URL", ""),
@@ -478,16 +523,7 @@ def _default_config() -> Json:
                 "protocol": os.environ.get("GATEWAY_LONG_CONTEXT_PROTOCOL", ""),
             },
         },
-        "downstream_keys": [
-            {
-                "name": "default",
-                "key_hash": _hash_secret(DEFAULT_DOWNSTREAM_KEY),
-                "prefix": DEFAULT_DOWNSTREAM_KEY[:8],
-                "enabled": True,
-                "protocols": ["models", "chat_completions", "responses", "messages", "direct_tools"],
-                "created_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-            }
-        ],
+        "downstream_keys": downstream_keys,
         "mcp": {
             "servers": [],
             "marketplace_enabled": True,
@@ -1234,6 +1270,36 @@ def _memory_block(memories: list[Json]) -> str:
         keywords = ", ".join(str(kw) for kw in item.get("keywords") or [][:8])
         lines.append(f"{idx}. [{item.get('kind')}; importance={item.get('importance')}; ts={item.get('ts')}; keywords={keywords}] {item.get('summary')}")
     return _trim_text_for_context("\n".join(lines), max_chars)
+
+
+# Context budget allocation by task type
+CONTEXT_BUDGETS: dict[str, dict[str, int]] = {
+    "code_review": {"system": 4000, "memory": 6000, "recent": 8000},
+    "code_generation": {"system": 3000, "memory": 4000, "recent": 15000},
+    "bug_fix": {"system": 3000, "memory": 5000, "recent": 12000},
+    "general": {"system": 2000, "memory": 3000, "recent": 20000},
+}
+
+
+def _allocate_context_budget(task_type: str) -> dict[str, int]:
+    """Allocate context token budget based on task type.
+
+    Returns a dict with keys: system, memory, recent
+    Each value is the max characters to use for that category.
+    """
+    return CONTEXT_BUDGETS.get(task_type, CONTEXT_BUDGETS["general"])
+
+
+def _detect_task_type(user_text: str) -> str:
+    """Detect the type of task based on user text to optimize context allocation."""
+    text_lower = user_text.lower()
+    if any(word in text_lower for word in ["review", "critique", "check", "audit", "assess"]):
+        return "code_review"
+    if any(word in text_lower for word in ["fix", "bug", "error", "crash", "issue", "problem"]):
+        return "bug_fix"
+    if any(word in text_lower for word in ["write", "create", "implement", "add", "new", "generate"]):
+        return "code_generation"
+    return "general"
 
 
 def _inject_recalled_memories(path: str, body: Json) -> Json:
@@ -2685,6 +2751,20 @@ def _normalize_tool_name(name: str) -> str:
         "exec_command": "Bash",
         "shell_command": "Bash",
         "exec_shell": "Bash",
+        # DeepSeek-style aliases
+        "deepseek_bash": "Bash",
+        "deepseek_read": "Read",
+        "deepseek_write": "Write",
+        "deepseek_search": "Grep",
+        # OpenAI function-style aliases
+        "get_file": "Read",
+        "create_file": "Write",
+        "run_command": "Bash",
+        "list_files": "LS",
+        "search_files": "Grep",
+        # Anthropic-style aliases
+        "computer_browse": "WebBrowser",
+        "computer_use": "computer_use",
         "exec_shell_start": "exec_shell_start",
         "exec_start": "exec_shell_start",
         "shell_start": "exec_shell_start",
@@ -3984,7 +4064,7 @@ def _client_snippet_context() -> Json:
     gateway = cfg.get("gateway", {}) if isinstance(cfg.get("gateway"), dict) else {}
     upstream = cfg.get("upstream", {}) if isinstance(cfg.get("upstream"), dict) else {}
     base_url = str(gateway.get("public_base_url") or os.environ.get("GATEWAY_PUBLIC_BASE_URL") or "http://127.0.0.1:8885").rstrip("/")
-    api_key = str(gateway.get("client_snippet_api_key") or os.environ.get("DOWNSTREAM_API_KEY") or "local-gateway-key")
+    api_key = str(gateway.get("client_snippet_api_key") or os.environ.get("DOWNSTREAM_API_KEY") or os.environ.get("GATEWAY_DOWNSTREAM_KEY") or "")
     model = str(gateway.get("downstream_model_alias") or upstream.get("model") or os.environ.get("UPSTREAM_MODEL") or "mimo-v2.5-pro")
     review_model = str(gateway.get("review_model_alias") or model)
     context_window = int(gateway.get("client_context_window") or 1_000_000)
@@ -4196,7 +4276,7 @@ def _render_admin_ui() -> str:
 </head><body>
 <h1>Tool Call Gateway Admin</h1>
 <p><a href="/client-config">下游客户端配置生成器</a> <a href="/client-config.json">Client config JSON</a> <a href="/healthz">Health</a></p>
-<p>默认管理员：<code>admin/admin</code>；默认下游 key：<code>{DEFAULT_DOWNSTREAM_KEY}</code>。上线前请修改。</p>
+<p>生产环境请通过环境变量 <code>GATEWAY_ADMIN_PASSWORD</code> 和 <code>GATEWAY_DOWNSTREAM_KEY</code> 配置管理员密码和下游 API Key。开发环境默认 admin/admin 和 local-gateway-key。</p>
 <div class="grid">
 <section><h2>上游 API</h2>
 <p>支持添加多个上游 API；每个上游可以独立设置协议、路由、模型、streaming、tool call、识图、网络检索等能力。当前默认上游会用于所有下游协议请求。</p>
@@ -4264,7 +4344,7 @@ def _render_admin_ui() -> str:
 <table><tr><th>Name</th><th>Prefix</th><th>Enabled</th><th>Protocols</th></tr>{key_rows}</table>
 <form method="post" action="/admin/downstream-key">
 <label>Name</label><input name="name" placeholder="codex-local">
-<label>Key</label><input name="key" placeholder="local-gateway-key">
+<label>Key</label><input name="key" placeholder="your-api-key">
 <label><input type="checkbox" name="key_proto_models" value="1" checked style="width:auto"> /v1/models</label>
 <label><input type="checkbox" name="key_proto_chat" value="1" checked style="width:auto"> /v1/chat/completions</label>
 <label><input type="checkbox" name="key_proto_responses" value="1" checked style="width:auto"> /v1/responses</label>
@@ -4560,6 +4640,46 @@ def _write_sse(handler: BaseHTTPRequestHandler, payload: Any, *, event: str | No
         handler.wfile.write(f"data: {line}\n".encode("utf-8"))
     handler.wfile.write(b"\n")
     handler.wfile.flush()
+
+
+def _stream_tool_start(handler: BaseHTTPRequestHandler, call_id: str, name: str) -> None:
+    """Send SSE event when a tool call starts execution."""
+    _write_sse(handler, {
+        "type": "tool_start",
+        "call_id": call_id,
+        "name": name,
+    }, event="tool_start")
+
+
+def _stream_tool_progress(handler: BaseHTTPRequestHandler, call_id: str, name: str, progress: str) -> None:
+    """Send SSE event for tool execution progress (for long-running tools)."""
+    _write_sse(handler, {
+        "type": "tool_progress",
+        "call_id": call_id,
+        "name": name,
+        "progress": progress,
+    }, event="tool_progress")
+
+
+def _stream_tool_end(handler: BaseHTTPRequestHandler, call_id: str, name: str, success: bool, content: str) -> None:
+    """Send SSE event when a tool call completes."""
+    _write_sse(handler, {
+        "type": "tool_end",
+        "call_id": call_id,
+        "name": name,
+        "success": success,
+        "content": content,
+    }, event="tool_end")
+
+
+def _stream_tool_error(handler: BaseHTTPRequestHandler, call_id: str, name: str, error: str) -> None:
+    """Send SSE event when a tool call fails."""
+    _write_sse(handler, {
+        "type": "tool_error",
+        "call_id": call_id,
+        "name": name,
+        "error": error,
+    }, event="tool_error")
 
 
 def _response_text(path: str, response: Json) -> str:
@@ -4867,6 +4987,22 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     }
                 )
             _json_response(self, 200, {"actions": actions})
+            return
+        if path == "/admin/marketplace.json":
+            if not _check_admin(self):
+                return
+            try:
+                from marketplace import list_mcp_marketplace, list_skills_catalog, scan_local_skills
+                mcp_items = list_mcp_marketplace()
+                skills = list_skills_catalog()
+                local_skills = scan_local_skills()
+                _json_response(self, 200, {
+                    "mcp_servers": mcp_items,
+                    "skills": skills,
+                    "local_skills": local_skills,
+                })
+            except Exception as exc:
+                _json_response(self, 200, {"error": str(exc), "mcp_servers": [], "skills": [], "local_skills": []})
             return
         _json_response(self, 404, _error_payload("not found"))
 

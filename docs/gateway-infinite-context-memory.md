@@ -75,7 +75,7 @@ GATEWAY_CONTEXT_FANOUT_ENABLED=1
 ./scripts/claude_m1.sh
 ```
 
-`mimo_gateway.sh` 默认端口 `8885`，默认上游由环境变量或本地 `.gateway_service.json` 配置，默认模型 `mimo-v2.5-pro`，默认下游 key `local-gateway-key`，默认 SQLite 日志 `gateway_log.sqlite3`。
+`mimo_gateway.sh` 默认端口 `8885`，默认上游由环境变量或本地 `.gateway_service.json` 配置，默认模型 `mimo-v2.5-pro`，默认下游 key 由 `GATEWAY_DOWNSTREAM_KEY` 环境变量设置（必填），默认 SQLite 日志 `gateway_log.sqlite3`。
 
 服务脚本默认优先用 `screen + pidfile + healthz` 后台运行（无 screen 时回退 `nohup`），并在启动时处理端口占用；如需强制 nohup 可设置 `GATEWAY_START_METHOD=nohup`。当前验收以这两个脚本为准。
 
@@ -115,7 +115,7 @@ Gateway now exposes a protected client-configuration center:
 
 - `/client-config` — HTML copy center for downstream clients.
 - `/client-config.json` — machine-readable snippets.
-- Admin auth required; default remains `admin/admin` until changed.
+- Admin auth required; default is `admin/admin` for development/testing only, must be changed via `GATEWAY_ADMIN_PASSWORD` in production.
 - It only generates copyable snippets and does **not** write to `~/.codex`, `~/.claude`, `opencode.json`, or `.bash_profile`.
 
 Generated downstream snippets include:

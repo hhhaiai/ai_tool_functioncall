@@ -35,7 +35,11 @@ except Exception:
 PY
 }
 
-DOWNSTREAM_API_KEY="${DOWNSTREAM_API_KEY:-$(configured_value gateway.client_snippet_api_key local-gateway-key)}"
+DOWNSTREAM_API_KEY="${DOWNSTREAM_API_KEY:-$(configured_value gateway.client_snippet_api_key '')}"
+# Also check GATEWAY_DOWNSTREAM_KEY for Phase 1 compatibility
+if [[ -z "$DOWNSTREAM_API_KEY" && -n "$GATEWAY_DOWNSTREAM_KEY" ]]; then
+  DOWNSTREAM_API_KEY="$GATEWAY_DOWNSTREAM_KEY"
+fi
 PUBLIC_BASE_URL="${GATEWAY_PUBLIC_BASE_URL:-http://127.0.0.1:${PORT}}"
 STOP_EXISTING="${GATEWAY_STOP_EXISTING:-1}"
 KILL_PORT_OWNER="${GATEWAY_KILL_PORT_OWNER:-1}"
@@ -66,6 +70,10 @@ export UPSTREAM_TIMEOUT="${UPSTREAM_TIMEOUT:-60}"
 export GATEWAY_PUBLIC_BASE_URL="$PUBLIC_BASE_URL"
 export GATEWAY_DOWNSTREAM_MODEL_ALIAS="${GATEWAY_DOWNSTREAM_MODEL_ALIAS:-$UPSTREAM_MODEL}"
 export GATEWAY_REVIEW_MODEL_ALIAS="${GATEWAY_REVIEW_MODEL_ALIAS:-$UPSTREAM_MODEL}"
+# Phase 1: Keys must be set via env vars - no hardcoded fallbacks
+export GATEWAY_DOWNSTREAM_KEY="${GATEWAY_DOWNSTREAM_KEY:-}"
+export GATEWAY_ADMIN_PASSWORD="${GATEWAY_ADMIN_PASSWORD:-}"
+export GATEWAY_ADMIN_PASSWORD_HASH="${GATEWAY_ADMIN_PASSWORD_HASH:-}"
 
 mkdir -p "$LOG_DIR"
 
@@ -155,14 +163,18 @@ cfg['upstream'].update({
 })
 cfg['upstream_profiles'] = [dict(cfg['upstream'])]
 cfg['active_upstream'] = 'mimo-default'
-cfg['downstream_keys'] = [{
-    'name': 'local-client',
-    'key_hash': gateway._hash_secret(key),
-    'prefix': key[:8],
-    'enabled': True,
-    'protocols': ['models', 'chat_completions', 'responses', 'messages', 'direct_tools'],
-    'created_at': dt.datetime.now(dt.timezone.utc).isoformat(),
-}]
+# Only create downstream_keys if a key is provided - no hardcoded fallback
+if key:
+    cfg['downstream_keys'] = [{
+        'name': 'local-client',
+        'key_hash': gateway._hash_secret(key),
+        'prefix': key[:8],
+        'enabled': True,
+        'protocols': ['models', 'chat_completions', 'responses', 'messages', 'direct_tools'],
+        'created_at': dt.datetime.now(dt.timezone.utc).isoformat(),
+    }]
+else:
+    cfg['downstream_keys'] = []
 cfg.setdefault('gateway', {})['client_snippet_api_key'] = key
 cfg['gateway']['allow_write_tools'] = os.environ.get('GATEWAY_ALLOW_WRITE_TOOLS', '1').lower() in {'1','true','yes'}
 cfg['gateway']['allow_shell_tools'] = os.environ.get('GATEWAY_ALLOW_SHELL_TOOLS', '1').lower() in {'1','true','yes'}
