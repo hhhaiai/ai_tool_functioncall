@@ -18,6 +18,10 @@ gateway_log.sqlite3-*
 .gateway_smoke/
 .gateway_smoke_external_project/
 
+# Local config (contains secrets)
+.gateway_service.json
+.gateway_local.json
+
 # Ad-hoc local logs
 /tmp/gateway-*.log
 /tmp/ai_tool_functioncall_*.log

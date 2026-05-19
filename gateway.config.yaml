@@ -1,0 +1,163 @@
+# ============================================================================
+# AI Tool FunctionCall Gateway - 完整配置文件
+# ============================================================================
+# 使用方法：
+#   1. 复制此文件: cp gateway.config.yaml .gateway_service.json
+#   2. 修改配置项
+#   3. 启动服务: ./scripts/mimo_gateway.sh start
+#
+# 优先级：环境变量 > 配置文件 > 默认值
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 管理员账号
+# ----------------------------------------------------------------------------
+admin:
+  username: admin
+  password: admin                    # 首次登录后请立即修改
+  # password_hash: ""                # 或直接设置 hash（优先级高于 password）
+
+# ----------------------------------------------------------------------------
+# 上游服务（你的真实 LLM API）
+# ----------------------------------------------------------------------------
+upstream:
+  base_url: ""                       # 例: https://api.openai.com
+  api_key: ""                        # 例: sk-xxx
+  model: ""                          # 例: gpt-4o, mimo-v2.5-pro
+  protocol: openai_chat              # openai_chat | anthropic_messages | openai_responses
+  tools_enabled: auto                # auto | on | off
+  timeout_seconds: 60
+  max_input_tokens: 128000
+  max_output_tokens: 8192
+  max_concurrency: 32
+
+  # 上游 API 路径（通常不需要修改）
+  paths:
+    models: /v1/models
+    chat_completions: /v1/chat/completions
+    responses: /v1/responses
+    messages: /v1/messages
+
+  # 上游能力声明（自动探测，通常不需要手动设置）
+  capabilities:
+    supports_streaming: true
+    supports_tools: true
+    supports_function_calls: true
+    supports_parallel_tool_calls: true
+    supports_vision: false
+    supports_network: false
+    supports_json_schema: true
+
+# ----------------------------------------------------------------------------
+# Gateway 核心配置
+# ----------------------------------------------------------------------------
+gateway:
+  # 工作目录（工具读写的根目录）
+  workspace_root: /Users/sanbo/Desktop/ai_tool_functioncall
+
+  # 工具模式：orchestrate（本地编排）| passthrough（直通上游）
+  tool_mode: orchestrate
+
+  # 工具权限
+  allow_write_tools: true            # 允许文件写入工具
+  allow_shell_tools: true            # 允许 Shell 执行工具
+
+  # 工具执行
+  max_tool_rounds: 10                # 最大工具调用轮数
+  tool_execution_timeout_seconds: 60 # 单次工具执行超时
+  max_concurrent_requests: 32        # 最大并发请求数
+
+  # 日志
+  request_logging: true
+  logging_backend: sqlite            # sqlite | jsonl
+  sqlite_log_path: gateway_log.sqlite3
+
+  # 本地规划器（自动分析代码上下文）
+  local_planner_enabled: true
+  local_planner_max_files: 24        # 最大分析文件数
+  local_planner_max_bytes_per_file: 24000
+
+  # 文本工具调用回退（当上游不支持 tools 时）
+  text_tool_call_fallback_enabled: true
+
+  # 公开访问地址（用于生成客户端配置片段）
+  public_base_url: http://127.0.0.1:8885
+
+  # 下游 API Key（客户端连接 Gateway 用）
+  client_snippet_api_key: ""         # 例: your-gateway-api-key
+
+  # 模型别名
+  downstream_model_alias: ""         # 客户端看到的模型名
+  review_model_alias: ""             # 质量审查用的模型名
+
+  # 客户端上下文窗口
+  client_context_window: 1000000
+  client_auto_compact_token_limit: 900000
+  client_output_token_limit: 128000
+
+# ----------------------------------------------------------------------------
+# 上下文管理（长上下文压缩、记忆、扇出）
+# ----------------------------------------------------------------------------
+context:
+  enabled: true
+  max_input_tokens: 24000            # 超过此值触发压缩
+  keep_recent_messages: 12           # 保留最近 N 条消息
+  summary_max_chars: 6000            # 摘要最大字符数
+
+  # 扇出（大请求拆分并行处理）
+  fanout_enabled: true
+  fanout_chunk_tokens: 12000         # 每块 token 数
+  fanout_max_chunks: 0               # 0=不限制
+  fanout_max_workers: 4              # 并行 worker 数
+
+  # 质量审查
+  quality_review_enabled: true
+
+  # 对话记忆
+  memory_enabled: true
+  memory_max_items: 200
+  memory_recall_limit: 8
+  memory_inject_max_chars: 4000
+  memory_summary_max_chars: 900
+
+  # 长上下文专用上游（可选）
+  route_to_long_context: true
+  long_context_upstream:
+    base_url: ""
+    api_key: ""
+    model: ""
+    protocol: ""
+
+# ----------------------------------------------------------------------------
+# 下游 API Keys（客户端认证）
+# ----------------------------------------------------------------------------
+downstream_keys:
+  # - name: default
+  #   key: your-gateway-api-key
+  #   enabled: true
+  #   protocols: [models, chat_completions, responses, messages, direct_tools]
+
+# ----------------------------------------------------------------------------
+# MCP 服务器配置
+# ----------------------------------------------------------------------------
+mcp:
+  servers: []
+  # - name: filesystem
+  #   command: npx
+  #   args: ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]
+  marketplace_enabled: true
+
+# ----------------------------------------------------------------------------
+# HTTP Actions（外部 API 作为工具）
+# ----------------------------------------------------------------------------
+http_actions:
+  enabled: true
+  actions: []
+  # - name: lookup_user
+  #   method: POST
+  #   url: http://127.0.0.1:9000/lookup
+  #   input_schema:
+  #     type: object
+  #     properties:
+  #       id:
+  #         type: string

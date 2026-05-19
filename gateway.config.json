@@ -1,0 +1,87 @@
+{
+  "admin": {
+    "username": "admin",
+    "password": "admin"
+  },
+  "upstream": {
+    "base_url": "",
+    "api_key": "",
+    "model": "",
+    "protocol": "openai_chat",
+    "tools_enabled": "auto",
+    "timeout_seconds": 60,
+    "max_input_tokens": 128000,
+    "max_output_tokens": 8192,
+    "max_concurrency": 32,
+    "paths": {
+      "models": "/v1/models",
+      "chat_completions": "/v1/chat/completions",
+      "responses": "/v1/responses",
+      "messages": "/v1/messages"
+    },
+    "capabilities": {
+      "supports_streaming": true,
+      "supports_tools": true,
+      "supports_function_calls": true,
+      "supports_parallel_tool_calls": true,
+      "supports_vision": false,
+      "supports_network": false,
+      "supports_json_schema": true
+    }
+  },
+  "gateway": {
+    "workspace_root": "/Users/sanbo/Desktop/ai_tool_functioncall",
+    "tool_mode": "orchestrate",
+    "allow_write_tools": true,
+    "allow_shell_tools": true,
+    "max_tool_rounds": 10,
+    "tool_execution_timeout_seconds": 60,
+    "max_concurrent_requests": 32,
+    "request_logging": true,
+    "logging_backend": "sqlite",
+    "sqlite_log_path": "gateway_log.sqlite3",
+    "local_planner_enabled": true,
+    "local_planner_max_files": 24,
+    "local_planner_max_bytes_per_file": 24000,
+    "text_tool_call_fallback_enabled": true,
+    "public_base_url": "http://127.0.0.1:8885",
+    "client_snippet_api_key": "",
+    "downstream_model_alias": "",
+    "review_model_alias": "",
+    "client_context_window": 1000000,
+    "client_auto_compact_token_limit": 900000,
+    "client_output_token_limit": 128000
+  },
+  "context": {
+    "enabled": true,
+    "max_input_tokens": 24000,
+    "keep_recent_messages": 12,
+    "summary_max_chars": 6000,
+    "fanout_enabled": true,
+    "fanout_chunk_tokens": 12000,
+    "fanout_max_chunks": 0,
+    "fanout_max_workers": 4,
+    "quality_review_enabled": true,
+    "memory_enabled": true,
+    "memory_max_items": 200,
+    "memory_recall_limit": 8,
+    "memory_inject_max_chars": 4000,
+    "memory_summary_max_chars": 900,
+    "route_to_long_context": true,
+    "long_context_upstream": {
+      "base_url": "",
+      "api_key": "",
+      "model": "",
+      "protocol": ""
+    }
+  },
+  "downstream_keys": [],
+  "mcp": {
+    "servers": [],
+    "marketplace_enabled": true
+  },
+  "http_actions": {
+    "enabled": true,
+    "actions": []
+  }
+}
