@@ -26,3 +26,5 @@ gateway_log.sqlite3-*
 /tmp/gateway-*.log
 /tmp/ai_tool_functioncall_*.log
 .gateway_service.json
+case.txt
+.omx/
