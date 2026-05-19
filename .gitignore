@@ -28,3 +28,4 @@ gateway_log.sqlite3-*
 .gateway_service.json
 case.txt
 .omx/
+.case.txt
