@@ -1,629 +1,548 @@
-# Gateway 运行与测试 README
+# Gateway 部署与运行指南
 
-本文档用于从零启动、配置、调用和验证 `API Tools / Function Call Gateway`。当前实现是 Python 标准库版本，不需要安装第三方依赖。
+本文档涵盖从零开始部署、配置、启动和验证 `AI Tool FunctionCall Gateway` 的完整流程。
 
-## 1. 进入项目目录
-
-```bash
-cd /Users/sanbo/Desktop/ai_tool_functioncall
-```
-
-确认 Python 版本：
-
-```bash
-python3 --version
-```
-
-建议 Python 3.10+。
+**特性**：纯 Python 标准库实现，无第三方依赖，支持 macOS / Linux / Windows (WSL)。
 
 ---
 
-## 2. 启动 Gateway
+## 目录
 
-默认端口：`8885`。
-
-```bash
-./scripts/mimo_gateway.sh start
-```
-
-启动后访问管理 UI：
-
-```text
-http://127.0.0.1:8885/ui
-```
-
-默认管理员账号：
-
-```text
-admin / admin（开发/测试用默认值，生产环境必须通过环境变量修改）
-```
-
-默认下游 API Key：
-
-```text
-无默认值，必须通过环境变量或配置文件设置
-```
-
-> **重要**：生产环境必须设置 `GATEWAY_ADMIN_PASSWORD`（管理员密码）和 `GATEWAY_DOWNSTREAM_KEY`（下游 API Key）。开发/测试环境可使用默认值 `admin/admin`，但必须在上线前修改。
+1. [环境要求](#1-环境要求)
+2. [快速开始](#2-快速开始)
+3. [配置说明](#3-配置说明)
+4. [启动服务](#4-启动服务)
+5. [验证部署](#5-验证部署)
+6. [客户端接入](#6-客户端接入)
+7. [生产环境部署](#7-生产环境部署)
+8. [常见问题](#8-常见问题)
 
 ---
 
-## 3. 基础健康检查
+## 1. 环境要求
 
-新开一个终端执行：
+| 依赖 | 版本 | 必需 | 说明 |
+|------|------|------|------|
+| Python | 3.10+ | ✅ | 核心运行时 |
+| sqlite3 | - | ✅ | Python 内置 |
+| curl | - | ✅ | 健康检查 |
+| screen / nohup | - | 可选 | 后台运行方式 |
+
+**可选依赖**（用于 computer_use 工具）：
 
 ```bash
-curl http://127.0.0.1:8885/healthz
+# Linux 截图/键鼠控制
+pip install pyautogui pillow
+
+# OCR 文字识别
+pip install pytesseract
+apt install tesseract-ocr  # Linux
+brew install tesseract      # macOS
 ```
 
-预期包含：
+---
+
+## 2. 快速开始
+
+### 2.1 克隆代码
+
+```bash
+git clone <repository-url> /opt/ai-tool-functioncall
+cd /opt/ai-tool-functioncall
+```
+
+### 2.2 创建配置文件
+
+```bash
+# 从模板创建本地配置
+cp gateway.config.json .gateway_service.json
+```
+
+### 2.3 编辑配置
+
+```bash
+vi .gateway_service.json
+```
+
+**最小配置**（只需修改这几项）：
 
 ```json
 {
-  "ok": true,
-  "mode": "orchestrate",
-  "fake_prompt_tools": false
+  "upstream": {
+    "base_url": "https://api.openai.com",
+    "api_key": "sk-your-api-key",
+    "model": "gpt-4o"
+  },
+  "gateway": {
+    "workspace_root": "/opt/ai-tool-functioncall",
+    "client_snippet_api_key": "your-gateway-api-key"
+  },
+  "admin": {
+    "password": "your-secure-password"
+  }
 }
 ```
 
-检查 Admin UI：
+### 2.4 启动服务
 
 ```bash
-curl -u admin:admin -i http://127.0.0.1:8885/ui
-```
-
-预期：
-
-```text
-HTTP/1.0 200 OK
-```
-
----
-
-## 4. 配置上游 API
-
-在 UI 中配置：
-
-```text
-Base URL: 上游模型 API 地址，例如 http://127.0.0.1:8000
-API Key: 上游 API key
-Model: 默认模型
-Protocol: openai_chat / openai_responses / anthropic_messages / openai_compatible
-Tool Mode: orchestrate
-Tools Enabled: auto 或 on
-```
-
-也可以通过环境变量初始化：
-
-```bash
-UPSTREAM_BASE_URL="http://127.0.0.1:8000" \
-UPSTREAM_API_KEY="your-upstream-key" \
-UPSTREAM_MODEL="your-model" \
-GATEWAY_DOWNSTREAM_KEY="your-downstream-key" \
-GATEWAY_ADMIN_PASSWORD="your-admin-password" \
 ./scripts/mimo_gateway.sh start
 ```
 
-**关键环境变量：**
-
-| 环境变量 | 说明 | 默认值 |
-|---------|------|--------|
-| `GATEWAY_DOWNSTREAM_KEY` | 下游 API Key（必填） | 无 |
-| `GATEWAY_ADMIN_PASSWORD` | 管理员密码（必填） | `admin`（仅开发环境） |
-| `UPSTREAM_BASE_URL` | 上游 API 地址 | 无 |
-| `UPSTREAM_API_KEY` | 上游 API Key | 无 |
-| `UPSTREAM_MODEL` | 默认模型 | `mimo-v2.5-pro` |
-| `DOWNSTREAM_API_KEY` | 向下兼容的下游 Key（优先于 GATEWAY_DOWNSTREAM_KEY） | 无 |
-
-配置文件默认保存到：
-
-```text
-.gateway_service.json
-```
-
----
-
-## 5. 下游客户端如何接入
-
-下游客户端包括 Codex、Claude Code、DeepSeek-TUI、OpenCode 或普通 SDK。
-
-通用配置：
-
-```text
-Base URL: http://127.0.0.1:8885
-API Key: <GATEWAY_DOWNSTREAM_KEY 设置的值>
-```
-
-支持接口：
-
-```text
-/v1/chat/completions
-/v1/responses
-/v1/messages
-```
-
-认证方式任选一种：
-
-```text
-Authorization: Bearer <GATEWAY_DOWNSTREAM_KEY>
-```
-
-或：
-
-```text
-x-api-key: <GATEWAY_DOWNSTREAM_KEY>
-```
-
----
-
-## 6. Curl 调用示例
-
-### 6.1 OpenAI Chat Completions
-
-```bash
-curl http://127.0.0.1:8885/v1/chat/completions \
-  -H 'authorization: Bearer <YOUR_DOWNSTREAM_KEY>' \
-  -H 'content-type: application/json' \
-  -d @examples/chat-with-tool.json
-```
-
-### 6.2 OpenAI Responses
-
-```bash
-curl http://127.0.0.1:8885/v1/responses \
-  -H 'authorization: Bearer <YOUR_DOWNSTREAM_KEY>' \
-  -H 'content-type: application/json' \
-  -d @examples/responses-with-tool.json
-```
-
-### 6.3 Anthropic Messages
-
-```bash
-curl http://127.0.0.1:8885/v1/messages \
-  -H 'authorization: Bearer <YOUR_DOWNSTREAM_KEY>' \
-  -H 'content-type: application/json' \
-  -d @examples/messages-with-tool.json
-```
-
-如果没有配置上游 API，以上模型调用会返回上游连接相关错误，这是正常的。完整本地闭环测试见第 9 节。
-
----
-
-## 7. 内置工具与权限
-
-当前 Gateway 会把内置工具合并到请求里，让上游模型可以通过协议级 tool/function call 调用。
-
-常用内置工具：
-
-```text
-calculator
-get_current_time
-Read / LS / Glob / Grep
-Write / Edit / MultiEdit / apply_patch
-Bash / exec_command
-WebFetch
-TodoWrite
-update_plan
-```
-
-安全默认值：
-
-```text
-写文件工具默认关闭
-Shell 工具默认关闭
-```
-
-如需启用，推荐在 UI 中打开：
-
-```text
-允许写入工具
-允许 Shell 工具
-```
-
-或用环境变量：
-
-```bash
-GATEWAY_ALLOW_WRITE_TOOLS=1 \
-GATEWAY_ALLOW_SHELL_TOOLS=1 \
-./scripts/mimo_gateway.sh start
-```
-
----
-
-## 8. MCP 测试方法
-
-### 8.1 查看 MCP 健康状态
-
-```bash
-curl -u admin:admin http://127.0.0.1:8885/admin/mcp-health.json
-```
-
-主动 probe：
-
-```bash
-curl -u admin:admin 'http://127.0.0.1:8885/admin/mcp-health.json?probe=1'
-```
-
-### 8.2 查看 MCP tools
-
-```bash
-curl -u admin:admin http://127.0.0.1:8885/admin/mcp-tools.json
-```
-
-### 8.3 MCP 配置示例
-
-在 UI 的 MCP 配置区域填入：
-
-```json
-[
-  {
-    "name": "github",
-    "type": "mcp_stdio",
-    "command": "npx",
-    "args": ["-y", "@modelcontextprotocol/server-github"],
-    "env": ["GITHUB_TOKEN"],
-    "cwd": ".",
-    "enabled": true,
-    "pool": true,
-    "catalog_ttl": 60
-  }
-]
-```
-
-成功后，MCP tools 会以如下格式暴露：
-
-```text
-mcp__github__<tool_name>
-```
-
-如果 MCP 启动失败或调用失败，Gateway 会：
-
-1. 关闭对应 session。
-2. 清理 catalog cache。
-3. 标记状态为 `broken`。
-4. 记录失败日志。
-5. 下次调用时重新启动 session。
-
----
-
-## 9. HTTP Action 测试方法
-
-HTTP Action 用于把已有 HTTP 服务包装成真实 tool/function executor。
-
-### 9.1 启动一个本地测试 action 服务
-
-新开终端：
-
-```bash
-python3 - <<'PY'
-import json
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-class Handler(BaseHTTPRequestHandler):
-    def do_POST(self):
-        length = int(self.headers.get('content-length') or '0')
-        body = json.loads(self.rfile.read(length).decode('utf-8') or '{}')
-        payload = json.dumps({'ok': True, 'received': body}, ensure_ascii=False).encode('utf-8')
-        self.send_response(200)
-        self.send_header('content-type', 'application/json')
-        self.send_header('content-length', str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def log_message(self, fmt, *args):
-        return
-
-ThreadingHTTPServer(('127.0.0.1', 9000), Handler).serve_forever()
-PY
-```
-
-### 9.2 在 Gateway UI 配置 HTTP Action
-
-进入：
-
-```text
-http://127.0.0.1:8885/ui
-```
-
-在 HTTP Actions 区域填入：
-
-```json
-[
-  {
-    "name": "echo_http",
-    "description": "Echo input through local HTTP action",
-    "method": "POST",
-    "url": "http://127.0.0.1:9000/echo",
-    "input_schema": {
-      "type": "object",
-      "properties": {
-        "value": {"type": "string"}
-      },
-      "required": ["value"]
-    },
-    "enabled": true
-  }
-]
-```
-
-保存后查看：
-
-```bash
-curl -u admin:admin http://127.0.0.1:8885/admin/http-actions.json
-```
-
-预期包含：
-
-```json
-{"name":"echo_http"}
-```
-
-### 9.3 真实执行 HTTP Action
-
-HTTP Action 需要上游模型返回协议级 tool/function call 才会被 Gateway 执行。完整闭环可以使用第 10 节的 fake upstream 测试。
-
----
-
-## 10. 本地完整闭环测试：Fake Upstream + Gateway
-
-这个测试不依赖真实模型 API，用一个 fake upstream 模拟模型第一次返回 `tool_calls`，Gateway 执行工具后再次请求 upstream，upstream 返回最终回答。
-
-### 10.1 启动 fake upstream
-
-新开终端：
-
-```bash
-python3 - <<'PY'
-import json
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-class Handler(BaseHTTPRequestHandler):
-    calls = 0
-
-    def do_POST(self):
-        Handler.calls += 1
-        length = int(self.headers.get('content-length') or '0')
-        body = json.loads(self.rfile.read(length).decode('utf-8') or '{}')
-        if Handler.calls == 1:
-            payload = {
-                'choices': [{
-                    'message': {
-                        'role': 'assistant',
-                        'content': None,
-                        'tool_calls': [{
-                            'id': 'call_1',
-                            'type': 'function',
-                            'function': {
-                                'name': 'calculator',
-                                'arguments': json.dumps({'expression': '123*456+7'})
-                            }
-                        }]
-                    },
-                    'finish_reason': 'tool_calls'
-                }]
-            }
-        else:
-            tool_result = body['messages'][-1]['content']
-            payload = {
-                'choices': [{
-                    'message': {
-                        'role': 'assistant',
-                        'content': '最终结果是 ' + str(tool_result)
-                    },
-                    'finish_reason': 'stop'
-                }]
-            }
-        raw = json.dumps(payload, ensure_ascii=False).encode('utf-8')
-        self.send_response(200)
-        self.send_header('content-type', 'application/json')
-        self.send_header('content-length', str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
-
-    def log_message(self, fmt, *args):
-        return
-
-ThreadingHTTPServer(('127.0.0.1', 18080), Handler).serve_forever()
-PY
-```
-
-### 10.2 使用 fake upstream 启动 Gateway
-
-新开终端：
-
-```bash
-cd /Users/sanbo/Desktop/ai_tool_functioncall
-UPSTREAM_BASE_URL='http://127.0.0.1:18080' \
-UPSTREAM_MODEL='fake-model' \
-./scripts/mimo_gateway.sh start
-```
-
-如果 `.gateway_service.json` 里已经保存了其他上游地址，请在 UI 里把 Base URL 改为：
-
-```text
-http://127.0.0.1:18080
-```
-
-### 10.3 发送请求
-
-```bash
-curl http://127.0.0.1:8885/v1/chat/completions \
-  -H 'authorization: Bearer <YOUR_DOWNSTREAM_KEY>' \
-  -H 'content-type: application/json' \
-  -d '{
-    "model": "fake-model",
-    "messages": [
-      {"role": "user", "content": "计算 123*456+7"}
-    ]
-  }'
-```
-
-预期最终响应包含：
-
-```text
-最终结果是 56095
-```
-
-这证明：
-
-```text
-下游请求 -> Gateway -> 上游返回 tool_calls -> Gateway 执行 calculator -> Gateway 回填 tool result -> 上游返回最终回答
-```
-
-整个过程是真实协议级 tool call，不是 prompt fake。
-
----
-
-## 11. 自动化测试
-
-### 11.1 一键严格验证
-
-```bash
-./scripts/mimo_gateway.sh verify
-```
-
-该命令会依次执行：语法检查、单元测试、核心 tools acceptance、安全/auth guardrails、真实工具 smoke、并发压力。
-
-### 11.2 分开执行
-
-```bash
-python3 -m py_compile src/toolcall_gateway.py src/gateway_app.py src/gateway_builtin_tools.py tests/test_gateway.py tests/integration/*.py
-python3 -m unittest discover -s tests -v
-python3 -W error::ResourceWarning -m unittest discover -s tests -v
-./tests/integration/tool_acceptance.py
-./tests/integration/security_gateway_checks.py
-./tests/integration/smoke_gateway_tools.py
-./tests/integration/stress_gateway_concurrency.py --workers 16 --direct-tool-requests 32 --model-requests 1
-```
-
-当前预期以实际输出为准；核心验收必须看到 `CORE TOOL ACCEPTANCE` / `acceptance: tools` 通过。
-
-测试覆盖：
-
-- Chat Completions `tool_calls` 提取和结果回填。
-- Responses API `function_call` 提取和结果回填。
-- Anthropic Messages `tool_use` 提取和结果回填。
-- 强制 tool_choice 的 native 校验。
-- 内置工具 registry。
-- `calculator` 执行。
-- `Read` / `Glob` / `Grep` workspace root 限制。
-- Gateway 多轮 tool orchestration。
-- stdio MCP `initialize` / `tools/list` / `tools/call`。
-- MCP schema merge。
-- MCP broken server health 和 cache invalidation。
-- `/admin/mcp-health.json?probe=1`。
-- HTTP Action schema 暴露和真实 HTTP 执行。
-
----
-
-## 12. 常用管理接口
-
-```bash
-curl -u admin:admin http://127.0.0.1:8885/admin/config.json
-curl -u admin:admin http://127.0.0.1:8885/admin/stats.json
-curl -u admin:admin http://127.0.0.1:8885/admin/requests.json
-curl -u admin:admin http://127.0.0.1:8885/admin/failures.json
-curl -u admin:admin http://127.0.0.1:8885/admin/mcp-tools.json
-curl -u admin:admin http://127.0.0.1:8885/admin/mcp-health.json
-curl -u admin:admin http://127.0.0.1:8885/admin/http-actions.json
-```
-
----
-
-## 13. 日志和数据文件
-
-```text
-.gateway_service.json        # Gateway 服务配置
-gateway_log.sqlite3         # 默认日志库；SQLite + WAL，保存请求、失败 tool、统计
-.gateway_requests.jsonl       # 旧日志格式，仅历史导入/兼容读取，不再默认写入
-.gateway_stats.json           # 旧统计格式，仅历史导入/兼容读取，不再默认写入
-.gateway_tool_failures.jsonl  # 旧失败日志，仅历史导入/兼容读取，不再默认写入
-```
-
-其中 `gateway_log.sqlite3` 是默认高频写入路径，用于：
-
-1. 复现下游请求。
-2. 分析 Codex / Claude Code / DeepSeek-TUI / OpenCode 的真实调用行为。
-3. 统计 tool 使用频次。
-4. 记录失败和不支持的 tool/function call。
-5. 后续接入 MCP/OpenAPI/action/plugin marketplace 并持续增强。
-
-隐藏 JSONL/JSON 文件只作为历史兼容读取，不作为默认写入路径。
-
----
-
-## 14. 常见问题
-
-### 14.1 返回 401
-
-下游请求没有带 key，或者 key 不对。
-
-正确示例：
-
-```bash
--H 'authorization: Bearer <YOUR_DOWNSTREAM_KEY>'
-```
-
-### 14.2 返回 upstream connection failed
-
-没有配置上游 API，或者上游不可访问。
-
-检查：
+### 2.5 验证
 
 ```bash
 curl http://127.0.0.1:8885/healthz
-curl -u admin:admin http://127.0.0.1:8885/admin/config.json
 ```
 
-### 14.3 tool_not_found
+预期输出：
 
-模型调用了 Gateway 没有实现、也没有通过 MCP/HTTP Action 配置的工具。
+```json
+{"ok": true, "mode": "orchestrate", "fake_prompt_tools": false}
+```
 
-查看失败：
+---
+
+## 3. 配置说明
+
+### 3.1 配置文件位置
+
+| 优先级 | 来源 | 说明 |
+|--------|------|------|
+| 1 | 环境变量 | 最高优先级 |
+| 2 | `.gateway_service.json` | 本地配置（不入 git） |
+| 3 | `gateway.config.json` | 模板配置 |
+| 4 | 代码默认值 | 最低优先级 |
+
+### 3.2 完整配置项
+
+```json
+{
+  "admin": {
+    "username": "admin",
+    "password": "admin",
+    "password_hash": ""
+  },
+  "upstream": {
+    "base_url": "https://api.openai.com",
+    "api_key": "sk-xxx",
+    "model": "gpt-4o",
+    "protocol": "openai_chat",
+    "tools_enabled": "auto",
+    "timeout_seconds": 60,
+    "max_input_tokens": 128000,
+    "max_output_tokens": 8192,
+    "max_concurrency": 32
+  },
+  "gateway": {
+    "workspace_root": "/path/to/project",
+    "tool_mode": "orchestrate",
+    "allow_write_tools": true,
+    "allow_shell_tools": true,
+    "max_tool_rounds": 10,
+    "tool_execution_timeout_seconds": 60,
+    "max_concurrent_requests": 32,
+    "request_logging": true,
+    "logging_backend": "sqlite",
+    "public_base_url": "http://127.0.0.1:8885",
+    "client_snippet_api_key": "your-gateway-key",
+    "downstream_model_alias": "",
+    "local_planner_enabled": true,
+    "local_planner_max_files": 24
+  },
+  "context": {
+    "enabled": true,
+    "max_input_tokens": 24000,
+    "fanout_enabled": true,
+    "memory_enabled": true
+  },
+  "downstream_keys": [],
+  "mcp": {
+    "servers": [],
+    "marketplace_enabled": true
+  },
+  "http_actions": {
+    "enabled": true,
+    "actions": []
+  }
+}
+```
+
+### 3.3 关键配置项说明
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `admin.password` | admin | 管理员密码，生产环境必须修改 |
+| `upstream.base_url` | - | 上游 LLM API 地址 |
+| `upstream.api_key` | - | 上游 API Key |
+| `upstream.model` | - | 默认模型名称 |
+| `upstream.protocol` | openai_chat | 上游协议类型 |
+| `gateway.workspace_root` | 当前目录 | 工具读写的根目录 |
+| `gateway.tool_mode` | orchestrate | 工具模式：orchestrate / passthrough |
+| `gateway.allow_write_tools` | false | 是否允许文件写入 |
+| `gateway.allow_shell_tools` | false | 是否允许 Shell 执行 |
+| `gateway.client_snippet_api_key` | - | 客户端连接 Gateway 的 API Key |
+| `context.max_input_tokens` | 24000 | 超过此值触发上下文压缩 |
+
+### 3.4 环境变量对照表
+
+| 环境变量 | 配置路径 | 说明 |
+|----------|----------|------|
+| `UPSTREAM_BASE_URL` | upstream.base_url | 上游 API 地址 |
+| `UPSTREAM_API_KEY` | upstream.api_key | 上游 API Key |
+| `UPSTREAM_MODEL` | upstream.model | 默认模型 |
+| `GATEWAY_DOWNSTREAM_KEY` | gateway.client_snippet_api_key | 下游 API Key |
+| `GATEWAY_ADMIN_PASSWORD` | admin.password | 管理员密码 |
+| `GATEWAY_WORKSPACE_ROOT` | gateway.workspace_root | 工作目录 |
+| `GATEWAY_PORT` | - | 监听端口（默认 8885） |
+| `GATEWAY_HOST` | - | 监听地址（默认 0.0.0.0） |
+
+---
+
+## 4. 启动服务
+
+### 4.1 启动方式
 
 ```bash
-curl -u admin:admin http://127.0.0.1:8885/admin/failures.json
+# 方式 1：screen 后台运行（默认，推荐）
+./scripts/mimo_gateway.sh start
+
+# 方式 2：nohup 后台运行
+GATEWAY_START_METHOD=nohup ./scripts/mimo_gateway.sh start
+
+# 方式 3：前台运行（调试用）
+./scripts/mimo_gateway.sh foreground
+
+# 方式 4：launchd（仅 macOS）
+GATEWAY_START_METHOD=launchd ./scripts/mimo_gateway.sh start
 ```
 
-后续处理：
-
-1. 实现内置工具。
-2. 配置 MCP server。
-3. 配置 HTTP Action。
-4. 后续接入 OpenAPI/action/plugin marketplace。
-
-### 14.4 connector_required
-
-该工具名已被识别为常见 coding-agent 工具，但当前还需要外部 connector/runtime。
-
-这类失败会被记录下来，作为后续持续维护和扩展的 backlog。
-
-### 14.5 写文件或 Shell 工具失败
-
-默认关闭写入和 shell 权限。需要在 UI 打开：
-
-```text
-允许写入工具
-允许 Shell 工具
-```
-
-或设置：
+### 4.2 服务管理
 
 ```bash
-GATEWAY_ALLOW_WRITE_TOOLS=1
-GATEWAY_ALLOW_SHELL_TOOLS=1
+# 查看状态
+./scripts/mimo_gateway.sh status
+
+# 停止服务
+./scripts/mimo_gateway.sh stop
+
+# 重启服务
+./scripts/mimo_gateway.sh restart
+
+# 查看日志
+tail -f .gateway_runtime/gateway-8885.log
 ```
 
-### Tool markup / too-long 回归
-
-已覆盖两类容易导致 Claude Code 卡住的回归：
-
-1. 只有 `<parameter=command>`、没有 `<function=Bash>` 的文本工具调用：Gateway 会推断为 Bash，并修复 `find/Users`、`-typef`、`wc -l{}`、`head-30` 等常见空格丢失问题。
-2. 上游返回 `Sorry, the text you sent is too long` 或类似上下文拒绝：Gateway 会 forced fan-out，而不是把拒绝文本当最终答案返回。
-
-对应单测：
+### 4.3 自定义端口
 
 ```bash
-python3 -m unittest discover -s tests -p test_gateway.py -k 'parameter_only_bash_markup_repairs_missing_spaces' -v
-python3 -m unittest discover -s tests -p test_gateway.py -k 'upstream_too_long_response_triggers_forced_fanout' -v
+# 方式 1：环境变量
+GATEWAY_PORT=9000 ./scripts/mimo_gateway.sh start
+
+# 方式 2：修改配置
+export GATEWAY_PORT=9000
+./scripts/mimo_gateway.sh start
 ```
+
+---
+
+## 5. 验证部署
+
+### 5.1 健康检查
+
+```bash
+curl http://127.0.0.1:8885/healthz
+```
+
+### 5.2 Admin UI
+
+```bash
+# 浏览器访问
+open http://127.0.0.1:8885/ui
+
+# 命令行验证
+curl -u admin:admin http://127.0.0.1:8885/ui
+```
+
+### 5.3 测试 API 调用
+
+```bash
+# OpenAI 兼容接口
+curl http://127.0.0.1:8885/v1/chat/completions \
+  -H "Authorization: Bearer your-gateway-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4o",
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
+
+# 查看可用模型
+curl http://127.0.0.1:8885/v1/models \
+  -H "Authorization: Bearer your-gateway-api-key"
+```
+
+### 5.4 运行测试套件
+
+```bash
+# 运行全部测试（97 个）
+python3 -m unittest discover -s tests -v
+
+# 运行集成测试
+python3 tests/integration/smoke_gateway_tools.py
+```
+
+---
+
+## 6. 客户端接入
+
+### 6.1 Claude Code
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8885
+export ANTHROPIC_API_KEY=your-gateway-api-key
+claude
+```
+
+### 6.2 OpenCode
+
+```bash
+export OPENAI_BASE_URL=http://127.0.0.1:8885/v1
+export OPENAI_API_KEY=your-gateway-api-key
+opencode
+```
+
+### 6.3 Codex CLI
+
+```bash
+export OPENAI_BASE_URL=http://127.0.0.1:8885/v1
+export OPENAI_API_KEY=your-gateway-api-key
+codex
+```
+
+### 6.4 Python OpenAI SDK
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:8885/v1",
+    api_key="your-gateway-api-key"
+)
+
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=[{"role": "user", "content": "Hello"}]
+)
+```
+
+---
+
+## 7. 生产环境部署
+
+### 7.1 安全配置
+
+```bash
+# 1. 修改管理员密码
+vi .gateway_service.json
+# 设置 admin.password 为强密码
+
+# 2. 设置下游 API Key
+# 设置 gateway.client_snippet_api_key
+
+# 3. 限制工具权限
+# gateway.allow_write_tools: false（如不需要文件写入）
+# gateway.allow_shell_tools: false（如不需要 Shell 执行）
+```
+
+### 7.2 Linux systemd 服务
+
+创建 `/etc/systemd/system/gateway.service`：
+
+```ini
+[Unit]
+Description=AI Tool FunctionCall Gateway
+After=network.target
+
+[Service]
+Type=simple
+User=gateway
+Group=gateway
+WorkingDirectory=/opt/ai-tool-functioncall
+Environment=GATEWAY_PORT=8885
+Environment=GATEWAY_HOST=0.0.0.0
+ExecStart=/usr/bin/python3 src/toolcall_gateway.py --host 0.0.0.0 --port 8885
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+启动服务：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable gateway
+sudo systemctl start gateway
+sudo systemctl status gateway
+```
+
+### 7.3 Docker 部署
+
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+COPY . .
+
+RUN cp gateway.config.json .gateway_service.json
+
+EXPOSE 8885
+
+CMD ["python3", "src/toolcall_gateway.py", "--host", "0.0.0.0", "--port", "8885"]
+```
+
+```bash
+docker build -t gateway .
+docker run -d -p 8885:8885 -v ./config:/app/.gateway_service.json gateway
+```
+
+### 7.4 Nginx 反向代理
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name gateway.example.com;
+
+    ssl_certificate /etc/ssl/certs/gateway.crt;
+    ssl_certificate_key /etc/ssl/private/gateway.key;
+
+    location / {
+        proxy_pass http://127.0.0.1:8885;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # WebSocket 支持（SSE 流式）
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_buffering off;
+        proxy_cache off;
+    }
+}
+```
+
+---
+
+## 8. 常见问题
+
+### Q: 启动失败，端口被占用
+
+```bash
+# 查看占用端口的进程
+lsof -i :8885
+
+# 强制停止
+./scripts/mimo_gateway.sh stop
+
+# 或使用其他端口
+GATEWAY_PORT=9000 ./scripts/mimo_gateway.sh start
+```
+
+### Q: 无法连接上游 API
+
+检查配置：
+
+```bash
+# 测试上游连接
+curl $UPSTREAM_BASE_URL/v1/models -H "Authorization: Bearer $UPSTREAM_API_KEY"
+```
+
+### Q: 工具调用不生效
+
+确保配置正确：
+
+```json
+{
+  "upstream": {
+    "tools_enabled": "auto"
+  },
+  "gateway": {
+    "tool_mode": "orchestrate"
+  }
+}
+```
+
+### Q: 如何查看日志
+
+```bash
+# 实时日志
+tail -f .gateway_runtime/gateway-8885.log
+
+# SQLite 日志查询
+sqlite3 gateway_log.sqlite3 "SELECT * FROM request_log ORDER BY id DESC LIMIT 10;"
+```
+
+### Q: Linux 上 computer_use 工具不工作
+
+```bash
+# 安装可选依赖
+pip install pyautogui pillow
+
+# 对于无头服务器，需要虚拟显示
+apt install xvfb
+export DISPLAY=:99
+Xvfb :99 -screen 0 1024x768x24 &
+```
+
+---
+
+## 附录
+
+### A. 项目结构
+
+```
+ai_tool_functioncall/
+├── src/
+│   ├── toolcall_gateway.py      # 入口文件
+│   ├── gateway_app.py           # 核心应用逻辑
+│   ├── gateway_builtin_tools.py # 内置工具实现
+│   ├── gateway_streaming.py     # SSE 流式处理
+│   ├── gateway_tool_runtime.py  # 工具运行时
+│   └── gateway_computer_use.py  # 电脑控制工具
+├── scripts/
+│   └── mimo_gateway.sh          # 启动脚本
+├── tests/                       # 测试文件
+├── docs/                        # 文档
+├── gateway.config.json          # 配置模板
+└── .gateway_service.json        # 本地配置（不入 git）
+```
+
+### B. API 端点
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/healthz` | GET | 健康检查 |
+| `/ui` | GET | Admin UI |
+| `/v1/models` | GET | 模型列表 |
+| `/v1/chat/completions` | POST | OpenAI Chat 接口 |
+| `/v1/responses` | POST | OpenAI Responses 接口 |
+| `/v1/messages` | POST | Anthropic Messages 接口 |
+| `/v1/tools/call` | POST | 直接工具调用 |
+
+### C. 支持的工具
+
+| 工具 | 说明 | 权限 |
+|------|------|------|
+| Read | 读取文件 | 默认开启 |
+| Write | 写入文件 | 需 allow_write_tools |
+| Edit | 编辑文件 | 需 allow_write_tools |
+| Shell | 执行命令 | 需 allow_shell_tools |
+| Grep | 搜索内容 | 默认开启 |
+| Glob | 搜索文件 | 默认开启 |
+| computer_use | 截图控制 | 需可选依赖 |
+
+---
+
+**最后更新**: 2026-05-19
