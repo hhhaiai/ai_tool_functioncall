@@ -615,6 +615,8 @@ python3 -W error::ResourceWarning -m unittest discover -s tests -v
 OK
 ```
 
+**p2 完成（2025-05-18）**：tool execution trace 新增 `execution_ms` / `retry_count` / `provider` 三个字段，SQLite schema 自动迁移，完整重试逻辑验证（MAX_RETRIES=2，指数退避，临时错误判定），8/8 测试 PASS。详见 `tests/test_tool_execution_trace.py`。
+
 ---
 
 ## 常用管理接口

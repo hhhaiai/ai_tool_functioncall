@@ -1,0 +1,314 @@
+# ============================================================================
+# Hermes Agent — Default MCP Server Configuration
+# ============================================================================
+#
+# This file defines recommended MCP servers for a production Hermes gateway.
+# Merge into your config.yaml under the `mcp_servers:` key, or use:
+#
+#   hermes mcp add <name> --command <cmd> --args <args...>
+#
+# Each server is categorized by purpose. Enable/disable per deployment needs.
+# Servers requiring API keys use ${ENV_VAR} — set them in .env.
+#
+# To add all defaults at once:
+#   cp mcp_defaults.yaml ~/.hermes/mcp_defaults.yaml
+#   # then merge into config.yaml or use hermes mcp import
+#
+# ============================================================================
+
+mcp_servers:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # FILESYSTEM & CODE
+  # Safe filesystem access — restrict path in args to project root
+  # ─────────────────────────────────────────────────────────────────────────
+
+  filesystem:
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
+    description: "Safe file read/write/list within allowed directories"
+    enabled: true
+
+  git:
+    command: "uvx"
+    args: ["mcp-server-git", "--repository", "."]
+    description: "Git operations — status, diff, log, commit"
+    enabled: true
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # DEVELOPER TOOLS
+  # GitHub, GitLab, Docker, CI/CD
+  # ─────────────────────────────────────────────────────────────────────────
+
+  github:
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_TOKEN}"
+    description: "GitHub API — repos, issues, PRs, actions"
+    enabled: true
+
+  gitlab:
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-gitlab"]
+    env:
+      GITLAB_PERSONAL_ACCESS_TOKEN: "${GITLAB_TOKEN}"
+      GITLAB_API_URL: "${GITLAB_URL:-https://gitlab.com/api/v4}"
+    description: "GitLab API — repos, issues, MRs, pipelines"
+    enabled: false
+
+  docker:
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-docker"]
+    description: "Docker — containers, images, compose"
+    enabled: true
+
+  sentry:
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-sentry"]
+    env:
+      SENTRY_AUTH_TOKEN: "${SENTRY_AUTH_TOKEN}"
+      SENTRY_ORG: "${SENTRY_ORG}"
+    description: "Sentry — error tracking, issues, releases"
+    enabled: false
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # DATABASES
+  # ─────────────────────────────────────────────────────────────────────────
+
+  sqlite:
+    command: "uvx"
+    args: ["mcp-server-sqlite", "--db-path", "${SQLITE_DB_PATH:-/data/hermes.db}"]
+    description: "SQLite — query, schema, data management"
+    enabled: true
+
+  postgres:
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-postgres"]
+    env:
+      POSTGRES_CONNECTION_STRING: "${DATABASE_URL}"
+    description: "PostgreSQL — query, schema introspection"
+    enabled: false
+
+  redis:
+    command: "npx"
+    args: ["-y", "@anthropic/mcp-server-redis"]
+    env:
+      REDIS_URL: "${REDIS_URL:-redis://localhost:6379}"
+    description: "Redis — get/set, keys, pub/sub, info"
+    enabled: false
+
+  mongodb:
+    command: "npx"
+    args: ["-y", "mongodb-mcp-server"]
+    env:
+      MDB_MCP_CONNECTION_STRING: "${MONGODB_URI}"
+    description: "MongoDB — query, collections, aggregation"
+    enabled: false
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # SEARCH & WEB
+  # ─────────────────────────────────────────────────────────────────────────
+
+  brave-search:
+    command: "npx"
+    args: ["-y", "@anthropic/mcp-server-brave-search"]
+    env:
+      BRAVE_API_KEY: "${BRAVE_API_KEY}"
+    description: "Brave web search — news, docs, general queries"
+    enabled: false
+
+  tavily:
+    command: "npx"
+    args: ["-y", "tavily-mcp@latest"]
+    env:
+      TAVILY_API_KEY: "${TAVILY_API_KEY}"
+    description: "Tavily AI-optimized web search for research"
+    enabled: false
+
+  fetch:
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-fetch"]
+    description: "HTTP fetch — GET/POST to any URL, HTML→markdown"
+    enabled: true
+
+  searxng:
+    url: "${SEARXNG_URL:-http://localhost:8000/sse}"
+    transport: sse
+    description: "SearXNG metasearch — privacy-focused, self-hosted"
+    enabled: false
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # KNOWLEDGE & MEMORY
+  # ─────────────────────────────────────────────────────────────────────────
+
+  memory:
+    command: "npx"
+    args: ["-y", "@anthropic/mcp-server-memory"]
+    description: "Knowledge graph — entities, relations, observations"
+    enabled: true
+
+  notion:
+    command: "npx"
+    args: ["-y", "@anthropic/mcp-server-notion"]
+    env:
+      NOTION_API_KEY: "${NOTION_API_KEY}"
+    description: "Notion — pages, databases, blocks, search"
+    enabled: false
+
+  obsidian:
+    command: "npx"
+    args: ["-y", "mcp-obsidian"]
+    env:
+      OBSIDIAN_API_KEY: "${OBSIDIAN_API_KEY}"
+      OBSIDIAN_HOST: "${OBSIDIAN_HOST:-localhost}"
+      OBSIDIAN_PORT: "${OBSIDIAN_PORT:-27124}"
+    description: "Obsidian — vault search, read, edit notes"
+    enabled: false
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # PRODUCTIVITY & COLLABORATION
+  # ─────────────────────────────────────────────────────────────────────────
+
+  slack:
+    command: "npx"
+    args: ["-y", "@anthropic/mcp-server-slack"]
+    env:
+      SLACK_BOT_TOKEN: "${SLACK_BOT_TOKEN}"
+      SLACK_TEAM_ID: "${SLACK_TEAM_ID}"
+    description: "Slack — channels, messages, users, threads"
+    enabled: false
+
+  linear:
+    command: "npx"
+    args: ["-y", "mcp-linear"]
+    env:
+      LINEAR_API_KEY: "${LINEAR_API_KEY}"
+    description: "Linear — issues, projects, teams, cycles"
+    enabled: false
+
+  google-drive:
+    command: "npx"
+    args: ["-y", "@anthropic/mcp-server-gdrive"]
+    env:
+      GOOGLE_APPLICATION_CREDENTIALS: "${GOOGLE_APPLICATION_CREDENTIALS}"
+    description: "Google Drive — file search, read, create"
+    enabled: false
+
+  google-calendar:
+    command: "npx"
+    args: ["-y", "@anthropic/mcp-server-gcal"]
+    env:
+      GOOGLE_APPLICATION_CREDENTIALS: "${GOOGLE_APPLICATION_CREDENTIALS}"
+    description: "Google Calendar — events, create, update, list"
+    enabled: false
+
+  airtable:
+    command: "npx"
+    args: ["-y", "airtable-mcp-server"]
+    env:
+      AIRTABLE_API_KEY: "${AIRTABLE_API_KEY}"
+    description: "Airtable — bases, tables, records CRUD"
+    enabled: false
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # MONITORING & OBSERVABILITY
+  # ─────────────────────────────────────────────────────────────────────────
+
+  prometheus:
+    command: "npx"
+    args: ["-y", "prometheus-mcp-server"]
+    env:
+      PROMETHEUS_URL: "${PROMETHEUS_URL:-http://localhost:9090}"
+    description: "Prometheus — PromQL queries, targets, alerts"
+    enabled: false
+
+  grafana:
+    command: "npx"
+    args: ["-y", "grafana-mcp-server"]
+    env:
+      GRAFANA_URL: "${GRAFANA_URL:-http://localhost:3000}"
+      GRAFANA_API_KEY: "${GRAFANA_API_KEY}"
+    description: "Grafana — dashboards, datasources, alerts"
+    enabled: false
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # CLOUD & INFRASTRUCTURE
+  # ─────────────────────────────────────────────────────────────────────────
+
+  aws:
+    command: "npx"
+    args: ["-y", "@anthropic/mcp-server-aws"]
+    env:
+      AWS_PROFILE: "${AWS_PROFILE:-default}"
+      AWS_REGION: "${AWS_REGION:-us-east-1}"
+    description: "AWS — S3, Lambda, CloudWatch, ECS, DynamoDB"
+    enabled: false
+
+  kubernetes:
+    command: "npx"
+    args: ["-y", "mcp-server-kubernetes"]
+    description: "Kubernetes — pods, services, deployments, logs"
+    enabled: false
+
+  terraform:
+    command: "npx"
+    args: ["-y", "terraform-mcp-server"]
+    description: "Terraform — state, plan, apply, workspace"
+    enabled: false
+
+  vercel:
+    command: "npx"
+    args: ["-y", "vercel-mcp-server"]
+    env:
+      VERCEL_TOKEN: "${VERCEL_TOKEN}"
+    description: "Vercel — deployments, domains, env vars"
+    enabled: false
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # AI & LLM TOOLS
+  # ─────────────────────────────────────────────────────────────────────────
+
+  huggingface:
+    command: "npx"
+    args: ["-y", "huggingface-mcp-server"]
+    env:
+      HF_TOKEN: "${HF_TOKEN}"
+    description: "HuggingFace — models, datasets, spaces, inference"
+    enabled: false
+
+  replicate:
+    command: "npx"
+    args: ["-y", "replicate-mcp-server"]
+    env:
+      REPLICATE_API_TOKEN: "${REPLICATE_API_TOKEN}"
+    description: "Replicate — run ML models (image gen, video, audio)"
+    enabled: false
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # UTILITY
+  # ─────────────────────────────────────────────────────────────────────────
+
+  time:
+    command: "npx"
+    args: ["-y", "@anthropic/mcp-server-time"]
+    description: "Time & timezone — current time, conversion, zones"
+    enabled: true
+
+  puppeteer:
+    command: "npx"
+    args: ["-y", "@anthropic/mcp-server-puppeteer"]
+    description: "Browser automation — screenshots, navigation, scraping"
+    enabled: true
+
+  sequential-thinking:
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+    description: "Structured reasoning — step-by-step thinking chains"
+    enabled: true
+
+  everything:
+    command: "npx"
+    args: ["-y", "@modelcontextprotocol/server-everything"]
+    description: "Testing/reference server — all MCP features demo"
+    enabled: false

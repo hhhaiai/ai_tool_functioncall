@@ -1,0 +1,177 @@
+## 特点
+
+字段：tools
+function 在 function 里
+用 "tool_choice": "auto"
+
+curl -X POST "https://fufu.iqach.top/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer linuxdo" \
+  -d '{
+    "model": "mimo-v2.5-pro",
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is 2+2?"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "calc",
+          "description": "Evaluate math expression",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "expr": {
+                "type": "string",
+                "description": "math expression"
+              }
+            },
+            "required": ["expr"]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto"
+  }'
+
+
+{"id":"ca508e697f1449cd8e4f8e9010de3423","choices":[{"finish_reason":"tool_calls","index":0,"message":{"content":null,"role":"assistant","tool_calls":[{"id":"call_4f34303ac3534a7eb65b0943","function":{"arguments":"{\"expr\": \"2+2\"}","name":"calc"},"type":"function"}],"reasoning_content":"The user is asking a simple math question: what is 2+2? I can use the calculator tool to evaluate this expression."}}],"created":1779034511,"model":"mimo-v2.5-pro","object":"chat.completion","usage":{"completion_tokens":52,"prompt_tokens":496,"total_tokens":548,"completion_tokens_details":{"reasoning_tokens":27},"prompt_tokens_details":{"cached_tokens":192}}}
+
+
+
+## 差异
+
+字段  chat.completions  responses
+输入  messages  input
+tools.function  包一层 function  直接平铺
+tool_choice 有 ❌（通常自动）
+
+
+
+curl -X POST "https://fufu.iqach.top/v1/responses" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer linuxdo" \
+  -d '{
+    "model": "mimo-v2.5-pro",
+    "input": "What is 2+2?",
+    "tools": [
+      {
+        "type": "function",
+        "name": "calc",
+        "description": "Evaluate math expression",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "expr": {
+              "type": "string"
+            }
+          },
+          "required": ["expr"]
+        }
+      }
+    ]
+  }'
+
+
+event: response.created
+data: {"response": {"id": "resp_45b5e681932b91ba11030a16", "object": "response", "created_at": 1779034465, "model": "mimo-v2.5-pro", "output": [], "status": "in_progress"}, "type": "response.created"}
+
+event: response.output_item.added
+data: {"output_index": 0, "item": {"type": "function_call", "id": "fc_5e67f9298868cae7d7e8103d", "call_id": "call_b3f01df6784d44d7957bcdf2", "name": "", "arguments": ""}, "type": "response.output_item.added"}
+
+event: response.function_call_arguments.delta
+data: {"output_index": 0, "delta": "{\"expr\": \"2+2\"}", "type": "response.function_call_arguments.delta"}
+
+event: response.function_call_arguments.done
+data: {"output_index": 0, "item": {"type": "function_call", "id": "fc_5e67f9298868cae7d7e8103d", "call_id": "call_b3f01df6784d44d7957bcdf2", "name": "calc", "arguments": "{\"expr\": \"2+2\"}"}, "type": "response.function_call_arguments.done"}
+
+event: response.output_item.done
+data: {"output_index": 0, "item": {"type": "function_call", "id": "fc_5e67f9298868cae7d7e8103d", "call_id": "call_b3f01df6784d44d7957bcdf2", "name": "calc", "arguments": "{\"expr\": \"2+2\"}"}, "type": "response.output_item.done"}
+
+event: response.completed
+data: {"response": {"id": "resp_45b5e681932b91ba11030a16", "object": "response", "created_at": 1779034465, "model": "mimo-v2.5-pro", "output": [{"type": "function_call", "id": "fc_5e67f9298868cae7d7e8103d", "call_id": "call_b3f01df6784d44d7957bcdf2", "name": "calc", "arguments": "{\"expr\": \"2+2\"}"}], "usage": {"input_tokens": 488, "output_tokens": 74, "total_tokens": 562}, "status": "completed"}, "type": "response.completed"}
+
+
+
+## 差异
+
+点 OpenAI  Anthropic
+字段名 parameters  input_schema
+type  function  ❌ 没这个字段
+tool_choice 有 ❌ 没有
+tool call 返回  tool_calls  content blocks
+
+
+curl -X POST "https://fufu.iqach.top/anthropic/v1/messages" \
+  -H "Authorization: Bearer linuxdo" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mimo-v2.5-pro",
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is 2+2?"
+      }
+    ],
+    "tools": [
+      {
+        "name": "calc",
+        "description": "Evaluate math expression",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "expr": {
+              "type": "string"
+            }
+          },
+          "required": ["expr"]
+        }
+      }
+    ],
+    "max_tokens": 100
+  }'
+
+
+{"id":"b0211e643f174b22bed4b3b3af230167","type":"message","role":"assistant","model":"mimo-v2.5-pro","stop_reason":"end_turn","content":[{"type":"text","text":"2 + 2 = **4**!\n\nThat's one of those classic math questions. If you have any other calculations or questions—whether simple or complex—I'm happy to help! \uD83D\uDE0A"},{"type":"thinking","thinking":"The user is asking a simple math question: \"What is 2+2?\"\n\nThis is a straightforward arithmetic question. The answer is 4. I don't need to use the calculator tool for this as it's a very simple calculation that I can do in my head.","signature":""}],"usage":{"input_tokens":40,"output_tokens":98,"cache_read_input_tokens":448}}
+
+
+
+curl -X POST http://47.85.40.209:8885/v1/chat/completions \
+  -H "Authorization: Bearer sk-sanbo" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mimo-v2.5-pro",
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is 2+2?"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "calc",
+          "description": "Evaluate a math expression",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "expr": {
+                "type": "string",
+                "description": "Math expression to evaluate"
+              }
+            },
+            "required": ["expr"],
+            "additionalProperties": false
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto"
+  }'
+
+
+{"id":"chatcmpl-e4c8409f8f0947079b25e31d","object":"chat.completion","created":1779034573,"model":"mimo-v2.5-pro","choices":[{"index":0,"message":{"role":"assistant","content":"<think>The user is asking a simple math question: 2+2=4. This is basic arithmetic that I can answer directly without needing a tool.</think>\n2 + 2 = **4**","tool_calls":null,"tool_call_id":null},"delta":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":3563,"completion_tokens":42,"total_tokens":3605}}

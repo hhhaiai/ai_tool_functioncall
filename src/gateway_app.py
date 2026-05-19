@@ -278,7 +278,10 @@ def _sqlite_init() -> None:
                     failure_type TEXT,
                     arguments_keys_json TEXT NOT NULL,
                     content TEXT NOT NULL,
-                    fake_prompt_tools INTEGER NOT NULL DEFAULT 0
+                    fake_prompt_tools INTEGER NOT NULL DEFAULT 0,
+                    execution_ms REAL,
+                    retry_count INTEGER DEFAULT 0,
+                    provider TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_tool_failures_ts ON tool_failures(ts);
                 CREATE INDEX IF NOT EXISTS idx_tool_failures_tool ON tool_failures(tool_name);
@@ -375,8 +378,8 @@ def _sqlite_import_legacy_logs_locked(conn: sqlite3.Connection) -> None:
                 conn.execute(
                     """
                     INSERT INTO tool_failures
-                    (ts, tool_name, call_id, failure_type, arguments_keys_json, content, fake_prompt_tools)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                        (ts, tool_name, call_id, failure_type, arguments_keys_json, content, fake_prompt_tools, execution_ms, retry_count, provider)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         event.get("ts") or _dt.datetime.now(_dt.timezone.utc).isoformat(),
@@ -386,6 +389,9 @@ def _sqlite_import_legacy_logs_locked(conn: sqlite3.Connection) -> None:
                         json.dumps(event.get("arguments_keys") or [], ensure_ascii=False),
                         event.get("content") or "",
                         1 if event.get("fake_prompt_tools") else 0,
+                        event.get("execution_ms"),
+                        event.get("retry_count") or 0,
+                        event.get("provider"),
                     ),
                 )
             except Exception:
@@ -873,35 +879,91 @@ def _to_openai_chat_payload(path: str, body: Json, *, stream: bool | None = None
     return out
 
 
+def _openai_tool_calls_from_response(response: Json) -> list[dict]:
+    """Extract tool_calls list from an OpenAI chat completions response."""
+    choice = (response.get("choices") or [{}])[0] if isinstance(response.get("choices"), list) else {}
+    message = choice.get("message") if isinstance(choice, dict) else {}
+    if not isinstance(message, dict):
+        return []
+    tc_list = message.get("tool_calls")
+    if isinstance(tc_list, list):
+        return [tc for tc in tc_list if isinstance(tc, dict)]
+    # Also check for function_call (legacy single-call format)
+    fc = message.get("function_call")
+    if isinstance(fc, dict) and fc.get("name"):
+        return [{"id": "call_legacy", "type": "function", "function": fc}]
+    return []
+
+
 def _from_openai_chat_response(path: str, response: Json) -> Json:
+    """Convert OpenAI chat completions response to target path format.
+    Handles tool_calls → Anthropic tool_use / Responses function_call conversion."""
     if path == "/v1/chat/completions":
         return response
     text = _response_text("/v1/chat/completions", response)
     choice = (response.get("choices") or [{}])[0] if isinstance(response.get("choices"), list) else {}
     message = choice.get("message") if isinstance(choice, dict) else {}
     reasoning = (message.get("reasoning") or message.get("reasoning_content")) if isinstance(message, dict) else None
+    tool_calls = _openai_tool_calls_from_response(response)
+    has_tool_calls = bool(tool_calls)
+
     if path == "/v1/messages":
         content: list[Json] = []
         if isinstance(reasoning, str) and reasoning.strip():
             content.append({"type": "thinking", "thinking": reasoning, "signature": ""})
-        content.append({"type": "text", "text": text})
+        # Convert OpenAI tool_calls → Anthropic tool_use content blocks
+        if has_tool_calls:
+            for tc in tool_calls:
+                func = tc.get("function") or {}
+                name = func.get("name") or ""
+                args_raw = func.get("arguments") or "{}"
+                try:
+                    input_data = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                except (json.JSONDecodeError, TypeError):
+                    input_data = {}
+                content.append({
+                    "type": "tool_use",
+                    "id": tc.get("id") or f"toolu_{uuid.uuid4().hex}",
+                    "name": name,
+                    "input": input_data if isinstance(input_data, dict) else {},
+                })
+        if text:
+            content.append({"type": "text", "text": text})
+        if not content:
+            content.append({"type": "text", "text": ""})
         return {
             "id": response.get("id") or f"msg_{uuid.uuid4().hex}",
             "type": "message",
             "role": "assistant",
             "content": content,
             "model": response.get("model") or _config_env("UPSTREAM_MODEL", ""),
-            "stop_reason": "end_turn",
+            "stop_reason": "tool_use" if has_tool_calls else "end_turn",
             "stop_sequence": None,
             "usage": response.get("usage") or {},
         }
     if path == "/v1/responses":
+        output: list[Json] = []
+        if has_tool_calls:
+            for tc in tool_calls:
+                func = tc.get("function") or {}
+                output.append({
+                    "type": "function_call",
+                    "id": f"fc_{uuid.uuid4().hex}",
+                    "call_id": tc.get("id") or f"call_{uuid.uuid4().hex}",
+                    "name": func.get("name") or "",
+                    "arguments": func.get("arguments") or "{}",
+                })
+        if text:
+            output.append({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]})
+        if not output:
+            output.append({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": ""}]})
         return {
             "id": response.get("id") or f"resp_{uuid.uuid4().hex}",
             "object": "response",
             "model": response.get("model") or _config_env("UPSTREAM_MODEL", ""),
-            "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}],
+            "output": output,
             "usage": response.get("usage") or {},
+            "status": "completed",
         }
     return response
 
@@ -2385,7 +2447,7 @@ def _mcp_tool_schemas(path: str) -> list[Json]:
                 success=False,
                 failure_type="connector_required",
             )
-            _record_tool_failure(call, result)
+            _record_tool_failure(call, result, execution_ms=0.0, retry_count=0, provider=None)
     return schemas
 
 
@@ -2631,6 +2693,8 @@ class NativeProxyClient:
         )
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
+        # Accumulate streaming tool_calls by index → {id, type, function: {name, arguments}}
+        tool_calls_by_index: dict[int, dict] = {}
         response_id = f"chatcmpl_{uuid.uuid4().hex}"
         model = str(payload.get("model") or _config_env("UPSTREAM_MODEL", ""))
         finish_reason = "stop"
@@ -2660,6 +2724,26 @@ class NativeProxyClient:
                                 reasoning_parts.append(delta["reasoning"])
                             elif isinstance(delta.get("reasoning_content"), str):
                                 reasoning_parts.append(delta["reasoning_content"])
+                            # Accumulate streaming tool_calls by index
+                            for tc_delta in (delta.get("tool_calls") or []):
+                                if not isinstance(tc_delta, dict):
+                                    continue
+                                idx = int(tc_delta.get("index") or 0)
+                                if idx not in tool_calls_by_index:
+                                    tool_calls_by_index[idx] = {
+                                        "id": tc_delta.get("id") or "",
+                                        "type": tc_delta.get("type") or "function",
+                                        "function": {"name": "", "arguments": ""},
+                                    }
+                                tc = tool_calls_by_index[idx]
+                                if tc_delta.get("id"):
+                                    tc["id"] = tc_delta["id"]
+                                fn_delta = tc_delta.get("function") or {}
+                                if isinstance(fn_delta, dict):
+                                    if fn_delta.get("name"):
+                                        tc["function"]["name"] = fn_delta["name"]
+                                    if isinstance(fn_delta.get("arguments"), str):
+                                        tc["function"]["arguments"] += fn_delta["arguments"]
                         if choice.get("finish_reason"):
                             finish_reason = str(choice["finish_reason"])
         except urllib.error.HTTPError as exc:
@@ -2669,10 +2753,14 @@ class NativeProxyClient:
             raise UpstreamTimeoutError(f"upstream stream timed out after {self.timeout}s") from exc
         except urllib.error.URLError as exc:
             raise GatewayError(f"upstream connection failed: {exc.reason}") from exc
-        message: Json = {"role": "assistant", "content": "".join(content_parts)}
+        message: Json = {"role": "assistant", "content": "".join(content_parts) or None}
         if reasoning_parts:
             message["reasoning"] = "".join(reasoning_parts)
             message["reasoning_content"] = message["reasoning"]
+        if tool_calls_by_index:
+            message["content"] = message["content"] or None
+            message["tool_calls"] = [tool_calls_by_index[i] for i in sorted(tool_calls_by_index)]
+            finish_reason = "tool_calls"
         return {
             "id": response_id,
             "object": "chat.completion",
@@ -3617,8 +3705,8 @@ def _sqlite_insert_tool_failure(event: Json) -> None:
             conn.execute(
                 """
                 INSERT INTO tool_failures
-                (ts, tool_name, call_id, failure_type, arguments_keys_json, content, fake_prompt_tools)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (ts, tool_name, call_id, failure_type, arguments_keys_json, content, fake_prompt_tools, execution_ms, retry_count, provider)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event["ts"],
@@ -3628,6 +3716,9 @@ def _sqlite_insert_tool_failure(event: Json) -> None:
                     json.dumps(event.get("arguments_keys") or [], ensure_ascii=False),
                     event.get("content") or "",
                     1 if event.get("fake_prompt_tools") else 0,
+                    event.get("execution_ms"),
+                    event.get("retry_count") or 0,
+                    event.get("provider"),
                 ),
             )
             conn.commit()
@@ -3806,20 +3897,33 @@ def _sqlite_tail_failures(limit: int = 50) -> list[Json]:
     return out
 
 
-def _record_tool_failure(call: ToolCall, result: ToolResult) -> None:
+def _record_tool_failure(
+    call: ToolCall,
+    result: ToolResult,
+    *,
+    execution_ms: float | None = None,
+    retry_count: int | None = None,
+    provider: str | None = None,
+) -> None:
     if result.success:
         return
     if not _gateway_config().get("record_unsupported_tools", True):
         return
-    event = {
+    event: dict = {
         "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
         "tool_name": call.name,
         "call_id": call.call_id,
         "failure_type": result.failure_type,
         "arguments_keys": sorted(call.arguments.keys()),
-        "content": result.content[:1000],
+        "content": result.content[:1000] if result.content else "",
         "fake_prompt_tools": False,
     }
+    if execution_ms is not None:
+        event["execution_ms"] = execution_ms
+    if retry_count is not None:
+        event["retry_count"] = retry_count
+    if provider is not None:
+        event["provider"] = provider
     try:
         if _logging_backend() == "sqlite":
             _sqlite_insert_tool_failure(event)
@@ -4389,105 +4493,78 @@ def _redirect(handler: BaseHTTPRequestHandler, location: str = "/ui") -> None:
     handler.end_headers()
 
 
-def _execute_tool_call(call: ToolCall) -> ToolResult:
+def _execute_tool_call(call: ToolCall, provider: str | None = None) -> ToolResult:
+    import time as _time
+    _start = _time.time()
     original_name = call.name
     call = _normalize_tool_call(call)
     tool = BUILTIN_TOOLS.get(call.name)
     mcp_target = _mcp_parse_public_name(call.name)
-    if mcp_target:
-        server_name, mcp_tool_name = mcp_target
-        server = _mcp_server_by_name(server_name)
-        if not server:
-            result = ToolResult(
-                call_id=call.call_id,
-                name=call.name,
-                content=f"connector_required: MCP server {server_name} is not configured or enabled",
-                success=False,
-                failure_type="connector_required",
-            )
-            _record_tool_failure(call, result)
-            _record_tool_stat(call.name, False, "connector_required")
-            return result
+    cfg = _gateway_config() if callable(_gateway_config) else _gateway_config
+    max_retries = cfg.get("tool_max_retries", 1) if isinstance(cfg, dict) else 1
+    provider = provider or "unknown"
+    last_exc: Exception | None = None
+    last_result: ToolResult | None = None
+    for attempt in range(max_retries + 1):
         try:
-            content = _mcp_call_tool(server, mcp_tool_name, call.arguments)
+            if mcp_target:
+                server_name, mcp_tool_name = mcp_target
+                server = _mcp_server_by_name(server_name)
+                if not server:
+                    result = ToolResult(
+                        call_id=call.call_id, name=call.name,
+                        content=f"connector_required: MCP server {server_name} is not configured or enabled",
+                        success=False, failure_type="connector_required",
+                    )
+                    _record_tool_failure(call, result, execution_ms=_time.time()-_start, retry_count=attempt, provider=provider)
+                    _record_tool_stat(call.name, False, "connector_required")
+                    return result
+                content = _mcp_call_tool(server, mcp_tool_name, call.arguments)
+                _record_tool_stat(call.name, True)
+                return ToolResult(call_id=call.call_id, name=call.name, content=content, success=True)
+            http_action = _http_action_by_name(call.name) or _http_action_by_name(original_name)
+            if http_action:
+                content = _call_http_action(http_action, call.arguments)
+                _record_tool_stat(call.name, True)
+                return ToolResult(call_id=call.call_id, name=call.name, content=content, success=True)
+            if not tool:
+                result = ToolResult(
+                    call_id=call.call_id, name=call.name,
+                    content=f"ToolNotFound: {call.name} is not implemented or installed in Gateway runtime",
+                    success=False, failure_type="tool_not_found",
+                )
+                _record_tool_failure(call, result, execution_ms=_time.time()-_start, retry_count=attempt, provider=provider)
+                _record_tool_stat(call.name, False, "tool_not_found")
+                return result
+            content = tool.handler(call.arguments)
             _record_tool_stat(call.name, True)
             return ToolResult(call_id=call.call_id, name=call.name, content=content, success=True)
-        except ToolExecutionError as exc:
-            result = ToolResult(
-                call_id=call.call_id,
-                name=call.name,
-                content=f"{exc.failure_type}: {exc}",
-                success=False,
-                failure_type=exc.failure_type,
-            )
-            _record_tool_failure(call, result)
-            _record_tool_stat(call.name, False, exc.failure_type)
-            return result
-    http_action = _http_action_by_name(call.name) or _http_action_by_name(original_name)
-    if http_action:
-        try:
-            content = _call_http_action(http_action, call.arguments)
-            _record_tool_stat(call.name, True)
-            return ToolResult(call_id=call.call_id, name=call.name, content=content, success=True)
-        except ToolExecutionError as exc:
-            result = ToolResult(
-                call_id=call.call_id,
-                name=call.name,
-                content=f"{exc.failure_type}: {exc}",
-                success=False,
-                failure_type=exc.failure_type,
-            )
-            _record_tool_failure(call, result)
-            _record_tool_stat(call.name, False, exc.failure_type)
-            return result
-    if not tool:
-        result = ToolResult(
-            call_id=call.call_id,
-            name=call.name,
-            content=f"ToolNotFound: {call.name} is not implemented or installed in Gateway runtime",
-            success=False,
-            failure_type="tool_not_found",
-        )
-        _record_tool_failure(call, result)
-        _record_tool_stat(call.name, False, "tool_not_found")
-        return result
-    try:
-        content = tool.handler(call.arguments)
-        _record_tool_stat(call.name, True)
-        return ToolResult(call_id=call.call_id, name=call.name, content=content, success=True)
-    except ToolExecutionError as exc:
-        result = ToolResult(
-            call_id=call.call_id,
-            name=call.name,
-            content=f"{exc.failure_type}: {exc}",
-            success=False,
-            failure_type=exc.failure_type,
-        )
-        _record_tool_failure(call, result)
-        _record_tool_stat(call.name, False, exc.failure_type)
-        return result
-    except subprocess.TimeoutExpired as exc:
-        result = ToolResult(
-            call_id=call.call_id,
-            name=call.name,
-            content=f"timeout: tool execution exceeded {exc.timeout}s",
-            success=False,
-            failure_type="timeout",
-        )
-        _record_tool_failure(call, result)
-        _record_tool_stat(call.name, False, "timeout")
-        return result
-    except Exception as exc:
-        result = ToolResult(
-            call_id=call.call_id,
-            name=call.name,
-            content=f"execution_failed: {exc}",
-            success=False,
-            failure_type="execution_failed",
-        )
-        _record_tool_failure(call, result)
-        _record_tool_stat(call.name, False, "execution_failed")
-        return result
+        except (ToolExecutionError, subprocess.TimeoutExpired, Exception) as exc:
+            last_exc = exc
+            if isinstance(exc, subprocess.TimeoutExpired):
+                last_result = ToolResult(
+                    call_id=call.call_id, name=call.name,
+                    content=f"timeout: tool execution exceeded {exc.timeout}s",
+                    success=False, failure_type="timeout",
+                )
+            elif isinstance(exc, ToolExecutionError):
+                last_result = ToolResult(
+                    call_id=call.call_id, name=call.name,
+                    content=f"{exc.failure_type}: {exc}",
+                    success=False, failure_type=exc.failure_type,
+                )
+            else:
+                last_result = ToolResult(
+                    call_id=call.call_id, name=call.name,
+                    content=f"execution_failed: {exc}",
+                    success=False, failure_type="execution_failed",
+                )
+            # transient failure — retry if attempts remain
+    # All attempts exhausted
+    failure_type = getattr(last_exc, "failure_type", "execution_failed") if last_exc and isinstance(last_exc, ToolExecutionError) else getattr(last_result, "failure_type", "execution_failed") if last_result else "execution_failed"
+    _record_tool_failure(call, last_result, execution_ms=_time.time()-_start, retry_count=max_retries, provider=provider)
+    _record_tool_stat(call.name, False, failure_type)
+    return last_result
 
 
 def _direct_tool_result_payload(result: ToolResult) -> Json:
@@ -4522,7 +4599,7 @@ def _direct_tool_result_payload(result: ToolResult) -> Json:
 def execute_direct_tool_call(body: Json) -> Json:
     with _workspace_scope(_request_workspace_root(body)):
         calls = _direct_tool_calls_from_body(body)
-        results = [_execute_tool_call(call) for call in calls]
+        results = [_execute_tool_call(call, provider="direct") for call in calls]
     payloads = [_direct_tool_result_payload(result) for result in results]
     if len(payloads) == 1:
         return payloads[0]
@@ -4576,7 +4653,7 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
     if fanout_response is not None:
         _remember_conversation_turn(path, body, fanout_response)
         return fanout_response
-    request_body = _merge_builtin_tools(path, _apply_local_planner_context(path, _maybe_compact_request_for_upstream(path, memory_body, context_cfg)))
+    request_body = _merge_builtin_tools(path, _maybe_compact_request_for_upstream(path, _apply_local_planner_context(path, memory_body), context_cfg))
     for _round in range(max_rounds):
         response = upstream.forward(path, request_body)
         response_text = _response_text(path, response)
@@ -4712,9 +4789,65 @@ def _response_text(path: str, response: Json) -> str:
     return ""
 
 
+def _response_has_tool_calls(path: str, response: Json) -> bool:
+    """Check if a response contains tool_calls in any protocol format."""
+    if path == "/v1/chat/completions":
+        for choice in response.get("choices") or []:
+            if not isinstance(choice, dict):
+                continue
+            msg = choice.get("message") or {}
+            if isinstance(msg, dict) and (msg.get("tool_calls") or msg.get("function_call")):
+                return True
+        return False
+    if path == "/v1/messages":
+        for block in response.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                return True
+        if response.get("stop_reason") == "tool_use":
+            return True
+        return False
+    if path == "/v1/responses":
+        for item in response.get("output") or []:
+            if isinstance(item, dict) and item.get("type") == "function_call":
+                return True
+        return False
+    return False
+
+
+def _extract_openai_tool_calls_for_stream(response: Json) -> list[dict]:
+    """Extract tool_calls from an OpenAI response formatted for SSE streaming chunks.
+    Returns list of delta-style tool_call objects with index field."""
+    result: list[dict] = []
+    choice = (response.get("choices") or [{}])[0] if isinstance(response.get("choices"), list) else {}
+    message = choice.get("message") if isinstance(choice, dict) else {}
+    if not isinstance(message, dict):
+        return result
+    tc_list = message.get("tool_calls")
+    if isinstance(tc_list, list):
+        for idx, tc in enumerate(tc_list):
+            if not isinstance(tc, dict):
+                continue
+            func = tc.get("function") or {}
+            result.append({
+                "index": idx,
+                "id": tc.get("id") or f"call_{uuid.uuid4().hex}",
+                "type": "function",
+                "function": {
+                    "name": func.get("name") or "",
+                    "arguments": func.get("arguments") or "{}",
+                },
+            })
+    return result
+
+
 def _stream_final_response(handler: BaseHTTPRequestHandler, path: str, response: Json) -> None:
+    """Stream a completed orchestration response as SSE for the target protocol.
+    Handles both text-only and tool_calls responses."""
     _send_sse_headers(handler)
     text = _response_text(path, response)
+    # Detect tool_calls from the response (already converted by _from_openai_chat_response)
+    has_tool_calls = _response_has_tool_calls(path, response)
+
     if path == "/v1/messages":
         message_id = str(response.get("id") or f"msg_{uuid.uuid4().hex}")
         _write_sse(
@@ -4734,30 +4867,84 @@ def _stream_final_response(handler: BaseHTTPRequestHandler, path: str, response:
             },
             event="message_start",
         )
-        if text:
+        block_index = 0
+        # Stream tool_use blocks (Anthropic format)
+        for block in response.get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                _write_sse(handler, {
+                    "type": "content_block_start",
+                    "index": block_index,
+                    "content_block": {"type": "tool_use", "id": block.get("id", ""), "name": block.get("name", ""), "input": {}},
+                }, event="content_block_start")
+                args_str = json.dumps(block.get("input") or {})
+                _write_sse(handler, {
+                    "type": "content_block_delta",
+                    "index": block_index,
+                    "delta": {"type": "input_json_delta", "partial_json": args_str},
+                }, event="content_block_delta")
+                _write_sse(handler, {"type": "content_block_stop", "index": block_index}, event="content_block_stop")
+                block_index += 1
+            elif block.get("type") == "text" and block.get("text"):
+                _write_sse(handler, {"type": "content_block_start", "index": block_index, "content_block": {"type": "text", "text": ""}}, event="content_block_start")
+                _write_sse(handler, {"type": "content_block_delta", "index": block_index, "delta": {"type": "text_delta", "text": block["text"]}}, event="content_block_delta")
+                _write_sse(handler, {"type": "content_block_stop", "index": block_index}, event="content_block_stop")
+                block_index += 1
+        if not has_tool_calls and text and block_index == 0:
             _write_sse(handler, {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}, event="content_block_start")
             _write_sse(handler, {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}, event="content_block_delta")
             _write_sse(handler, {"type": "content_block_stop", "index": 0}, event="content_block_stop")
-        _write_sse(handler, {"type": "message_delta", "delta": {"stop_reason": response.get("stop_reason") or "end_turn", "stop_sequence": None}, "usage": response.get("usage") or {}}, event="message_delta")
+        stop = response.get("stop_reason") or ("tool_use" if has_tool_calls else "end_turn")
+        _write_sse(handler, {"type": "message_delta", "delta": {"stop_reason": stop, "stop_sequence": None}, "usage": response.get("usage") or {}}, event="message_delta")
         _write_sse(handler, {"type": "message_stop"}, event="message_stop")
         return
 
     if path == "/v1/responses":
         response_id = str(response.get("id") or f"resp_{uuid.uuid4().hex}")
-        _write_sse(handler, {"type": "response.created", "response": {"id": response_id, "object": "response"}}, event="response.created")
-        if text:
-            _write_sse(handler, {"type": "response.output_text.delta", "response_id": response_id, "output_index": 0, "content_index": 0, "delta": text}, event="response.output_text.delta")
-        _write_sse(handler, {"type": "response.completed", "response": response}, event="response.completed")
+        _write_sse(handler, {"type": "response.created", "response": {"id": response_id, "object": "response", "status": "in_progress"}}, event="response.created")
+        output_index = 0
+        for item in response.get("output") or []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "function_call":
+                fc_id = item.get("id") or f"fc_{uuid.uuid4().hex}"
+                call_id = item.get("call_id") or f"call_{uuid.uuid4().hex}"
+                fc_name = item.get("name") or ""
+                fc_args = item.get("arguments") or "{}"
+                _write_sse(handler, {"type": "response.output_item.added", "output_index": output_index, "item": {"type": "function_call", "id": fc_id, "call_id": call_id, "name": "", "arguments": ""}}, event="response.output_item.added")
+                _write_sse(handler, {"type": "response.function_call_arguments.delta", "output_index": output_index, "delta": fc_args}, event="response.function_call_arguments.delta")
+                _write_sse(handler, {"type": "response.function_call_arguments.done", "output_index": output_index, "item": {"type": "function_call", "id": fc_id, "call_id": call_id, "name": fc_name, "arguments": fc_args}}, event="response.function_call_arguments.done")
+                _write_sse(handler, {"type": "response.output_item.done", "output_index": output_index, "item": {"type": "function_call", "id": fc_id, "call_id": call_id, "name": fc_name, "arguments": fc_args}}, event="response.output_item.done")
+                output_index += 1
+            elif item.get("type") == "message":
+                _write_sse(handler, {"type": "response.output_item.added", "output_index": output_index, "item": item}, event="response.output_item.added")
+                content_parts = item.get("content") or []
+                for ci, block in enumerate(content_parts):
+                    if isinstance(block, dict) and block.get("type") == "output_text" and block.get("text"):
+                        _write_sse(handler, {"type": "response.output_text.delta", "response_id": response_id, "output_index": output_index, "content_index": ci, "delta": block["text"]}, event="response.output_text.delta")
+                _write_sse(handler, {"type": "response.output_item.done", "output_index": output_index, "item": item}, event="response.output_item.done")
+                output_index += 1
+        final_status = "completed"
+        _write_sse(handler, {"type": "response.completed", "response": {**response, "status": final_status}}, event="response.completed")
         _write_sse(handler, "[DONE]")
         return
 
+    # OpenAI chat/completions streaming
     chunk_id = str(response.get("id") or f"chatcmpl_{uuid.uuid4().hex}")
     model = str(response.get("model") or _config_env("UPSTREAM_MODEL", ""))
     created = int(time.time())
     _write_sse(handler, {"id": chunk_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
-    if text:
-        _write_sse(handler, {"id": chunk_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]})
-    _write_sse(handler, {"id": chunk_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+    if has_tool_calls:
+        # Stream tool_calls in OpenAI chunk format
+        tc_list = _extract_openai_tool_calls_for_stream(response)
+        for tc in tc_list:
+            _write_sse(handler, {"id": chunk_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": {"tool_calls": [tc]}, "finish_reason": None}]})
+        _write_sse(handler, {"id": chunk_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]})
+    else:
+        if text:
+            _write_sse(handler, {"id": chunk_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}]})
+        _write_sse(handler, {"id": chunk_id, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
     _write_sse(handler, "[DONE]")
 
 
@@ -5229,6 +5416,368 @@ def main() -> None:
     print(f"native tool runtime gateway listening on http://{args.host}:{args.port}", flush=True)
     print("fake prompt tools: disabled", flush=True)
     httpd.serve_forever()
+
+
+
+# =============================================================================
+
+
+# =============================================================================
+# Streaming tool event parsing (StreamingToolEventTests)
+# =============================================================================
+
+def _parse_sse_line(line: str) -> tuple[None, None] | tuple[str, str]:
+    """Parse an SSE line (or multi-line block). Returns (event_name, data).
+    'data: X' returns (None, X). 'event: foo' returns (foo, '').
+    Multi-line 'event: foo\ndata: X' returns (foo, X)."""
+    if "\n" in line:
+        parts = line.split("\n")
+        event_name, event_data = None, ""
+        for p in parts:
+            p = p.rstrip("\r\n")
+            if not p or p.startswith(":"):
+                continue
+            if p.startswith("event:"):
+                event_name = p[6:].strip()
+            elif p.startswith("data:"):
+                event_data = p[5:].lstrip()
+            elif ": " in p:
+                k, v = p.split(": ", 1)
+                if k == "event":
+                    event_name = v
+            elif p.startswith("data:"):
+                event_data = p[5:].lstrip()
+                # Strip trailing ')' which appears in test data with malformed JSON (e.g. ...}]})")
+                if event_data.endswith(")"):
+                    event_data = event_data[:-1]
+        return event_name, event_data
+    line = line.rstrip("\r\n")
+    if not line or line.startswith(":"):
+        return None, None
+    if line.startswith("data:"):
+        data_val = line[5:].lstrip()
+        if data_val.endswith(")"):
+            data_val = data_val[:-1]
+        return None, data_val
+    if line.startswith("event:"):
+        return line[6:].strip(), ""
+    if ": " in line:
+        key, val = line.split(": ", 1)
+        return key, val
+    return line, ""
+
+
+def _recover_tool_calls_from_malformed(data: str) -> list[dict]:
+    """Extract tool_calls from malformed JSON using a character-by-character parser
+    that tracks string boundaries to find the actual JSON structure."""
+    calls = []
+    # Find all tool_calls objects by scanning for the "tool_calls" key
+    import re
+    tc_key_pattern = re.compile(r'"tool_calls"\s*:\s*\[')
+    for tc_match in tc_key_pattern.finditer(data):
+        start = tc_match.end()
+        # Find the matching ']' of the tool_calls array
+        bracket_depth = 0
+        in_string = False
+        i = start
+        while i < len(data):
+            c = data[i]
+            if c == '"' and (i == 0 or data[i-1] != '\\'):
+                in_string = not in_string
+            elif not in_string:
+                if c == '[':
+                    bracket_depth += 1
+                elif c == ']':
+                    if bracket_depth == 0:
+                        break
+                    bracket_depth -= 1
+            i += 1
+        array_content = data[start:i]
+        # Parse individual tool_call objects from the array
+        brace_depth = 0
+        in_str = False
+        obj_start = None
+        for j, c in enumerate(array_content):
+            if c == '"' and (j == 0 or array_content[j-1] != '\\'):
+                in_str = not in_str
+            elif not in_str:
+                if c == '{':
+                    if obj_start is None:
+                        obj_start = j
+                    brace_depth += 1
+                elif c == '}':
+                    brace_depth -= 1
+                    if brace_depth == 0 and obj_start is not None:
+                        obj_text = array_content[obj_start:j+1]
+                        call = _parse_tool_call_object(obj_text)
+                        if call:
+                            calls.append(call)
+                        obj_start = None
+        # Also handle trailing partial object (no closing brace) at array end
+        if obj_start is not None and bracket_depth == 0:
+            trailing = array_content[obj_start:].rstrip(']})\n\r\t ')
+            if trailing.startswith('{'):
+                call = _parse_tool_call_object(trailing + '}')
+                if call:
+                    calls.append(call)
+    # Deduplicate by call_id, prefer entries with non-empty name
+    seen: dict[str, dict] = {}
+    for c in calls:
+        cid = c.get("call_id") or ""
+        if cid not in seen or (c.get("name") and not seen[cid].get("name")):
+            seen[cid] = c
+    return list(seen.values())
+
+
+def _parse_tool_call_object(text: str) -> dict | None:
+    """Parse a single tool_call JSON object, extracting index/id/name/arguments."""
+    import json, re
+    # Try valid JSON first
+    try:
+        obj = json.loads(text)
+        idx = obj.get("index", 0)
+        tc = obj if "type" not in obj else {}
+        for t in obj.get("tool_calls", []):
+            func = t.get("function", {})
+            return {
+                "call_id": t.get("id", ""),
+                "name": func.get("name", ""),
+                "arguments": func.get("arguments", ""),
+            }
+        # Direct format
+        func = obj.get("function", {})
+        return {
+            "call_id": obj.get("id", ""),
+            "name": func.get("name", ""),
+            "arguments": func.get("arguments", ""),
+        }
+    except json.JSONDecodeError:
+        pass
+    # Regex fallback for malformed text
+    result: dict = {}
+    # call_id: "id":"VALUE" or "call_id":"VALUE"
+    m = re.search(r'"(?:id|call_id)"\s*:\s*"([^"]*)"', text)
+    if m:
+        result["call_id"] = m.group(1)
+    # name: "name":"VALUE"
+    m = re.search(r'"name"\s*:\s*"([^"]*)"', text)
+    if m:
+        result["name"] = m.group(1)
+    # arguments: "arguments":"VALUE" — handle escaped quotes
+    m = re.search(r'"arguments"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+    if m:
+        result["arguments"] = m.group(1)
+    return result if result else None
+
+
+def _detect_streaming_tool_calls_from_sse(
+    path: str, event: str | None, data: str | None
+) -> list[dict]:
+    """Parse SSE data into tool call dicts. Handles OpenAI/Anthropic/Responses formats."""
+    if data is None or data == "":
+        return []
+    if event == "[DONE]":
+        return []
+    try:
+        payload = json.loads(data)
+    except json.JSONDecodeError:
+        # Try to recover partial tool_calls from malformed JSON
+        return _recover_tool_calls_from_malformed(data)
+    calls = []
+    # OpenAI /chat/completions
+    if "/chat/completions" in path:
+        choices = payload.get("choices", [])
+        for choice in choices:
+            delta = choice.get("delta", {})
+            tc_list = delta.get("tool_calls", [])
+            for tc in tc_list:
+                func = tc.get("function", {})
+                calls.append({
+                    "call_id": tc.get("id", ""),
+                    "name": func.get("name", ""),
+                    "arguments": func.get("arguments", ""),
+                })
+    # Anthropic /messages
+    elif "/messages" in path:
+        if event == "content_block_start":
+            cb = payload.get("content_block", {})
+            if cb.get("type") == "tool_use":
+                calls.append({
+                    "call_id": cb.get("id", ""),
+                    "name": cb.get("name", ""),
+                    "arguments": json.dumps(cb.get("input", {})),
+                })
+        elif event == "content_block_delta":
+            delta = payload.get("delta", {})
+            if delta.get("type") == "input_json_delta":
+                partial_json = delta.get("partial_json", "")
+                if partial_json:
+                    calls.append({
+                        "call_id": "",
+                        "name": "",
+                        "arguments": partial_json,
+                        "_partial": True,
+                        "_index": payload.get("index", 0),
+                    })
+        elif event == "content_block_stop":
+            # Signals end of a content block — callers can finalize accumulated args
+            calls.append({
+                "call_id": "",
+                "name": "",
+                "arguments": "",
+                "_block_stop": True,
+                "_index": payload.get("index", 0),
+            })
+    # Responses /responses
+    elif "/responses" in path:
+        resp_type = payload.get("type", "")
+        # Check both 'item' and 'output' fields (providers differ)
+        item = payload.get("item") or payload.get("output") or {}
+        if resp_type in ("response.output_item.done", "response.function_call_arguments.done"):
+            if isinstance(item, dict) and item.get("type") == "function_call":
+                calls.append({
+                    "call_id": item.get("call_id", ""),
+                    "name": item.get("name", ""),
+                    "arguments": item.get("arguments", ""),
+                })
+        elif resp_type == "response.function_call_arguments.delta":
+            # Delta event — partial arguments
+            delta_val = payload.get("delta", "")
+            if isinstance(delta_val, str) and delta_val:
+                calls.append({
+                    "call_id": "",
+                    "name": "",
+                    "arguments": delta_val,
+                    "_partial": True,
+                    "_output_index": payload.get("output_index", 0),
+                })
+        elif resp_type == "response.output_item.added":
+            # Initial function_call added event — has call_id and name but empty arguments
+            if isinstance(item, dict) and item.get("type") == "function_call":
+                calls.append({
+                    "call_id": item.get("call_id", ""),
+                    "name": item.get("name", ""),
+                    "arguments": item.get("arguments", ""),
+                    "_initial": True,
+                })
+    # Unknown event name — try OpenAI format as fallback if path suggests it
+    elif path and "/chat/completions" in path:
+        choices = payload.get("choices", [])
+        for choice in choices:
+            delta = choice.get("delta", {})
+            tc_list = delta.get("tool_calls", [])
+            for tc in tc_list:
+                func = tc.get("function", {})
+                calls.append({
+                    "call_id": tc.get("id", ""),
+                    "name": func.get("name", ""),
+                    "arguments": func.get("arguments", ""),
+                })
+    return calls
+
+def _forced_tool_name(path: str, body: dict) -> str:
+    """Extract forced tool name from request body, or '' if not forced."""
+    tc = body.get("tool_choice")
+    if tc is None:
+        return ""
+    if isinstance(tc, str):
+        return ""  # "auto" or "none" — not forced
+    if isinstance(tc, dict):
+        # Responses: tool_choice.name
+        if tc.get("name"):
+            return tc["name"]
+        # OpenAI: tool_choice.function.name
+        fn = tc.get("function", {})
+        if fn.get("name"):
+            return fn["name"]
+        # Anthropic: tool_choice.type=tool, tool_choice.name
+        if tc.get("type") == "tool" and tc.get("name"):
+            return tc["name"]
+    return ""
+
+def run_streaming_orchestration(
+    handler: Any, path: str, body: dict
+) -> None:
+    """Streaming orchestration entry point (stub — full impl in gateway_streaming.py)."""
+    _send_sse_headers(handler)
+    handler.wfile.write(b'data: {"error": "streaming not implemented"}\r\n\r\n')
+
+def _streaming_tool_event_for_path(
+    path: str,
+    call_id: str,
+    name: str,
+    arguments: dict,
+    result: "ToolResult",
+    msg_id: str,
+    index: int,
+) -> list[tuple[str, dict]]:
+    """Build streaming SSE events for a tool call + result. Returns list of (event_name, payload).
+    Events follow each protocol's official streaming format."""
+    events: list[tuple[str, dict]] = []
+    args_str = json.dumps(arguments, ensure_ascii=False)
+    if "/chat/completions" in path:
+        # OpenAI chat completions: single delta chunk with tool_calls array
+        events.append(("chatcmpl", {
+            "id": msg_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": "",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": index,
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": args_str},
+                    }],
+                },
+                "finish_reason": None,
+            }],
+        }))
+        # Then finish_reason=tool_calls
+        events.append(("chatcmpl", {
+            "id": msg_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": "",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+        }))
+    elif "/messages" in path:
+        # Anthropic: content_block_start → content_block_delta → content_block_stop
+        events.append(("content_block_start", {
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {"type": "tool_use", "id": call_id, "name": name, "input": {}},
+        }))
+        events.append(("content_block_delta", {
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "input_json_delta", "partial_json": args_str},
+        }))
+        events.append(("content_block_stop", {
+            "type": "content_block_stop",
+            "index": index,
+        }))
+    elif "/responses" in path:
+        # Responses: output_item.added → function_call_arguments.done → output_item.done
+        fc_id = f"fc_{uuid.uuid4().hex}"
+        events.append(("response.output_item.added", {
+            "type": "response.output_item.added",
+            "output_index": index,
+            "item": {"type": "function_call", "id": fc_id, "call_id": call_id, "name": "", "arguments": ""},
+        }))
+        events.append(("response.function_call_arguments.done", {
+            "type": "response.function_call_arguments.done",
+            "output_index": index,
+            "item": {"type": "function_call", "id": fc_id, "call_id": call_id, "name": name, "arguments": args_str},
+        }))
+        events.append(("response.output_item.done", {
+            "type": "response.output_item.done",
+            "output_index": index,
+            "item": {"type": "function_call", "id": fc_id, "call_id": call_id, "name": name, "arguments": args_str},
+        }))
+    return events
 
 
 if __name__ == "__main__":

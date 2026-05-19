@@ -1316,6 +1316,56 @@ def _tool_connector_required(args: Json) -> str:
         failure_type="connector_required",
     )
 
+
+# --- Real computer_use / GUI / image_generation implementations ---
+
+def _tool_computer_use_real(args: Json) -> str:
+    try:
+        from . import gateway_computer_use as _cu
+    except ImportError:
+        import gateway_computer_use as _cu
+    return _cu._tool_computer_use(args)
+
+
+def _tool_click_real(args: Json) -> str:
+    try:
+        from . import gateway_computer_use as _cu
+    except ImportError:
+        import gateway_computer_use as _cu
+    return _cu._tool_click(args)
+
+
+def _tool_type_text_real(args: Json) -> str:
+    try:
+        from . import gateway_computer_use as _cu
+    except ImportError:
+        import gateway_computer_use as _cu
+    return _cu._tool_type_text(args)
+
+
+def _tool_press_key_real(args: Json) -> str:
+    try:
+        from . import gateway_computer_use as _cu
+    except ImportError:
+        import gateway_computer_use as _cu
+    return _cu._tool_press_key(args)
+
+
+def _tool_scroll_real(args: Json) -> str:
+    try:
+        from . import gateway_computer_use as _cu
+    except ImportError:
+        import gateway_computer_use as _cu
+    return _cu._tool_scroll(args)
+
+
+def _tool_image_generation_real(args: Json) -> str:
+    try:
+        from . import gateway_computer_use as _cu
+    except ImportError:
+        import gateway_computer_use as _cu
+    return _cu._tool_image_generation(args)
+
 def _make_tools() -> dict[str, GatewayTool]:
     path_props = {
         "file_path": {"type": "string"},
@@ -1402,21 +1452,16 @@ def _make_tools() -> dict[str, GatewayTool]:
         GatewayTool("file_search_call", "Search workspace files with a real local grep implementation.", _json_schema({"query": {"type": "string"}, "pattern": {"type": "string"}, "path": {"type": "string"}}), _tool_file_search_call, "read_local"),
         GatewayTool("web_search_call", "Run a real web search and return parsed results.", _json_schema({"query": {"type": "string"}, "max_results": {"type": "integer"}}), _tool_web_search_call, "read_network", aliases=("web_search_preview_2025_03_11",)),
         GatewayTool("Skill", "List/read local skills or execute a task with a skill guide through Agent.", _json_schema({"name": {"type": "string"}, "prompt": {"type": "string"}}), _tool_skill, "ai_agent", aliases=("skill", "list_skills", "read_skill", "run_skill")),
+        # --- Real computer_use / GUI tools (no placeholders) ---
+        GatewayTool("computer_use", "Take a screenshot of the current display. Returns path and optional base64.", _json_schema({"include_base64": {"type": "boolean"}}), _tool_computer_use_real, "gui", aliases=("computer_use_preview", "screenshot")),
+        GatewayTool("computer_call", "Take a screenshot — alias for computer_use.", _json_schema({"include_base64": {"type": "boolean"}}), _tool_computer_use_real, "gui"),
+        GatewayTool("image_generation", "Generate an image from a text prompt via Pollinations.ai (free) or configured API.", _json_schema({"prompt": {"type": "string"}, "size": {"type": "string"}}, ["prompt"]), _tool_image_generation_real, "gui", aliases=("generate_image",)),
+        GatewayTool("click", "Click at (x, y) on screen. Supports left/right/middle and double-click.", _json_schema({"x": {"type": "integer"}, "y": {"type": "integer"}, "button": {"type": "string"}, "double": {"type": "boolean"}}, ["x", "y"]), _tool_click_real, "gui", aliases=("mouse_click",)),
+        GatewayTool("type_text", "Type a text string via real keyboard events.", _json_schema({"text": {"type": "string"}, "interval": {"type": "number"}}, ["text"]), _tool_type_text_real, "gui", aliases=("type_input", "keyboard_type")),
+        GatewayTool("press_key", "Press a key or key combo (e.g. 'command+a', 'ctrl+shift+s', 'Enter').", _json_schema({"key": {"type": "string"}}, ["key"]), _tool_press_key_real, "gui", aliases=("key_press", "hotkey")),
+        GatewayTool("scroll", "Scroll the mouse wheel. dx=horizontal, dy=vertical.", _json_schema({"dx": {"type": "integer"}, "dy": {"type": "integer"}, "x": {"type": "integer"}, "y": {"type": "integer"}}), _tool_scroll_real, "gui", aliases=("mouse_scroll",)),
     ]
-    connector_required = [
-        # Claude Code / coding-agent orchestration surfaces.
-        # OpenAI hosted / external-runtime tools.
-        "computer_use",
-        "computer_use_preview",
-        "image_generation",
-        "computer_call",
-        # MCP/resource connectors not backed by a configured local MCP server.
-        # Local app / UI / streaming interaction surfaces need their own runtime.
-        "click",
-        "type_text",
-        "press_key",
-        "scroll",
-    ]
+    connector_required: list[str] = []  # all former placeholders now have real implementations
     registry: dict[str, GatewayTool] = {}
     for tool in tools:
         registry[tool.name] = tool

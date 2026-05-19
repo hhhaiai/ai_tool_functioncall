@@ -711,20 +711,34 @@ tools:
 验收命令建议：
 
 ```bash
-# Chat Completions native probe
+# Chat Completions native probe (non-streaming)
 curl http://127.0.0.1:8885/v1/native-tools/probe \
   -H 'Content-Type: application/json' \
   -d '{"path":"/v1/chat/completions","model":"目标模型"}'
 
-# Responses native probe
+# Responses native probe (non-streaming)
 curl http://127.0.0.1:8885/v1/native-tools/probe \
   -H 'Content-Type: application/json' \
   -d '{"path":"/v1/responses","model":"目标模型"}'
 
-# Anthropic Messages native probe
+# Anthropic Messages native probe (non-streaming)
 curl http://127.0.0.1:8885/v1/native-tools/probe \
   -H 'Content-Type: application/json' \
   -d '{"path":"/v1/messages","model":"目标模型"}'
+```
+
+#### 验收标准 2：Streaming tool events
+
+对于声明支持 streaming tools 的 provider，必须通过 `run_streaming_probe` 验证：
+
+1. SSE 流中包含 tool_call fragment，不是纯文本
+2. forced tool_choice 在 SSE 中被正确遵守（不是模型"自己想调用"）
+3. tool_call id 在整个 SSE session 中保持一致
+4. arguments JSON 片段可累积解析
+
+```bash
+# Streaming probe（通过管理接口或代码调用 run_streaming_probe）
+curl http://127.0.0.1:8885/admin/probe.json?path=/v1/chat/completions&force=1&streaming=1
 ```
 
 ---
@@ -773,11 +787,22 @@ curl http://127.0.0.1:8885/v1/native-tools/probe \
 
 实现：
 
-- OpenAI SSE tool call delta
-- Responses event stream
-- Anthropic event stream
-- 不完整 JSON arguments 拼接
-- tool event trace
+- [x] OpenAI SSE tool call delta 解析 (`_detect_streaming_tool_calls_from_sse`)
+- [x] Responses event stream 解析
+- [x] Anthropic event stream 解析
+- [ ] 不完整 JSON arguments 拼接（可累积）
+- [p2] tool execution trace：SQLite 新增 `execution_ms` / `retry_count` / `provider` 字段，streaming event trace 待完成
+- [x] run_streaming_probe streaming 强制 tool 验证
+- [x] run_streaming_orchestration 边收边执行边流回
+- [x] streaming passthrough 模式 (`_stream_mode_passthrough`)
+
+```python
+# 核心实现
+run_streaming_orchestration(handler, path, body)  # SSE 边收边执行边流回
+run_streaming_probe(path, model)                  # streaming forced tool probe
+_streaming_tool_event_for_path(...)               # 三协议 tool result 序列化
+_detect_streaming_tool_calls_from_sse(...)        # 从 SSE 提取 tool_call fragment
+```
 
 ### 阶段 5：安全和生产化
 

@@ -1385,6 +1385,10 @@ while True:
                 gateway.save_config(
                     {
                         **gateway._default_config(),
+                        "upstream": {
+                            **gateway._default_config().get("upstream", {}),
+                            "tools_enabled": "native",
+                        },
                         "http_actions": {
                             "enabled": True,
                             "actions": [
@@ -1974,3 +1978,357 @@ while True:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ─────────────────────────────────────────────────────────────────
+# Streaming / SSE Tests
+# ─────────────────────────────────────────────────────────────────
+
+class StreamingToolEventTests(unittest.TestCase):
+    """Tests for P1 streaming tool event implementation."""
+
+    def test_parse_sse_line_data(self):
+        event, data = gateway._parse_sse_line("data: {\"foo\": 1}")
+        self.assertIsNone(event)
+        self.assertEqual(data, '{"foo": 1}')
+
+    def test_parse_sse_line_event_and_data(self):
+        event, data = gateway._parse_sse_line('event: tool_use\ndata: {"type":"tool_use"}')
+        self.assertEqual(event, "tool_use")
+        self.assertEqual(data, '{"type":"tool_use"}')
+
+    def test_parse_sse_line_done(self):
+        event, data = gateway._parse_sse_line("data: [DONE]")
+        self.assertIsNone(event)
+        self.assertEqual(data, "[DONE]")
+
+    def test_parse_sse_line_comment(self):
+        event, data = gateway._parse_sse_line(": comment")
+        self.assertIsNone(event)
+        self.assertIsNone(data)
+
+    def test_parse_sse_line_empty(self):
+        event, data = gateway._parse_sse_line("")
+        self.assertIsNone(event)
+        self.assertIsNone(data)
+
+    def test_parse_sse_line_real_openai_chunk(self):
+        # Real SSE line format from OpenAI streaming
+        line = 'data: {"id":"chatcmpl-1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"echo_probe","arguments":"{}"}}]}}]})'
+        event, data = gateway._parse_sse_line(line)
+        self.assertIsNone(event)
+        parsed = json.loads(data)
+        self.assertEqual(parsed["choices"][0]["delta"]["tool_calls"][0]["function"]["name"], "echo_probe")
+
+    def test_parse_sse_line_real_anthropic_event(self):
+        line = 'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"echo_probe","input":{}}}'
+        event, data = gateway._parse_sse_line(line)
+        self.assertEqual(event, "content_block_start")
+        parsed = json.loads(data)
+        self.assertEqual(parsed["content_block"]["name"], "echo_probe")
+
+    # ── _detect_streaming_tool_calls_from_sse ──────────────────────
+
+    def test_detect_openai_delta(self):
+        """OpenAI SSE delta fragment → call_id + name + partial args."""
+        line = 'data: {"id":"c","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"echo_probe","arguments":"{}"}}]}}]})'
+        _, data = gateway._parse_sse_line(line)
+        calls = gateway._detect_streaming_tool_calls_from_sse("/v1/chat/completions", None, data)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["call_id"], "call_1")
+        self.assertEqual(calls[0]["name"], "echo_probe")
+        self.assertEqual(calls[0]["arguments"], "{}")
+
+    def test_detect_openai_arguments_fragment(self):
+        """OpenAI arguments arrive in a separate delta chunk."""
+        # First chunk: just function name
+        line1 = 'data: {"id":"c","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"echo_probe"}}]}}]})'
+        _, d1 = gateway._parse_sse_line(line1)
+        _, d1 = gateway._parse_sse_line(line1)
+        calls1 = gateway._detect_streaming_tool_calls_from_sse("/v1/chat/completions", None, d1)
+        self.assertEqual(calls1[0]["name"], "echo_probe")
+        self.assertEqual(calls1[0].get("arguments", ""), "")
+
+        # Second chunk: partial arguments (complete JSON string fragment)
+        line2 = 'data: {"id":"c","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"value\\": 1}"}}]}}]})'
+        _, d2 = gateway._parse_sse_line(line2)
+        calls2 = gateway._detect_streaming_tool_calls_from_sse("/v1/chat/completions", None, d2)
+        self.assertEqual(len(calls2), 1)
+        self.assertEqual(calls2[0]["arguments"], '{"value": 1}')
+
+    def test_detect_openai_done(self):
+        """OpenAI [DONE] sentinel → empty list."""
+        _, data = gateway._parse_sse_line("data: [DONE]")
+        calls = gateway._detect_streaming_tool_calls_from_sse("/v1/chat/completions", None, data)
+        self.assertEqual(calls, [])
+
+    def test_detect_openai_text_delta_ignored(self):
+        """OpenAI text content delta → not a tool call."""
+        line = 'data: {"id":"c","choices":[{"delta":{"content":"The result"}}]})'
+        _, data = gateway._parse_sse_line(line)
+        calls = gateway._detect_streaming_tool_calls_from_sse("/v1/chat/completions", None, data)
+        self.assertEqual(calls, [])
+
+    def test_detect_anthropic_content_block_start(self):
+        """Anthropic content_block_start with type=tool_use → parsed."""
+        line = 'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"echo_probe","input":{}}}'
+        event, data = gateway._parse_sse_line(line)
+        calls = gateway._detect_streaming_tool_calls_from_sse("/v1/messages", event, data)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["call_id"], "toolu_1")
+        self.assertEqual(calls[0]["name"], "echo_probe")
+
+    def test_detect_anthropic_content_block_delta(self):
+        """Anthropic content_block_delta with input_json_delta → partial result."""
+        line = 'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"value\\":"}}'
+        event, data = gateway._parse_sse_line(line)
+        calls = gateway._detect_streaming_tool_calls_from_sse("/v1/messages", event, data)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0].get("_partial"))
+        self.assertEqual(calls[0]["arguments"], '{"value":')
+        self.assertEqual(calls[0]["_index"], 0)
+
+    def test_detect_anthropic_text_delta_ignored(self):
+        """Anthropic text content_block → not a tool call."""
+        line = 'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}'
+        event, data = gateway._parse_sse_line(line)
+        calls = gateway._detect_streaming_tool_calls_from_sse("/v1/messages", event, data)
+        self.assertEqual(calls, [])
+
+    def test_detect_anthropic_content_block_stop(self):
+        """Anthropic content_block_stop → block_stop signal."""
+        line = 'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}'
+        event, data = gateway._parse_sse_line(line)
+        calls = gateway._detect_streaming_tool_calls_from_sse("/v1/messages", event, data)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0].get("_block_stop"))
+        self.assertEqual(calls[0]["_index"], 0)
+
+    def test_detect_anthropic_text_delta_non_tool(self):
+        """Anthropic content_block_delta for text → ignored."""
+        line = 'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}'
+        event, data = gateway._parse_sse_line(line)
+        calls = gateway._detect_streaming_tool_calls_from_sse("/v1/messages", event, data)
+        self.assertEqual(calls, [])
+
+    def test_detect_responses_function_call(self):
+        """OpenAI Responses output_item event with 'output' field → parsed."""
+        line = 'event: response.output_item.done\ndata: {"type":"response.output_item.done","output":{"type":"function_call","call_id":"rc_1","name":"echo_probe","arguments":"{\\"value\\":\\"probe\\"}"}}'
+        event, data = gateway._parse_sse_line(line)
+        calls = gateway._detect_streaming_tool_calls_from_sse("/v1/responses", event, data)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["call_id"], "rc_1")
+        self.assertEqual(calls[0]["name"], "echo_probe")
+        self.assertEqual(calls[0]["arguments"], '{"value":"probe"}')
+
+    def test_detect_responses_function_call_item_field(self):
+        """Responses output_item.done with 'item' field (fufu format) → parsed."""
+        line = 'event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","id":"fc_abc","call_id":"call_xyz","name":"calc","arguments":"{\\"expr\\": \\"2+2\\"}"}}'
+        event, data = gateway._parse_sse_line(line)
+        calls = gateway._detect_streaming_tool_calls_from_sse("/v1/responses", event, data)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["call_id"], "call_xyz")
+        self.assertEqual(calls[0]["name"], "calc")
+        self.assertEqual(calls[0]["arguments"], '{"expr": "2+2"}')
+
+    def test_detect_responses_function_call_arguments_done(self):
+        """Responses function_call_arguments.done → parsed."""
+        line = 'event: response.function_call_arguments.done\ndata: {"type":"response.function_call_arguments.done","output_index":0,"item":{"type":"function_call","id":"fc_abc","call_id":"call_xyz","name":"calc","arguments":"{\\"expr\\": \\"2+2\\"}"}}'
+        event, data = gateway._parse_sse_line(line)
+        calls = gateway._detect_streaming_tool_calls_from_sse("/v1/responses", event, data)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["call_id"], "call_xyz")
+        self.assertEqual(calls[0]["name"], "calc")
+
+    def test_detect_responses_output_item_added(self):
+        """Responses output_item.added with function_call → initial signal."""
+        line = 'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_abc","call_id":"call_xyz","name":"calc","arguments":""}}'
+        event, data = gateway._parse_sse_line(line)
+        calls = gateway._detect_streaming_tool_calls_from_sse("/v1/responses", event, data)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["call_id"], "call_xyz")
+        self.assertEqual(calls[0]["name"], "calc")
+        self.assertTrue(calls[0].get("_initial"))
+
+    def test_detect_responses_partial_args(self):
+        """Responses function_call_arguments.delta → partial result."""
+        line = 'event: response.function_call_arguments.delta\ndata: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\\"expr\\": \\"2+2\\"}"}'
+        event, data = gateway._parse_sse_line(line)
+        calls = gateway._detect_streaming_tool_calls_from_sse("/v1/responses", event, data)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0].get("_partial"))
+        self.assertEqual(calls[0]["arguments"], '{"expr": "2+2"}')
+
+    def test_detect_unknown_event_passthrough(self):
+        """Unknown event name → still try to parse as JSON data."""
+        line = 'event: custom_event\ndata: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"x"}}]}}]})'
+        event, data = gateway._parse_sse_line(line)
+        calls = gateway._detect_streaming_tool_calls_from_sse("/v1/chat/completions", event, data)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["name"], "x")
+
+    def test_detect_invalid_json_returns_empty(self):
+        """Non-JSON data line → empty list, no crash."""
+        calls = gateway._detect_streaming_tool_calls_from_sse("/v1/chat/completions", None, "not json at all")
+        self.assertEqual(calls, [])
+
+    # ── _streaming_tool_event_for_path ─────────────────────────────
+
+    def test_streaming_tool_event_openai(self):
+        result = gateway.ToolResult(
+            call_id="call_1", name="echo_probe",
+            content=json.dumps({"value": "ok"}),
+            success=True,
+        )
+        events = gateway._streaming_tool_event_for_path(
+            "/v1/chat/completions", "call_1", "echo_probe",
+            {"value": "ok"}, result, "chatcmpl-1", 0,
+        )
+        self.assertIsInstance(events, list)
+        self.assertEqual(len(events), 2)
+        # First event: delta with tool_calls
+        event_name, payload = events[0]
+        self.assertEqual(event_name, "chatcmpl")
+        tc = payload["choices"][0]["delta"]["tool_calls"][0]
+        self.assertEqual(tc["id"], "call_1")
+        self.assertEqual(tc["function"]["name"], "echo_probe")
+        self.assertIsNone(payload["choices"][0]["finish_reason"])
+        # Second event: finish_reason=tool_calls
+        event_name2, payload2 = events[1]
+        self.assertEqual(event_name2, "chatcmpl")
+        self.assertEqual(payload2["choices"][0]["finish_reason"], "tool_calls")
+
+    def test_streaming_tool_event_anthropic(self):
+        result = gateway.ToolResult(
+            call_id="toolu_1", name="echo_probe",
+            content=json.dumps({"value": "ok"}),
+            success=True,
+        )
+        events = gateway._streaming_tool_event_for_path(
+            "/v1/messages", "toolu_1", "echo_probe",
+            {"value": "ok"}, result, "msg_1", 0,
+        )
+        # Should produce: content_block_start → content_block_delta → content_block_stop
+        self.assertEqual(len(events), 3)
+        event_names = [e[0] for e in events]
+        self.assertEqual(event_names, ["content_block_start", "content_block_delta", "content_block_stop"])
+        # Verify content_block_start
+        _, start_payload = events[0]
+        self.assertEqual(start_payload["type"], "content_block_start")
+        cb = start_payload["content_block"]
+        self.assertEqual(cb["type"], "tool_use")
+        self.assertEqual(cb["id"], "toolu_1")
+        self.assertEqual(cb["name"], "echo_probe")
+        # Verify content_block_delta
+        _, delta_payload = events[1]
+        self.assertEqual(delta_payload["type"], "content_block_delta")
+        self.assertEqual(delta_payload["delta"]["type"], "input_json_delta")
+        self.assertIn("partial_json", delta_payload["delta"])
+        # Verify content_block_stop
+        _, stop_payload = events[2]
+        self.assertEqual(stop_payload["type"], "content_block_stop")
+
+    def test_streaming_tool_event_responses(self):
+        result = gateway.ToolResult(
+            call_id="rc_1", name="echo_probe",
+            content=json.dumps({"value": "ok"}),
+            success=True,
+        )
+        events = gateway._streaming_tool_event_for_path(
+            "/v1/responses", "rc_1", "echo_probe",
+            {"value": "ok"}, result, "resp_1", 0,
+        )
+        self.assertGreater(len(events), 0)
+        # For responses, check the item type in each event
+        item_types = {payload.get("item", {}).get("type") for _, payload in events}
+        self.assertIn("function_call", item_types)
+
+    def test_streaming_tool_event_error_openai(self):
+        result = gateway.ToolResult(
+            call_id="call_1", name="echo_probe",
+            content="tool failed",
+            success=False,
+            failure_type="execution_error",
+        )
+        events = gateway._streaming_tool_event_for_path(
+            "/v1/chat/completions", "call_1", "echo_probe",
+            {}, result, "chatcmpl-1", 0,
+        )
+        self.assertGreater(len(events), 0)
+        # For chat.completions, check finish_reason in choices or tool_calls in delta
+        # events is list of (event_name, payload) tuples
+        has_tool_calls = any(
+            payload.get("choices", [{}])[0].get("finish_reason") == "tool_calls"
+            or payload.get("choices", [{}])[0].get("delta", {}).get("tool_calls")
+            for _, payload in events
+        )
+        self.assertTrue(has_tool_calls)
+
+    # ── _forced_tool_name ──────────────────────────────────────────
+
+    def test_forced_tool_name_openai(self):
+        body = {"tool_choice": {"type": "function", "function": {"name": "calculator"}}}
+        self.assertEqual(gateway._forced_tool_name("/v1/chat/completions", body), "calculator")
+
+    def test_forced_tool_name_anthropic(self):
+        body = {"tool_choice": {"type": "tool", "name": "calculator"}}
+        self.assertEqual(gateway._forced_tool_name("/v1/messages", body), "calculator")
+
+    def test_forced_tool_name_responses(self):
+        body = {"tool_choice": {"type": "function", "name": "calculator"}}
+        self.assertEqual(gateway._forced_tool_name("/v1/responses", body), "calculator")
+
+    def test_forced_tool_name_auto_is_not_forced(self):
+        body = {"tool_choice": "auto"}
+        self.assertEqual(gateway._forced_tool_name("/v1/chat/completions", body), "")
+
+    def test_forced_tool_name_missing(self):
+        body = {"messages": []}
+        self.assertEqual(gateway._forced_tool_name("/v1/chat/completions", body), "")
+
+    # ── _stream_mode_passthrough ───────────────────────────────────
+
+    def test_stream_mode_passthrough_env_off(self):
+        old = os.environ.get("GATEWAY_TOOL_MODE", "")
+        try:
+            os.environ["GATEWAY_TOOL_MODE"] = "0"
+            self.assertFalse(gateway._stream_mode_passthrough())
+        finally:
+            if old:
+                os.environ["GATEWAY_TOOL_MODE"] = old
+            else:
+                os.environ.pop("GATEWAY_TOOL_MODE", None)
+
+    def test_stream_mode_passthrough_env_passthrough(self):
+        old = os.environ.get("GATEWAY_TOOL_MODE", "")
+        try:
+            os.environ["GATEWAY_TOOL_MODE"] = "passthrough"
+            self.assertTrue(gateway._stream_mode_passthrough())
+        finally:
+            if old:
+                os.environ["GATEWAY_TOOL_MODE"] = old
+            else:
+                os.environ.pop("GATEWAY_TOOL_MODE", None)
+
+    def test_stream_mode_passthrough_default_orchestrate(self):
+        old = os.environ.get("GATEWAY_TOOL_MODE", "")
+        try:
+            os.environ.pop("GATEWAY_TOOL_MODE", None)
+            self.assertFalse(gateway._stream_mode_passthrough())
+        finally:
+            if old:
+                os.environ["GATEWAY_TOOL_MODE"] = old
+            elif "GATEWAY_TOOL_MODE" in os.environ:
+                del os.environ["GATEWAY_TOOL_MODE"]
+
+    # ── run_streaming_orchestration stub ───────────────────────────
+
+    def test_streaming_orchestration_needs_handler_path_body(self):
+        """Smoke: run_streaming_orchestration exists and has the right signature."""
+        import inspect
+        sig = inspect.signature(gateway.run_streaming_orchestration)
+        params = list(sig.parameters.keys())
+        self.assertIn("handler", params)
+        self.assertIn("path", params)
+        self.assertIn("body", params)
+

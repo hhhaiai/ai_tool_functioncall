@@ -1,0 +1,24 @@
+[
+  {
+    "name": "github",
+    "type": "mcp_stdio",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-github"],
+    "env": ["GITHUB_TOKEN"],
+    "cwd": ".",
+    "enabled": false,
+    "pool": true,
+    "catalog_ttl": 60
+  },
+  {
+    "name": "filesystem",
+    "type": "mcp_stdio",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-filesystem"],
+    "env": [],
+    "cwd": ".",
+    "enabled": false,
+    "pool": true,
+    "catalog_ttl": 60
+  }
+]
