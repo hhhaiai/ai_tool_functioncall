@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import traceback
+import urllib.parse
 from http.server import BaseHTTPRequestHandler
 from typing import Any
 
@@ -163,6 +164,53 @@ def _read_form(handler: BaseHTTPRequestHandler) -> dict[str, str]:
     import urllib.parse
     parsed = urllib.parse.parse_qs(raw)
     return {k: v[0] if v else "" for k, v in parsed.items()}
+
+
+def _url_origin(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        parsed = urllib.parse.urlparse(value.strip())
+    except Exception:
+        return None
+    if not parsed.scheme or not parsed.netloc or not parsed.hostname:
+        return None
+    try:
+        scheme = parsed.scheme.lower()
+        host = parsed.hostname.lower()
+        port = parsed.port
+    except ValueError:
+        return None
+    default_port = 443 if scheme == "https" else 80 if scheme == "http" else None
+    if port and port != default_port:
+        host = f"{host}:{port}"
+    return f"{scheme}://{host}"
+
+
+def _request_origin(handler: BaseHTTPRequestHandler) -> str | None:
+    host = (handler.headers.get("X-Forwarded-Host") or handler.headers.get("Host") or "").split(",", 1)[0].strip()
+    if not host:
+        return None
+    proto = (handler.headers.get("X-Forwarded-Proto") or "http").split(",", 1)[0].strip().lower()
+    return _url_origin(f"{proto}://{host}")
+
+
+def _check_admin_origin(handler: BaseHTTPRequestHandler, cfg: Json) -> bool:
+    """Reject browser cross-origin admin writes while keeping CLI requests working."""
+    source = handler.headers.get("Origin") or handler.headers.get("Referer")
+    if not source:
+        return True
+    source_origin = _url_origin(source)
+    if not source_origin:
+        _json_response(handler, 403, _error_payload("cross-origin admin request rejected"))
+        return False
+    allowed = {_request_origin(handler)}
+    gateway_cfg = cfg.get("gateway", {}) if isinstance(cfg.get("gateway"), dict) else {}
+    allowed.add(_url_origin(str(gateway_cfg.get("public_base_url") or "")))
+    if source_origin in {origin for origin in allowed if origin}:
+        return True
+    _json_response(handler, 403, _error_payload("cross-origin admin request rejected"))
+    return False
 
 
 def _redirect(handler: BaseHTTPRequestHandler, location: str = "/ui") -> None:
@@ -349,9 +397,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if path in {"/admin/config", "/admin/upstream-profile", "/admin/client-config", "/admin/password", "/admin/downstream-key", "/admin/mcp", "/admin/mcp-reload", "/admin/http-actions"}:
                 if not _check_admin(self):
                     return
-                form = _read_form(self)
                 from .gateway_config import load_config, save_config
                 cfg = load_config()
+                if not _check_admin_origin(self, cfg):
+                    return
+                form = _read_form(self)
                 if path == "/admin/mcp-reload":
                     from .gateway_mcp import _mcp_close_sessions
                     _mcp_close_sessions()

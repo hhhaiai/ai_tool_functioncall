@@ -1188,6 +1188,133 @@ class NativeGatewayTests(unittest.TestCase):
                 thread.join(timeout=2)
                 gateway.CONFIG_PATH = old_config
 
+    def test_admin_post_rejects_cross_origin_browser_request(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                gateway.save_config(gateway._default_config())
+                token = base64.b64encode(b"admin:admin").decode("ascii")
+                form = urllib.parse.urlencode(
+                    {
+                        "public_base_url": "http://attacker-controlled.local",
+                        "client_snippet_api_key": "should-not-save",
+                    }
+                ).encode("utf-8")
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{httpd.server_address[1]}/admin/client-config",
+                    data=form,
+                    headers={
+                        "authorization": f"Basic {token}",
+                        "content-type": "application/x-www-form-urlencoded",
+                        "Origin": "https://evil.example",
+                    },
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as err:
+                    urllib.request.urlopen(req, timeout=5).read()
+                self.assertEqual(err.exception.code, 403)
+                payload = json.loads(err.exception.read().decode("utf-8"))
+                self.assertIn("cross-origin admin request rejected", payload["error"]["message"])
+                saved = gateway.load_config()
+                self.assertNotEqual(saved["gateway"]["public_base_url"], "http://attacker-controlled.local")
+                self.assertNotEqual(saved["gateway"]["client_snippet_api_key"], "should-not-save")
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+
+    def test_admin_post_rejects_malformed_origin_without_mutating_config(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                gateway.save_config(gateway._default_config())
+                token = base64.b64encode(b"admin:admin").decode("ascii")
+                form = urllib.parse.urlencode(
+                    {
+                        "public_base_url": "http://malformed-origin.local",
+                        "client_snippet_api_key": "should-not-save",
+                    }
+                ).encode("utf-8")
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{httpd.server_address[1]}/admin/client-config",
+                    data=form,
+                    headers={
+                        "authorization": f"Basic {token}",
+                        "content-type": "application/x-www-form-urlencoded",
+                        "Origin": "http://127.0.0.1:bad-port",
+                    },
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as err:
+                    urllib.request.urlopen(req, timeout=5).read()
+                self.assertEqual(err.exception.code, 403)
+                payload = json.loads(err.exception.read().decode("utf-8"))
+                self.assertIn("cross-origin admin request rejected", payload["error"]["message"])
+                saved = gateway.load_config()
+                self.assertNotEqual(saved["gateway"]["public_base_url"], "http://malformed-origin.local")
+                self.assertNotEqual(saved["gateway"]["client_snippet_api_key"], "should-not-save")
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+
+    def test_admin_post_allows_same_origin_browser_request(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                gateway.save_config(gateway._default_config())
+                token = base64.b64encode(b"admin:admin").decode("ascii")
+                base = f"http://127.0.0.1:{httpd.server_address[1]}"
+                form = urllib.parse.urlencode(
+                    {
+                        "public_base_url": "http://same-origin.local:8885",
+                        "client_snippet_api_key": "same-origin-key",
+                        "downstream_model_alias": "gpt-5.4",
+                        "review_model_alias": "gpt-5.4",
+                        "codex_reasoning_effort": "xhigh",
+                        "client_context_window": "1000000",
+                        "client_auto_compact_token_limit": "900000",
+                        "client_output_token_limit": "128000",
+                    }
+                ).encode("utf-8")
+                req = urllib.request.Request(
+                    base + "/admin/client-config",
+                    data=form,
+                    headers={
+                        "authorization": f"Basic {token}",
+                        "content-type": "application/x-www-form-urlencoded",
+                        "Origin": base,
+                    },
+                    method="POST",
+                )
+                try:
+                    urllib.request.urlopen(req, timeout=5).read()
+                except Exception as exc:
+                    if getattr(exc, "code", None) != 303:
+                        raise
+                saved = gateway.load_config()
+                self.assertEqual(saved["gateway"]["public_base_url"], "http://same-origin.local:8885")
+                self.assertEqual(saved["gateway"]["client_snippet_api_key"], "same-origin-key")
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+
     def test_downstream_key_protocol_restrictions_include_models_compatibility(self):
         class DummyHandler:
             def __init__(self, path: str, key: str):

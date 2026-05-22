@@ -205,6 +205,8 @@ curl http://127.0.0.1:8885/healthz
 
 请求/响应日志和 Admin 配置展示会递归遮盖常见敏感字段，包括 `Authorization`、`X-API-Key`、`Cookie`、token、secret、password、`key_hash` 等；`must_change_password` 等非敏感状态字段会保留原值。
 
+Admin 写操作会校验浏览器 `Origin` / `Referer`：跨源请求返回 403，畸形来源 fail closed；同源请求和无来源头的 CLI/脚本请求保持可用。反向代理部署时请正确传递 `Host` / `X-Forwarded-Host` / `X-Forwarded-Proto`，或配置 `gateway.public_base_url`。
+
 ---
 
 ## 4. 启动服务
@@ -292,7 +294,7 @@ curl http://127.0.0.1:8885/v1/models \
 ### 5.4 运行测试套件
 
 ```bash
-# 运行全部测试（当前 139 个）
+# 运行全部测试（当前 142 个）
 python3 -m unittest discover -s tests -v
 
 # 运行集成测试
