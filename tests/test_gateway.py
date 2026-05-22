@@ -6,6 +6,7 @@ import pathlib
 import sys
 import tempfile
 import threading
+import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -328,6 +329,63 @@ class NativeGatewayTests(unittest.TestCase):
                 self.assertEqual(cfg["admin"]["password_hash"], expected_hash)
                 self.assertNotIn("password", cfg["admin"])
             finally:
+                gateway.CONFIG_PATH = old_config
+
+    def test_invalid_config_file_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                gateway.CONFIG_PATH.write_text("{not valid json", encoding="utf-8")
+                with self.assertRaises(gateway.ConfigError) as json_error:
+                    gateway.load_config()
+                self.assertIn("invalid gateway config", str(json_error.exception))
+                self.assertIn("JSONDecodeError", str(json_error.exception.detail))
+
+                gateway.CONFIG_PATH.write_text("[]", encoding="utf-8")
+                with self.assertRaises(gateway.ConfigError) as root_error:
+                    gateway.load_config()
+                self.assertIn("config root must be object", str(root_error.exception.detail))
+            finally:
+                gateway.CONFIG_PATH = old_config
+
+    def test_invalid_config_returns_structured_error_for_admin_and_api(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            gateway.CONFIG_PATH.write_text("{not valid json", encoding="utf-8")
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base = f"http://127.0.0.1:{httpd.server_address[1]}"
+                token = base64.b64encode(b"admin:admin").decode("ascii")
+
+                ui_req = urllib.request.Request(base + "/ui", headers={"authorization": f"Basic {token}"})
+                with self.assertRaises(urllib.error.HTTPError) as ui_error:
+                    urllib.request.urlopen(ui_req, timeout=5)
+                self.assertEqual(ui_error.exception.code, 500)
+                ui_payload = json.loads(ui_error.exception.read().decode("utf-8"))
+                self.assertIn("invalid gateway config", ui_payload["error"]["message"])
+                self.assertIn("JSONDecodeError", ui_payload["error"]["detail"])
+
+                tool_req = urllib.request.Request(
+                    base + "/v1/tools/call",
+                    data=json.dumps({"tool": "calculator", "arguments": {"expression": "6*7"}}).encode("utf-8"),
+                    headers={"authorization": "Bearer local-gateway-key", "content-type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as tool_error:
+                    urllib.request.urlopen(tool_req, timeout=5)
+                self.assertEqual(tool_error.exception.code, 500)
+                tool_payload = json.loads(tool_error.exception.read().decode("utf-8"))
+                self.assertIn("invalid gateway config", tool_payload["error"]["message"])
+                self.assertIn("JSONDecodeError", tool_payload["error"]["detail"])
+                self.assertNotIn("success", tool_payload)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
                 gateway.CONFIG_PATH = old_config
 
     def test_client_snippet_key_is_normalized_into_downstream_auth(self):

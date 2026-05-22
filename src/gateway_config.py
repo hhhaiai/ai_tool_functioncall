@@ -14,6 +14,8 @@ import re
 import uuid
 from typing import Any
 
+from .gateway_errors import ConfigError
+
 Json = dict[str, Any]
 
 CONFIG_PATH = pathlib.Path(os.environ.get("GATEWAY_CONFIG_PATH") or ".gateway_service.json")
@@ -195,8 +197,11 @@ def load_config() -> Json:
         loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         if not isinstance(loaded, dict):
             raise ValueError("config root must be object")
-    except Exception:
-        loaded = {}
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise ConfigError(
+            f"invalid gateway config: {CONFIG_PATH}",
+            detail=f"{exc.__class__.__name__}: {exc}",
+        ) from exc
     cfg = _default_config()
     _normalize_admin_credentials(loaded)
     _deep_update(cfg, loaded)

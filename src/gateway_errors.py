@@ -39,6 +39,10 @@ class GatewayBusyError(GatewayError):
     status = 429
 
 
+class ConfigError(GatewayError):
+    status = 500
+
+
 class ToolExecutionError(Exception):
     def __init__(self, message: str, *, failure_type: str = "execution_failed") -> None:
         super().__init__(message)

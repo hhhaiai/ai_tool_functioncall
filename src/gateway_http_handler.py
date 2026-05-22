@@ -6,6 +6,7 @@ Handles HTTP routing, request/response processing, and API endpoints.
 from __future__ import annotations
 
 import base64
+import hmac
 import html
 import json
 import os
@@ -63,6 +64,11 @@ def _read_json(handler: BaseHTTPRequestHandler) -> Json:
         raise GatewayError(f"invalid JSON: {e}") from e
 
 
+def _constant_time_equal(left: object, right: object) -> bool:
+    """Compare auth material without leaking timing or failing on unicode input."""
+    return hmac.compare_digest(str(left).encode("utf-8"), str(right).encode("utf-8"))
+
+
 def _parse_basic_auth(header: str | None) -> tuple[str, str] | None:
     if not header or not header.startswith("Basic "):
         return None
@@ -78,14 +84,18 @@ def _parse_basic_auth(header: str | None) -> tuple[str, str] | None:
 
 def _check_admin(handler: BaseHTTPRequestHandler) -> bool:
     from .gateway_config import load_config, _hash_secret
-    cfg = load_config()
+    try:
+        cfg = load_config()
+    except Exception as exc:
+        _handle_error(handler, handler.path.split("?", 1)[0], exc)
+        return False
     admin = cfg.get("admin", {})
     auth = handler.headers.get("Authorization")
     creds = _parse_basic_auth(auth)
     if creds:
         username, password = creds
-        if username == admin.get("username", "admin"):
-            if _hash_secret(password) == admin.get("password_hash"):
+        if _constant_time_equal(username, admin.get("username", "admin")):
+            if _constant_time_equal(_hash_secret(password), admin.get("password_hash") or ""):
                 return True
     handler.send_response(401)
     handler.send_header("WWW-Authenticate", 'Basic realm="Gateway Admin"')
@@ -116,7 +126,7 @@ def _check_downstream_key(handler: BaseHTTPRequestHandler) -> str | None:
     key_hash = _hash_secret(api_key)
     for dk in downstream_keys:
         if isinstance(dk, dict) and dk.get("enabled", True):
-            if dk.get("key_hash") == key_hash:
+            if _constant_time_equal(dk.get("key_hash") or "", key_hash):
                 protocols = set(dk.get("protocols") or [])
                 if protocols:
                     route = "models"
@@ -401,7 +411,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         _json_response(self, 400, _error_payload("missing old_password or new_password"))
                         return
                     admin = cfg.get("admin", {})
-                    if _hash_secret(old_password) != admin.get("password_hash"):
+                    if not _constant_time_equal(_hash_secret(old_password), admin.get("password_hash") or ""):
                         _json_response(self, 403, _error_payload("invalid old password"))
                         return
                     admin["password_hash"] = _hash_secret(new_password)
@@ -553,20 +563,26 @@ class GatewayHandler(BaseHTTPRequestHandler):
 def _handle_error(handler: BaseHTTPRequestHandler, path: str, exc: Exception) -> None:
     from .gateway_errors import GatewayError, UpstreamHTTPError, DownstreamAuthError, GatewayBusyError
     from .gateway_logging import _record_request_stat
+    def record_status(status: int) -> None:
+        try:
+            _record_request_stat(path, status)
+        except Exception:
+            pass
+
     if isinstance(exc, UpstreamHTTPError):
-        _record_request_stat(path, 502)
+        record_status(502)
         _safe_json_response(handler, 502, _error_payload(str(exc), detail=exc.detail, upstream_status=exc.upstream_status))
     elif isinstance(exc, DownstreamAuthError):
-        _record_request_stat(path, 401)
+        record_status(401)
         _safe_json_response(handler, 401, _error_payload(str(exc)))
     elif isinstance(exc, GatewayBusyError):
-        _record_request_stat(path, 429)
+        record_status(429)
         _safe_json_response(handler, 429, _error_payload(str(exc)))
     elif isinstance(exc, GatewayError):
-        _record_request_stat(path, exc.status)
+        record_status(exc.status)
         _safe_json_response(handler, exc.status, _error_payload(str(exc), detail=exc.detail))
     else:
         if os.environ.get("DEBUG"):
             traceback.print_exc()
-        _record_request_stat(path, 500)
+        record_status(500)
         _safe_json_response(handler, 500, _error_payload(str(exc)))

@@ -28,6 +28,7 @@ from .gateway_errors import (
     NativeToolVerificationError,
     DownstreamAuthError,
     GatewayBusyError,
+    ConfigError,
     ToolExecutionError,
 )
 from .gateway_config import (

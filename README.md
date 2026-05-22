@@ -60,7 +60,7 @@
 
 ```bash
 python3 -m unittest discover -s tests -v
-# 135 tests OK
+# 137 tests OK
 ```
 
 ---
@@ -181,4 +181,5 @@ src/
 - 写文件、Shell、GUI、网络类工具要通过配置显式授权；公开模板和 Docker 默认关闭写入/Shell。
 - `admin.password` 模板字段会在加载/保存时转换为 `password_hash`，避免明文密码被回写。
 - `gateway.client_snippet_api_key` 会自动同步成可认证的 downstream key，避免复制出的客户端配置不可用。
+- 已存在配置文件如果 JSON 损坏或根节点不是对象，会 fail closed 返回结构化 500；不会回退到默认 `admin/admin` 或无下游鉴权。
 - `gateway_app.py` 当前保留旧单体兼容导出层，新增实现应优先放入对应 `gateway_*` 模块。

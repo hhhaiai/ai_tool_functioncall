@@ -201,6 +201,8 @@ curl http://127.0.0.1:8885/healthz
 | `GATEWAY_HOST` | - | 监听地址（默认 0.0.0.0） |
 | `GATEWAY_SQLITE_LOG_PATH` | gateway.sqlite_log_path | SQLite 请求/工具/记忆日志路径 |
 
+配置文件存在但 JSON 损坏或根节点不是对象时，Gateway 会 fail closed：Admin/API 请求返回结构化 500 `invalid gateway config`，不会静默回退到默认 `admin/admin` 或无下游鉴权。修复方式是恢复有效 `.gateway_service.json`，而不是依赖代码默认值。
+
 ---
 
 ## 4. 启动服务
@@ -288,7 +290,7 @@ curl http://127.0.0.1:8885/v1/models \
 ### 5.4 运行测试套件
 
 ```bash
-# 运行全部测试（当前 131 个）
+# 运行全部测试（当前 137 个）
 python3 -m unittest discover -s tests -v
 
 # 运行集成测试
