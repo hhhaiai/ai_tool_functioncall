@@ -33,7 +33,7 @@
 | 4 | `_get_long_context_upstream()` 直接改 `os.environ` 有竞态 | 当前工作区不成立 | 当前函数直接构造 `NativeProxyClient(base_url/api_key/model)`，没有修改 `os.environ`。 |
 | 5 | 流式文本 fallback 缺 `text_fallback` 标志 | 当前工作区已修 | `gateway_streaming.py` 识别文本工具调用后设置 `text_fallback=True`，并复用 runtime 的 `_append_text_tool_results()` / `_append_tool_results()` 回填路径；orchestrate-stream 调上游时强制非 stream。 |
 | 6 | `.bak` 文件残留 | 真实存在，已清理 | 删除 `src/gateway_tool_runtime.py.bak`。 |
-| 7 | 测试覆盖盲区 | 外部结论过时/夸大 | 当前有 137 个 unittest，覆盖协议转换、流式、工具编排、上下文 fan-out、SQLite 记忆、HTTP 路由、MCP、HTTP Action、鉴权、路径沙箱和 provider 失败语义等。仍可继续加强真实 provider 集成测试。 |
+| 7 | 测试覆盖盲区 | 外部结论过时/夸大 | 当前有 139 个 unittest，覆盖协议转换、流式、工具编排、上下文 fan-out、SQLite 记忆、HTTP 路由、MCP、HTTP Action、鉴权、路径沙箱和 provider 失败语义等。仍可继续加强真实 provider 集成测试。 |
 | 8 | `__getattr__` shim 每次 miss import，脆弱 | 当前工作区已修 | 已删除 `gateway_tool_runtime.py` 末尾动态 `__getattr__`；旧入口兼容由 `gateway_app.py` 的显式重导出和 module wrapper 承担。 |
 
 ## 3. 本轮实际发现并修复的当前回归
@@ -134,6 +134,10 @@
    - 问题：`.gateway_service.json` 已存在但 JSON 损坏或根节点不是对象时，`load_config()` 曾吞掉异常并按默认配置继续运行，可能重新打开开发默认 `admin/admin` 或跳过下游 key。
    - 修复：新增 `ConfigError`，坏配置返回结构化 500 并 fail closed；Admin/API 入口均覆盖回归测试；认证用户名、管理员密码 hash、downstream key hash 使用 constant-time bytes 比较。
 
+24. **日志和 Admin 配置展示的敏感字段遮盖范围过窄**
+   - 问题：请求/响应日志和 Admin redacted config 只遮盖少数字段，可能漏掉 nested `X-API-Key`、`Cookie`、token、secret、password、`key_hash`、long-context upstream key 或 HTTP Action secret。
+   - 修复：新增共享递归 redaction helper；日志和 Admin 配置展示复用同一套字段规则；保留 `must_change_password` 等非敏感状态字段；新增回归测试覆盖 nested headers、token/secret/password/cookie/key_hash。
+
 ## 4. 当前验证结果
 
 ```bash
@@ -144,7 +148,7 @@ bash -n scripts/mimo_gateway.sh scripts/deploy.sh scripts/generate-ssl.sh script
 # OK
 
 python3 -m unittest discover -s tests -v
-# Ran 137 tests ... OK
+# Ran 139 tests ... OK
 
 # HTTP/UI smoke
 # GET /, /healthz, /ui, /client-config.json, /client-config

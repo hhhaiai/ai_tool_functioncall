@@ -3,7 +3,7 @@
 **Project:** ai_tool_functioncall gateway
 **Last Updated:** 2026-05-23
 **Status:** Core conversions and runtime lifecycle verified in the split-module gateway
-**Test Suite:** 137 unittest cases passing
+**Test Suite:** 139 unittest cases passing
 
 ---
 
@@ -258,7 +258,7 @@ Current probe sends a simple request with tools and checks if the response conta
 ## 6. Test Coverage Summary
 
 ```
-Total tests:    137 unittest cases
+Total tests:    139 unittest cases
 Result:         OK
 Coverage focus: protocol conversion, streaming tool events, tool orchestration, context fan-out, SQLite memory/logging, HTTP routing/auth, MCP, HTTP Actions, workspace sandbox, provider failure semantics
 ```

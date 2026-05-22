@@ -516,17 +516,9 @@ def _record_request_stat(path: str, status: int) -> None:
 
 
 def _redact_payload(value: Any) -> Any:
-    if isinstance(value, dict):
-        redacted = {}
-        for k, v in value.items():
-            if k in {"api_key", "apiKey", "authorization", "Authorization"} and isinstance(v, str):
-                redacted[k] = "***"
-            else:
-                redacted[k] = _redact_payload(v)
-        return redacted
-    if isinstance(value, list):
-        return [_redact_payload(item) for item in value]
-    return value
+    from .gateway_config import _redact_sensitive_values
+
+    return _redact_sensitive_values(value)
 
 
 def _write_request_log(path: str, body: Json, status: int, response: Json | None, downstream_key: str | None) -> None:

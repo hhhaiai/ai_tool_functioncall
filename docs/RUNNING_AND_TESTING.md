@@ -203,6 +203,8 @@ curl http://127.0.0.1:8885/healthz
 
 配置文件存在但 JSON 损坏或根节点不是对象时，Gateway 会 fail closed：Admin/API 请求返回结构化 500 `invalid gateway config`，不会静默回退到默认 `admin/admin` 或无下游鉴权。修复方式是恢复有效 `.gateway_service.json`，而不是依赖代码默认值。
 
+请求/响应日志和 Admin 配置展示会递归遮盖常见敏感字段，包括 `Authorization`、`X-API-Key`、`Cookie`、token、secret、password、`key_hash` 等；`must_change_password` 等非敏感状态字段会保留原值。
+
 ---
 
 ## 4. 启动服务
@@ -290,7 +292,7 @@ curl http://127.0.0.1:8885/v1/models \
 ### 5.4 运行测试套件
 
 ```bash
-# 运行全部测试（当前 137 个）
+# 运行全部测试（当前 139 个）
 python3 -m unittest discover -s tests -v
 
 # 运行集成测试

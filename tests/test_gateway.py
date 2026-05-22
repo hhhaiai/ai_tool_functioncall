@@ -1369,6 +1369,75 @@ class NativeGatewayTests(unittest.TestCase):
                 else:
                     os.environ["GATEWAY_TOOL_FAILURE_LOG"] = old_failure_env
 
+    def test_request_log_redacts_common_secret_fields(self):
+        redacted = gateway._redact_payload(
+            {
+                "Authorization": "Bearer live-token",
+                "headers": {
+                    "X-API-Key": "header-key",
+                    "Cookie": "session=secret",
+                    "content-type": "application/json",
+                },
+                "metadata": {
+                    "apiKey": "camel-key",
+                    "access_token": "access-token",
+                    "refresh-token": "refresh-token",
+                    "client_secret": "client-secret",
+                    "password": "plain-password",
+                    "max_output_tokens": 8192,
+                },
+                "items": [{"set-cookie": "sid=secret"}, {"normal": "visible"}],
+            }
+        )
+
+        self.assertEqual(redacted["Authorization"], "***")
+        self.assertEqual(redacted["headers"]["X-API-Key"], "***")
+        self.assertEqual(redacted["headers"]["Cookie"], "***")
+        self.assertEqual(redacted["headers"]["content-type"], "application/json")
+        self.assertEqual(redacted["metadata"]["apiKey"], "***")
+        self.assertEqual(redacted["metadata"]["access_token"], "***")
+        self.assertEqual(redacted["metadata"]["refresh-token"], "***")
+        self.assertEqual(redacted["metadata"]["client_secret"], "***")
+        self.assertEqual(redacted["metadata"]["password"], "***")
+        self.assertEqual(redacted["metadata"]["max_output_tokens"], 8192)
+        self.assertEqual(redacted["items"][0]["set-cookie"], "***")
+        self.assertEqual(redacted["items"][1]["normal"], "visible")
+
+    def test_redacted_config_covers_nested_secrets_and_key_hashes(self):
+        cfg = gateway._default_config()
+        cfg["admin"]["password_hash"] = "admin-hash"
+        cfg["upstream"]["api_key"] = "upstream-key"
+        cfg["upstream_profiles"] = [
+            {
+                "name": "primary",
+                "api_key": "profile-key",
+                "headers": {"x-api-key": "profile-header-key"},
+            }
+        ]
+        cfg["context"]["long_context_upstream"]["api_key"] = "long-context-key"
+        cfg["downstream_keys"] = [{"name": "client", "key_hash": "downstream-hash", "prefix": "client-p"}]
+        cfg["http_actions"]["actions"] = [
+            {
+                "name": "callback",
+                "headers": {"Authorization": "Bearer action-token", "Cookie": "sid=secret"},
+                "client_secret": "action-secret",
+            }
+        ]
+
+        redacted = gateway._redacted_config(cfg)
+
+        self.assertNotIn("password_hash", redacted["admin"])
+        self.assertIs(redacted["admin"]["must_change_password"], cfg["admin"]["must_change_password"])
+        self.assertEqual(redacted["upstream"]["api_key"], "***")
+        self.assertEqual(redacted["upstream_profiles"][0]["api_key"], "***")
+        self.assertEqual(redacted["upstream_profiles"][0]["headers"]["x-api-key"], "***")
+        self.assertEqual(redacted["context"]["long_context_upstream"]["api_key"], "***")
+        self.assertEqual(redacted["downstream_keys"][0]["key_hash"], "***")
+        self.assertEqual(redacted["downstream_keys"][0]["prefix"], "client-p")
+        self.assertEqual(redacted["http_actions"]["actions"][0]["headers"]["Authorization"], "***")
+        self.assertEqual(redacted["http_actions"]["actions"][0]["headers"]["Cookie"], "***")
+        self.assertEqual(redacted["http_actions"]["actions"][0]["client_secret"], "***")
+
     def test_file_logging_backend_is_readonly_unless_explicitly_allowed(self):
         with tempfile.TemporaryDirectory() as td:
             old_config = gateway.CONFIG_PATH

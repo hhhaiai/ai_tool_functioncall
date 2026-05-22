@@ -244,6 +244,52 @@ def _normalize_admin_credentials(config: Json) -> Json:
     return config
 
 
+_SENSITIVE_KEY_NAMES = {
+    "apikey",
+    "authorization",
+    "auth",
+    "authtoken",
+    "bearer",
+    "cookie",
+    "setcookie",
+    "password",
+    "passwordhash",
+    "keyhash",
+    "clientsecret",
+    "privatekey",
+}
+
+
+_NON_SENSITIVE_KEY_NAMES = {
+    "mustchangepassword",
+}
+
+
+def _sensitive_key_name(key: object) -> bool:
+    """Return True for payload/config field names that should never be logged."""
+    normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+    if normalized in _NON_SENSITIVE_KEY_NAMES:
+        return False
+    if normalized in _SENSITIVE_KEY_NAMES:
+        return True
+    return normalized.endswith(("apikey", "token", "secret", "password", "keyhash", "cookie"))
+
+
+def _redact_sensitive_values(value: Any) -> Any:
+    """Recursively redact common credential-bearing fields while preserving shape."""
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            if _sensitive_key_name(key):
+                redacted[key] = "***"
+            else:
+                redacted[key] = _redact_sensitive_values(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_sensitive_values(item) for item in value]
+    return value
+
+
 def _ensure_client_snippet_downstream_key(config: Json) -> Json:
     """Make copied client snippets authenticate without extra manual key setup."""
     gateway_cfg = config.get("gateway")
@@ -364,13 +410,7 @@ def _profile_from_admin_form(form: dict[str, str], existing: Json | None = None)
 
 
 def _redacted_config(config: Json) -> Json:
-    redacted = copy.deepcopy(config)
-    if isinstance(redacted.get("upstream"), dict):
-        if redacted["upstream"].get("api_key"):
-            redacted["upstream"]["api_key"] = "***"
-    for prof in redacted.get("upstream_profiles", []):
-        if isinstance(prof, dict) and prof.get("api_key"):
-            prof["api_key"] = "***"
+    redacted = _redact_sensitive_values(copy.deepcopy(config))
     if isinstance(redacted.get("admin"), dict):
         redacted["admin"].pop("password_hash", None)
     return redacted
