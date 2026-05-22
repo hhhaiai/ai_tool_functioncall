@@ -5,7 +5,8 @@ click, type_text, press_key, scroll tools.
 No placeholders. All tools perform real actions:
 - Screenshots via macOS Quartz / cross-platform pyautogui
 - Mouse/keyboard via Quartz CGEvents
-- Image generation via Pollinations.ai (free, no key) or configured API
+- Image generation via Pollinations.ai (free, no key) or configured API.
+  If every real provider fails, returns ok=false instead of a local placeholder.
 """
 
 from __future__ import annotations
@@ -313,7 +314,7 @@ def _tool_scroll(args: Json) -> str:
 
 def _tool_image_generation(args: Json) -> str:
     """Generate an image from a text prompt.
-    Provider priority: 1) OpenAI (if key set) 2) HuggingFace (if key set) 3) Pollinations.ai (free).
+    Provider priority: 1) OpenAI (if key set) 2) Pollinations.ai (free) 3) HuggingFace (if key set).
     Returns base64 PNG and saves to disk.
     """
     prompt = str(args.get("prompt") or args.get("input") or "")
@@ -324,6 +325,7 @@ def _tool_image_generation(args: Json) -> str:
     output_dir = _ensure_screenshot_dir()
     ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = output_dir / f"generated_{ts}.png"
+    provider_errors: list[str] = []
 
     # --- Provider 1: OpenAI DALL-E ---
     openai_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("IMAGE_GEN_API_KEY")
@@ -354,7 +356,7 @@ def _tool_image_generation(args: Json) -> str:
                 "base64_png": b64_data[:200000] + ("..." if len(b64_data) > 200000 else ""),
             }, ensure_ascii=False)
         except Exception as e:
-            pass  # fall through to next provider
+            provider_errors.append(f"openai: {e}")
 
     # --- Provider 2: Pollinations.ai (free, no key) ---
     try:
@@ -380,7 +382,7 @@ def _tool_image_generation(args: Json) -> str:
             "prompt": prompt,
         }, ensure_ascii=False)
     except Exception as e:
-        pass
+        provider_errors.append(f"pollinations: {e}")
 
     # --- Provider 3: HuggingFace Inference API ---
     hf_key = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
@@ -405,52 +407,13 @@ def _tool_image_generation(args: Json) -> str:
                 "prompt": prompt,
             }, ensure_ascii=False)
         except Exception as e:
-            pass
+            provider_errors.append(f"huggingface: {e}")
 
-    # --- Provider 4: local placeholder (last resort, always works) ---
-    if _PIL_Image is not None:
-        try:
-            w, h = 512, 512
-            if "x" in size:
-                parts = size.split("x")
-                w, h = int(parts[0]), int(parts[1])
-            img = _PIL_Image.new("RGB", (min(w, 1024), min(h, 1024)), color=(30, 30, 40))
-            # draw prompt text on image as a visual record
-            try:
-                from PIL import ImageDraw, ImageFont
-                draw = ImageDraw.Draw(img)
-                # wrap prompt text
-                margin = 20
-                lines = []
-                words = prompt.split()
-                line = ""
-                for word in words:
-                    test = f"{line} {word}".strip()
-                    if len(test) > 45:
-                        lines.append(line)
-                        line = word
-                    else:
-                        line = test
-                if line:
-                    lines.append(line)
-                y_pos = img.height // 3
-                for ln in lines[:12]:
-                    draw.text((margin, y_pos), ln, fill=(200, 200, 220))
-                    y_pos += 22
-                draw.text((margin, img.height - 40), f"[generated placeholder — no API key configured]", fill=(120, 120, 140))
-            except Exception:
-                pass
-            img.save(str(out_path))
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            b64_str = base64.b64encode(buf.getvalue()).decode("ascii")
-            return json.dumps({
-                "ok": True, "provider": "local_placeholder", "path": str(out_path),
-                "base64_png": b64_str,
-                "prompt": prompt,
-                "note": "Set OPENAI_API_KEY or HF_TOKEN for real AI image generation. Pollinations.ai requires no key but may be rate-limited.",
-            }, ensure_ascii=False)
-        except Exception:
-            pass
-
-    return json.dumps({"ok": False, "error": "No image generation backend available. Install Pillow or set OPENAI_API_KEY."}, ensure_ascii=False)
+    return json.dumps(
+        {
+            "ok": False,
+            "error": "No real image generation provider succeeded. Configure OPENAI_API_KEY/HF_TOKEN or ensure Pollinations.ai is reachable.",
+            "provider_errors": provider_errors[-5:],
+        },
+        ensure_ascii=False,
+    )

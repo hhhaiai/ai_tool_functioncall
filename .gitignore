@@ -29,3 +29,13 @@ gateway_log.sqlite3-*
 case.txt
 .omx/
 .case.txt
+.traces/
+# Environment/secrets (keep .env.example tracked)
+.env
+.env.local
+.env.*
+!.env.example
+*.pem
+*.key
+nginx/ssl/
+workspace/

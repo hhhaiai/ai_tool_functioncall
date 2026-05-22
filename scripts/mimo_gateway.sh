@@ -140,7 +140,7 @@ cfg['upstream'].update({
     'base_url': os.environ.get('UPSTREAM_BASE_URL', '').rstrip('/'),
     'api_key': os.environ.get('UPSTREAM_API_KEY', ''),
     'model': os.environ.get('UPSTREAM_MODEL', 'mimo-v2.5-pro'),
-    'protocol': os.environ.get('GATEWAY_UPSTREAM_PROTOCOL', 'openai_chat'),
+    'protocol': os.environ.get('GATEWAY_UPSTREAM_PROTOCOL') or os.environ.get('UPSTREAM_PROTOCOL', 'openai_chat'),
     'tools_enabled': os.environ.get('GATEWAY_TOOLS_ENABLED', 'off'),
     'native_tools_verified': False,
     'use_for_coding': True,

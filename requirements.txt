@@ -1,0 +1,6 @@
+# Optional Python dependencies for enhanced gateway features.
+# Core gateway runtime is stdlib-only; install these when you want richer
+# local image inspection/screenshot support.
+
+# Image metadata / screenshot saving for view_image and computer_use.
+Pillow>=10.0.0

@@ -1,9 +1,9 @@
 # Tool Format Compatibility Analysis
 
-**Project:** ai_tool_functioncall gateway  
-**Last Updated:** 2025-05-18  
-**Status:** Core conversions complete, runtime lifecycle in progress  
-**Test Suite:** 97 tests (96 pass, 1 pre-existing compaction test failure)
+**Project:** ai_tool_functioncall gateway
+**Last Updated:** 2026-05-22
+**Status:** Core conversions and runtime lifecycle verified in the split-module gateway
+**Test Suite:** 129 unittest cases passing
 
 ---
 
@@ -30,7 +30,7 @@ Legend:
 
 ### 2.1 Input Tools — Schema Generation
 
-**Function:** `_tool_schema_for_path`
+**Function:** `_tool_schema_for_path` in `src/gateway_mcp.py` (merged by `src/gateway_streaming.py:_merge_builtin_tools`)
 
 Generates correct tool schemas for all 3 inbound protocols:
 
@@ -42,7 +42,7 @@ Status: ✅ DONE for all 3 protocols
 
 ### 2.2 Output Tools — Response Wrapping
 
-**Function:** `_from_openai_chat_response` (line 1224)
+**Function:** `_from_openai_chat_response` in `src/gateway_protocol.py`
 
 Normalizes upstream responses into the client's expected format. Handles:
 - `finish_reason: tool_calls` detection
@@ -53,7 +53,7 @@ Status: ✅ DONE
 
 ### 2.3 Tool Calls Extraction
 
-**Function:** `_extract_tool_calls` (line 4535)
+**Function:** `_extract_tool_calls` and `_parse_text_tool_calls` in `src/gateway_tool_runtime.py`
 
 Extracts tool call information from provider responses across all formats:
 - OpenAI Chat: `message.tool_calls[].function.{name, arguments}`
@@ -68,7 +68,7 @@ Status: ✅ DONE
 
 ### 2.4 Tool Result Injection
 
-**Function:** `_append_tool_results` (line 3344)
+**Function:** `_append_tool_results` in `src/gateway_tool_runtime.py`
 
 Injects tool execution results back into the conversation for the next turn:
 
@@ -88,13 +88,13 @@ Detects tool call events in SSE streams:
 - **OpenAI Responses:** `response.function_call_arguments.delta` events
 - **Anthropic:** `content_block_start` with `type: "tool_use"` + `content_block_delta` with `input_json_delta`
 
-**Aggregator fix (2025-05-18):** `_post_chat_completions_stream_aggregate` now correctly captures `tool_calls` from streaming chunks instead of discarding them.
+**Current streaming behavior:** `gateway_streaming.py` handles SSE parsing plus downstream SSE emission. Passthrough mode proxies upstream SSE; orchestrate mode calls upstream non-streaming and emits Gateway-owned SSE after local/MCP/HTTP tool execution.
 
-Status: 🔧 FIXED (streaming aggregator was missing tool_calls capture)
+Status: ✅ DONE
 
 ### 2.6 Streaming Emission
 
-**Function:** `_streaming_tool_event_for_path` (line 3714)
+**Function:** `_streaming_tool_event_for_path` in `src/gateway_streaming.py`
 
 Emits correctly formatted SSE events for each protocol:
 
@@ -110,7 +110,7 @@ Status: ✅ DONE
 
 ### 3.1 Provider: fufu (fufu.iqach.top) — Tool Calls WORK
 
-**Model:** `mimo-v2.5-pro`  
+**Model:** `mimo-v2.5-pro`
 **Protocol:** OpenAI Chat (`/v1/chat/completions`)
 
 ```
@@ -124,7 +124,7 @@ Key observation: The model's `reasoning_content` shows it decided to use the too
 
 ### 3.2 Provider: 47.85 (47.85.40.209:8885) — Tool Calls DO NOT Trigger
 
-**Model:** `mimo-v2.5-pro` (same model!)  
+**Model:** `mimo-v2.5-pro` (same model!)
 **Protocol:** OpenAI Chat (`/v1/chat/completions`)
 
 ```
@@ -220,8 +220,8 @@ Gateway: probe upstream capability
 
 Current probe sends a simple request with tools and checks if the response contains tool_calls. The audit report identifies this as insufficient:
 
-**Current approach:** `tool_choice: "auto"` → check for tool_calls in response  
-**Problem:** Auto means the model decides; a simple query like "2+2" may not trigger tool use  
+**Current approach:** `tool_choice: "auto"` → check for tool_calls in response
+**Problem:** Auto means the model decides; a simple query like "2+2" may not trigger tool use
 **Recommended:** Use forced `tool_choice: {type: "function", function: {name: "echo_probe"}}` to verify provider actually supports tool forcing
 
 **Capability levels:**
@@ -231,51 +231,36 @@ Current probe sends a simple request with tools and checks if the response conta
 
 ---
 
-## 5. Known Gaps and Next Steps
+## 5. Current Reliability Status and Next Steps
 
-### 5.1 P0 — Critical (blocks production use)
+### 5.1 已落地的生产化能力
 
-| Gap | Impact | Status |
+| Capability | Current status | Evidence |
 |---|---|---|
-| Forced tool_choice probe | Cannot reliably detect provider capability | ❌ Not implemented |
-| Tool roundtrip verification | Multi-turn tool flows may break silently | ❌ Not implemented |
-| Streaming tool event validation | Streaming tool calls may be malformed | ⚠️ Manual testing only |
-| Arguments strict JSON parse | Malformed arguments cause silent failures | ⚠️ Basic error handling exists |
+| Forced tool-choice probe shape | Implemented for Chat / Responses / Anthropic | `_probe_body()` tests verify forced `echo_probe` shapes |
+| Tool roundtrip orchestration | Implemented | Chat / Responses / Messages orchestration tests execute local tools and append results |
+| Streaming tool event parsing | Implemented | SSE parser tests cover OpenAI Chat, Responses, Anthropic events and malformed JSON tolerance |
+| Strict argument handling | Implemented with explicit failures | Invalid JSON / invalid parameters return structured tool failures |
+| Tool execution tracing | Implemented | SQLite `tool_failures` records execution time, retry count, provider |
+| Timeout/retry | Implemented for local shell/code tools and tool retry tracing | `GATEWAY_TOOL_EXECUTION_TIMEOUT`, shell/code timeouts, retry tests |
+| Permission gating / path sandbox | Implemented | Write/shell gates default off; workspace `relative_to(root)` containment tests |
+| MCP integration | Implemented baseline | `tools/list`, `tools/call`, resource and prompt helper tests |
 
-### 5.2 P1 — Important (limits reliability)
+### 5.2 仍建议继续加强
 
-| Gap | Impact | Status |
+| Area | Why it still matters | Current next step |
 |---|---|---|
-| Capability registry independence | Static config doesn't adapt to provider changes | ❌ Not implemented |
-| Provider adapter decoupling | Protocol conversion mixed with runtime logic | ⚠️ Partially separated |
-| Tool execution tracing | Cannot debug tool failures in production | ❌ Not implemented |
-| Timeout/retry for tool execution | Hanging tools block the entire request | ❌ Not implemented |
-| Permission gating | No sandboxing for dangerous tool operations | ❌ Not implemented |
-
-### 5.3 P2 — Nice to have (enables advanced clients)
-
-| Gap | Impact | Status |
-|---|---|---|
-| Claude Code streaming compliance | Claude Code may reject malformed streams | ⚠️ Basic support |
-| Codex compatibility test suite | Codex-specific edge cases untested | ❌ Not implemented |
-| Parallel tool call handling | Multiple simultaneous tool calls may conflict | ⚠️ Basic support |
-| Structured event replay | Cannot debug/replay tool call sequences | ❌ Not implemented |
-| MCP integration | No MCP tool provider support | ❌ Not implemented |
-
-### 5.4 Pre-existing Issues
-
-- 1 compaction test failure (pre-existing, not tool-related)
-- `47.85` provider: same model, same schema, but tools don't trigger — root cause is provider runtime, not gateway code
-
----
+| Real provider matrix | Providers differ even for the same model/schema | Run credentialed smoke against each commercial upstream before rollout |
+| Capability registry automation | Static config can drift as providers change | Periodic probe job + Admin UI health display |
+| Full downstream client E2E | Unit tests cover protocol, but clients may add edge cases | Add scheduled Codex / Claude Code / OpenCode smoke with real clients |
+| Structured event replay | Helpful for production incident debugging | Persist sanitized replay bundles for failed tool loops |
 
 ## 6. Test Coverage Summary
 
 ```
-Total tests:    97
-Passed:         96 ✅
-Failed:         1  (pre-existing compaction test)
-Tool-specific:  Covered in format conversion and streaming tests
+Total tests:    131 unittest cases
+Result:         OK
+Coverage focus: protocol conversion, streaming tool events, tool orchestration, context fan-out, SQLite memory/logging, HTTP routing/auth, MCP, HTTP Actions, workspace sandbox, provider failure semantics
 ```
 
 **What's tested:**
@@ -285,12 +270,10 @@ Tool-specific:  Covered in format conversion and streaming tests
 - Streaming tool call detection and emission
 - Text fallback tool call parsing
 
-**What's NOT tested:**
-- End-to-end tool roundtrip with real providers
-- Forced tool_choice behavior
-- Multi-turn tool conversation state
-- Parallel tool call ordering
-- Malformed argument handling under load
+**Still requires credentialed/manual coverage:**
+- End-to-end tool roundtrip against each real upstream provider
+- Full downstream-client E2E with Codex / Claude Code / OpenCode binaries
+- Long-running malformed/slow tool behavior under production load
 
 ---
 
@@ -298,4 +281,4 @@ Tool-specific:  Covered in format conversion and streaming tests
 
 - `case.txt` — Real curl commands and responses from fufu and 47.85 providers
 - `tool_gateway_audit_report.md` — Comprehensive audit of architecture and gaps
-- Test suite — 97 automated tests covering format conversions
+- Test suite — 130 automated unittest cases covering protocol conversion, streaming, orchestration, auth, context, MCP, HTTP Actions, sandboxing, and tracing

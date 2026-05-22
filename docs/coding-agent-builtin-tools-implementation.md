@@ -17,16 +17,21 @@
 实现文件：
 
 - `src/toolcall_gateway.py`：兼容入口，保留旧导入路径。
-- `src/gateway_app.py`：HTTP 协议、配置/Admin UI、Claude/OpenAI/Anthropic 适配、MCP、context fan-out。
+- `src/gateway_app.py`：主入口与旧导入路径兼容重导出层。
+- `src/gateway_http_handler.py` / `src/gateway_admin.py`：HTTP 路由、认证、Admin UI 和客户端配置页。
+- `src/gateway_protocol.py`：OpenAI Chat / Responses / Anthropic Messages 协议转换。
+- `src/gateway_tool_runtime.py`：工具调用解析、文本 fallback、多轮编排和直接工具调用入口。
 - `src/gateway_builtin_tools.py`：内置工具实现和别名注册。
+- `src/gateway_context.py` / `src/gateway_mcp.py` / `src/gateway_logging.py`：上下文治理、MCP 连接、SQLite/JSONL 日志。
 
 ### 2.1 Runtime 骨架
 
-- `GatewayTool` / `ToolCall` / `ToolResult` 内部模型：`src/toolcall_gateway.py:64-88`
-- 三协议 tool call 提取：`src/toolcall_gateway.py:655-710`
-- 三协议 tool result 回填：`src/toolcall_gateway.py:720-775`
-- 多轮 tool orchestration loop：`src/toolcall_gateway.py:849-867`
-- 失败记录 JSONL：`src/toolcall_gateway.py:778-846`
+- `GatewayTool` / `ToolCall` / `ToolResult` 内部模型：`src/gateway_builtin_tools.py`
+- 三协议 tool call 提取：`src/gateway_tool_runtime.py:_extract_tool_calls()`
+- 文本 fallback tool call 解析：`src/gateway_tool_runtime.py:_parse_text_tool_calls()`
+- 三协议 tool result 回填：`src/gateway_tool_runtime.py:_append_tool_results()` / `_append_text_tool_results()`
+- 多轮 tool orchestration loop：`src/gateway_tool_runtime.py:run_tool_orchestration()`
+- 失败记录：`src/gateway_logging.py:_record_tool_failure()`，默认 SQLite，可按配置退回 JSONL
 - 默认 `GATEWAY_TOOL_MODE=orchestrate`，可切回 `passthrough`。
 
 ### 2.2 已内置实现的工具
@@ -65,18 +70,20 @@
 | `Bash`, `exec_command`, `shell_command`, `exec_shell`, `local_shell`, `user_shell` | gated | execute_code | 需 `GATEWAY_ALLOW_SHELL_TOOLS=1` |
 | `exec_shell_start`, `write_stdin`, `exec_wait`, `exec_kill` | gated | execute_code | 持久 shell session，需 `GATEWAY_ALLOW_SHELL_TOOLS=1` |
 
-### 2.3 已注册但需要 connector/runtime 的工具
+### 2.3 运行时依赖 / connector 边界
 
-这些是四个参考项目中会出现、但不能在纯 HTTP gateway 内安全/完整本地实现的工具名。当前 Gateway 不会崩溃，会返回协议级 `connector_required` tool result，并写入失败日志，等待 MCP/OpenAPI/plugin marketplace 接入：
+当前不保留“占位成功”的 connector 工具。以下工具名已经注册，但需要真实配置、权限或本地 runtime；缺失时会返回明确失败（常见为 `connector_required` / `permission_denied`）并写入失败日志：
 
-```text
-request_user_input / AskUserQuestion
-ListMcpResourcesTool / ReadMcpResourceTool
-computer_use / computer_use_preview
-WebBrowser / click / type_text / press_key / scroll
-```
+| 工具名/别名 | 当前行为 | 缺失时行为 |
+|---|---|---|
+| `request_user_input` / `AskUserQuestion` | 记录结构化 `pending_user_input` 状态，供下游交互层展示 | 无交互客户端时只返回待处理状态，不伪造用户回答 |
+| `ListMcpResourcesTool` / `ReadMcpResourceTool` | 已映射到真实 MCP resources/list/read | MCP server 未配置时失败并标记 `connector_required` |
+| `computer_use` / `computer_use_preview` / `computer_call` | 使用 macOS Quartz / pyautogui 等真实截图后端 | 无桌面权限、显示环境或依赖时失败 |
+| `click` / `type_text` / `press_key` / `scroll` | 使用真实鼠标/键盘/滚轮事件后端 | 无权限或后端不可用时失败 |
+| `image_generation` / `generate_image` | 使用真实 OpenAI / Pollinations / Hugging Face provider | 所有 provider 失败时失败并标记 `connector_required`，不生成 placeholder |
+| `WebBrowser` | 轻量浏览器兼容入口，实际执行真实 HTTP fetch | 网络/URL 失败时返回真实错误 |
 
-**注意：** `code_interpreter` 已实现为真实工具（第382行 `_tool_code_interpreter`），使用 `subprocess.run` 执行 Python 代码。默认禁用，需设置 `GATEWAY_ALLOW_SHELL_TOOLS=1` 启用。
+**注意：** `code_interpreter` 已实现为真实工具（`src/gateway_builtin_tools.py:_tool_code_interpreter()`），使用 `subprocess.run` 执行 Python 代码。默认禁用，需设置 `GATEWAY_ALLOW_SHELL_TOOLS=1` 启用。
 
 补全策略：优先通过 MCP 市场安装对应 server（浏览器、GitHub、数据库、文件系统、搜索、代码执行等），其次通过 Admin UI 的 HTTP Action 把已有服务注册为工具。Gateway 会自动暴露 `mcp__server__tool` 和 `mcp_server_tool` 两套名称。
 
@@ -98,7 +105,7 @@ GATEWAY_WORKSPACE_ROOT=$PWD
 ## 4. 后续必做
 
 1. MCP connector 已支持 `tools/list`、`tools/call`、resource/prompt helpers；下一步是接入可浏览/安装的 MCP 市场和认证配置。
-2. `request_user_input` 仍需要交互式客户端配合；Gateway 会记录未支持调用。
-3. `computer_use` / 浏览器 UI：需要桌面权限和持久 UI runtime，建议走 MCP/插件。
+2. `request_user_input` 已能记录 `pending_user_input`，仍需要下游交互式客户端展示问题并回传用户答案。
+3. `computer_use` / GUI 输入工具已有本地真实后端，但生产环境仍建议通过 MCP/插件管理桌面权限、会话和审计。
 4. 完善 streaming tool events；当前 orchestrate 模式会内部非流式执行工具并输出最终 SSE，passthrough 模式透传上游 SSE。
 5. 商业化稳定性继续增强：多租户 key、配额、审计、MCP 市场安装器、provider 能力自动探测。

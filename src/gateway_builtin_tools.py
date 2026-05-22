@@ -2,8 +2,8 @@
 """Builtin tool/runtime implementations for the gateway.
 
 This module intentionally keeps tool executors separate from HTTP/protocol
-handling. It imports gateway_app lazily through wrappers so existing module
-state such as CONFIG_PATH, MCP sessions, and test monkeypatches remain shared.
+handling. Shared configuration, MCP, and runtime behavior are imported from the
+split gateway modules instead of the old monolithic gateway_app.
 """
 from __future__ import annotations
 
@@ -27,33 +27,112 @@ import urllib.parse
 import urllib.request
 import uuid
 from typing import Any, Callable
+from dataclasses import dataclass
 
-try:
-    from . import gateway_app as app
-except ImportError:  # pragma: no cover - script fallback
-    import gateway_app as app  # type: ignore
+from .gateway_errors import ToolExecutionError, ToolResult
+from .gateway_mcp import (
+    McpSession,
+    _enabled_mcp_servers,
+    _mcp_safe_component,
+    _mcp_session_key,
+    _mcp_use_pool,
+    _mcp_get_session,
+    _mcp_with_server,
+    _mcp_request,
+    _mcp_public_name,
+    _mcp_legacy_public_name,
+    _mcp_parse_public_name,
+    _mcp_server_by_name,
+    _mcp_list_server_tools,
+    _mcp_call_tool,
+)
+from .gateway_config import _config_env
 
 Json = dict[str, Any]
-GatewayTool = app.GatewayTool
-ToolCall = app.ToolCall
-ToolExecutionError = app.ToolExecutionError
 
-def _workspace_root(): return app._workspace_root()
-def _resolve_workspace_path(*args, **kwargs): return app._resolve_workspace_path(*args, **kwargs)
-def _require_write_enabled(): return app._require_write_enabled()
-def _require_shell_enabled(): return app._require_shell_enabled()
-def _config_env(*args, **kwargs): return app._config_env(*args, **kwargs)
-def _enabled_mcp_servers(): return app._enabled_mcp_servers()
-def _mcp_safe_component(*args, **kwargs): return app._mcp_safe_component(*args, **kwargs)
-def _mcp_session_key(*args, **kwargs): return app._mcp_session_key(*args, **kwargs)
-def _mcp_use_pool(*args, **kwargs): return app._mcp_use_pool(*args, **kwargs)
-def _mcp_get_session(*args, **kwargs): return app._mcp_get_session(*args, **kwargs)
-def _mcp_with_server(*args, **kwargs): return app._mcp_with_server(*args, **kwargs)
-def _mcp_request(*args, **kwargs): return app._mcp_request(*args, **kwargs)
-def _parse_json_arguments(*args, **kwargs): return app._parse_json_arguments(*args, **kwargs)
-def _execute_tool_call(*args, **kwargs): return app._execute_tool_call(*args, **kwargs)
-def _response_text(*args, **kwargs): return app._response_text(*args, **kwargs)
-def _chunk_text_by_tokens(*args, **kwargs): return app._chunk_text_by_tokens(*args, **kwargs)
+@dataclass(frozen=True)
+class GatewayTool:
+    name: str
+    description: str
+    parameters: Json
+    handler: Callable[[Json], str]
+    risk: str = "pure"
+    aliases: tuple[str, ...] = ()
+
+@dataclass(frozen=True)
+class ToolCall:
+    call_id: str
+    name: str
+    arguments: Json
+    raw: Json
+
+def _workspace_root():
+    from . import gateway_builtin_tools as _self
+    override = getattr(_self, '_WORKSPACE_ROOT_OVERRIDE', None)
+    if override is not None:
+        return pathlib.Path(override).resolve()
+    env_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+    if env_root:
+        return pathlib.Path(env_root).resolve()
+    from .gateway_config import _gateway_config
+    return pathlib.Path(_gateway_config().get("workspace_root") or os.getcwd()).resolve()
+
+def _resolve_workspace_path(value: str | None, *, default: str = ".") -> pathlib.Path:
+    root = _workspace_root().resolve()
+    raw = pathlib.Path(value or default)
+    candidate = raw if raw.is_absolute() else root / raw
+    resolved = candidate.resolve(strict=False)
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ToolExecutionError(
+            f"path escapes workspace root: {value or default}",
+            failure_type="permission_denied",
+        ) from exc
+    return resolved
+
+def _require_write_enabled():
+    from .gateway_config import _gateway_config
+    if not _gateway_config().get("allow_write_tools", False):
+        raise ToolExecutionError("write tools are disabled", failure_type="permission_denied")
+
+def _require_shell_enabled():
+    from .gateway_config import _gateway_config
+    if not _gateway_config().get("allow_shell_tools", False):
+        raise ToolExecutionError("shell tools are disabled", failure_type="permission_denied")
+
+def _parse_json_arguments(raw: Any, *, allow_text: bool = False) -> Json:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+        if allow_text:
+            return {"text": raw}
+    return {}
+
+def _execute_tool_call(call: ToolCall, provider: str | None = None) -> "ToolResult":
+    from .gateway_tool_runtime import _execute_tool_call as _impl
+    return _impl(call, provider)
+
+def _response_text(path: str, response: Json) -> str:
+    from .gateway_protocol import _text_from_content
+    if "/messages" in path:
+        content = response.get("content") or []
+        return _text_from_content(content)
+    choices = response.get("choices") or []
+    if choices:
+        message = choices[0].get("message") or {}
+        return _text_from_content(message.get("content"))
+    return ""
+
+def _chunk_text_by_tokens(text: str, chunk_tokens: int, max_chunks: int) -> list[str]:
+    from .gateway_context import _chunk_text_by_tokens as _chunk
+    return _chunk(text, chunk_tokens, max_chunks)
 
 def _json_schema(properties: Json, required: list[str] | None = None) -> Json:
     return {
@@ -96,7 +175,7 @@ def _tool_echo_probe(args: Json) -> str:
     return str(args.get("value", ""))
 
 def _tool_calculator(args: Json) -> str:
-    expression = str(args.get("expression") or args.get("input") or "")
+    expression = str(args.get("expression") or args.get("input") or args.get("text") or args.get("value") or "")
     if not expression.strip():
         raise ToolExecutionError("missing expression", failure_type="invalid_input")
     result = _safe_calculate(expression)
@@ -147,7 +226,7 @@ def _tool_read_many_files(args: Json) -> str:
             continue
         data = path.read_bytes()[:max_bytes]
         text = data.decode("utf-8", errors="replace")
-        rel = path.relative_to(_workspace_root())
+        rel = path.relative_to(_workspace_root().resolve())
         truncated = " [truncated]" if path.stat().st_size > max_bytes else ""
         outputs.append(f"## {rel}{truncated}\n{text}")
     return "\n\n".join(outputs)
@@ -158,7 +237,7 @@ def _tool_file_info(args: Json) -> str:
         raise ToolExecutionError(f"path not found: {path}", failure_type="not_found")
     stat = path.stat()
     payload = {
-        "path": str(path.relative_to(_workspace_root())),
+        "path": str(path.relative_to(_workspace_root().resolve())),
         "type": "directory" if path.is_dir() else "file" if path.is_file() else "other",
         "bytes": stat.st_size,
         "modified_at": _dt.datetime.fromtimestamp(stat.st_mtime, _dt.timezone.utc).isoformat(),
@@ -210,7 +289,7 @@ def _tool_create_directory(args: Json) -> str:
     _require_write_enabled()
     path = _resolve_workspace_path(str(args.get("path") or args.get("dir") or args.get("directory") or ""))
     path.mkdir(parents=bool(args.get("parents", True)), exist_ok=bool(args.get("exist_ok", True)))
-    return f"created directory {path.relative_to(_workspace_root())}"
+    return f"created directory {path.relative_to(_workspace_root().resolve())}"
 
 def _tool_delete_path(args: Json) -> str:
     _require_write_enabled()
@@ -218,6 +297,8 @@ def _tool_delete_path(args: Json) -> str:
     if not path.exists():
         raise ToolExecutionError(f"path not found: {path}", failure_type="not_found")
     if path.is_dir():
+        if path.resolve() == _workspace_root().resolve():
+            raise ToolExecutionError("refusing to delete workspace root", failure_type="permission_denied")
         if not args.get("recursive"):
             raise ToolExecutionError("refusing to delete directory without recursive=true", failure_type="invalid_input")
         for child in sorted(path.rglob("*"), key=lambda p: len(p.parts), reverse=True):
@@ -228,7 +309,7 @@ def _tool_delete_path(args: Json) -> str:
         path.rmdir()
     else:
         path.unlink()
-    return f"deleted {path.relative_to(_workspace_root())}"
+    return f"deleted {path.relative_to(_workspace_root().resolve())}"
 
 def _tool_move_path(args: Json) -> str:
     _require_write_enabled()
@@ -240,7 +321,7 @@ def _tool_move_path(args: Json) -> str:
         raise ToolExecutionError(f"destination exists: {dst}", failure_type="invalid_input")
     dst.parent.mkdir(parents=True, exist_ok=True)
     src.replace(dst)
-    return f"moved {src.relative_to(_workspace_root())} to {dst.relative_to(_workspace_root())}"
+    return f"moved {src.relative_to(_workspace_root().resolve())} to {dst.relative_to(_workspace_root().resolve())}"
 
 def _tool_copy_path(args: Json) -> str:
     _require_write_enabled()
@@ -252,16 +333,20 @@ def _tool_copy_path(args: Json) -> str:
         raise ToolExecutionError(f"destination exists: {dst}", failure_type="invalid_input")
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_bytes(src.read_bytes())
-    return f"copied {src.relative_to(_workspace_root())} to {dst.relative_to(_workspace_root())}"
+    return f"copied {src.relative_to(_workspace_root().resolve())} to {dst.relative_to(_workspace_root().resolve())}"
 
 def _tool_glob(args: Json) -> str:
     pattern = str(args.get("pattern") or "**/*")
+    # Strip leading / to avoid treating as absolute path
+    if pattern.startswith("/"):
+        pattern = pattern[1:]
     base = _resolve_workspace_path(str(args.get("path") or "."))
+    root = _workspace_root().resolve()
     matches = []
     for match in glob.glob(str(base / pattern), recursive=True):
         path = pathlib.Path(match).resolve()
         try:
-            rel = path.relative_to(_workspace_root())
+            rel = path.relative_to(root)
         except ValueError:
             continue
         matches.append(str(rel) + ("/" if path.is_dir() else ""))
@@ -283,13 +368,13 @@ def _tool_grep(args: Json) -> str:
         if not file_path.is_file():
             continue
         try:
-            file_path.resolve().relative_to(_workspace_root())
+            file_path.resolve().relative_to(_workspace_root().resolve())
             text = file_path.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
         for line_no, line in enumerate(text.splitlines(), start=1):
             if regex.search(line):
-                rel = file_path.resolve().relative_to(_workspace_root())
+                rel = file_path.resolve().relative_to(_workspace_root().resolve())
                 results.append(f"{rel}:{line_no}: {line}")
                 if len(results) >= limit:
                     break
@@ -301,7 +386,7 @@ def _tool_write(args: Json) -> str:
     content = str(args.get("content") if args.get("content") is not None else args.get("file_text") or "")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
-    return f"wrote {len(content)} bytes to {path.relative_to(_workspace_root())}"
+    return f"wrote {len(content)} bytes to {path.relative_to(_workspace_root().resolve())}"
 
 def _tool_edit(args: Json) -> str:
     _require_write_enabled()
@@ -316,7 +401,7 @@ def _tool_edit(args: Json) -> str:
         raise ToolExecutionError("old_string not found", failure_type="not_found")
     count = text.count(old) if replace_all else 1
     path.write_text(text.replace(old, new, -1 if replace_all else 1), encoding="utf-8")
-    return f"edited {path.relative_to(_workspace_root())}; replacements={count}"
+    return f"edited {path.relative_to(_workspace_root().resolve())}; replacements={count}"
 
 def _tool_multiedit(args: Json) -> str:
     _require_write_enabled()
@@ -337,7 +422,7 @@ def _tool_multiedit(args: Json) -> str:
         text = text.replace(old, new, -1 if replace_all else 1)
         count += 1
     path.write_text(text, encoding="utf-8")
-    return f"applied {count} edits to {path.relative_to(_workspace_root())}"
+    return f"applied {count} edits to {path.relative_to(_workspace_root().resolve())}"
 
 
 def _tool_regex_edit(args: Json) -> str:
@@ -353,7 +438,7 @@ def _tool_regex_edit(args: Json) -> str:
     if count == 0:
         raise ToolExecutionError("regex pattern not found", failure_type="not_found")
     path.write_text(new_text, encoding="utf-8")
-    return f"regex edited {path.relative_to(_workspace_root())}; replacements={count}"
+    return f"regex edited {path.relative_to(_workspace_root().resolve())}; replacements={count}"
 
 def _tool_shell(args: Json) -> str:
     _require_shell_enabled()
@@ -904,13 +989,13 @@ def _tool_mcp_list_tools(args: Json) -> str:
     for server in servers:
         server_name = str(server.get("name") or _mcp_session_key(server))
         try:
-            for tool in app._mcp_list_server_tools(server):
+            for tool in _mcp_list_server_tools(server):
                 tool_name = str(tool.get("name") or "")
                 rows.append({
                     "server": server_name,
                     "name": tool_name,
-                    "gateway_name": app._mcp_public_name(server_name, tool_name),
-                    "legacy_name": app._mcp_legacy_public_name(server_name, tool_name),
+                    "gateway_name": _mcp_public_name(server_name, tool_name),
+                    "legacy_name": _mcp_legacy_public_name(server_name, tool_name),
                     "description": tool.get("description"),
                     "input_schema": tool.get("inputSchema"),
                 })
@@ -924,27 +1009,29 @@ def _tool_mcp_call_tool(args: Json) -> str:
     server_name = str(args.get("server") or args.get("server_name") or "").strip()
     tool_name = str(args.get("name") or args.get("tool_name") or "").strip()
     arguments = args.get("arguments") if isinstance(args.get("arguments"), dict) else args.get("args") if isinstance(args.get("args"), dict) else {}
-    parsed = app._mcp_parse_public_name(public_name) if public_name else None
+    parsed = _mcp_parse_public_name(public_name) if public_name else None
     if parsed:
         server_name, tool_name = parsed
     if not server_name or not tool_name:
         raise ToolExecutionError("missing MCP server/tool name", failure_type="invalid_input")
-    server = app._mcp_server_by_name(server_name)
+    server = _mcp_server_by_name(server_name)
     if not server:
         raise ToolExecutionError(f"MCP server not configured or enabled: {server_name}", failure_type="connector_required")
-    return app._mcp_call_tool(server, tool_name, arguments)
+    return _mcp_call_tool(server, tool_name, arguments)
 
 
 def _tool_memory(args: Json) -> str:
+    from .gateway_context import _memory_extract_keywords, _sqlite_insert_memory, _sqlite_tail_memories
+
     action = str(args.get("action") or args.get("operation") or "list").lower()
     if action in {"list", "read", "recall"}:
-        return json.dumps({"memories": app._sqlite_tail_memories(int(args.get("limit") or 50))}, ensure_ascii=False, indent=2)
+        return json.dumps({"memories": _sqlite_tail_memories(int(args.get("limit") or 50))}, ensure_ascii=False, indent=2)
     if action in {"write", "remember", "add"}:
         summary = str(args.get("summary") or args.get("content") or args.get("text") or "").strip()
         if not summary:
             raise ToolExecutionError("missing memory summary/content", failure_type="invalid_input")
-        keywords = args.get("keywords") if isinstance(args.get("keywords"), list) else app._memory_extract_keywords(summary)
-        app._sqlite_insert_memory(
+        keywords = args.get("keywords") if isinstance(args.get("keywords"), list) else _memory_extract_keywords(summary)
+        _sqlite_insert_memory(
             str(args.get("session_key") or "manual"),
             str(args.get("workspace_root") or _workspace_root()),
             str(args.get("kind") or "manual"),
@@ -1233,12 +1320,14 @@ def _agent_prompt_from_args(args: Json) -> str:
 
 
 def _agent_call_upstream(prompt: str, model: str | None = None) -> str:
+    from .gateway_proxy import NativeProxyClient
+
     body = {
         "model": model or _config_env("UPSTREAM_MODEL", ""),
         "max_tokens": int(os.environ.get("GATEWAY_AGENT_MAX_TOKENS") or "4096"),
         "messages": [{"role": "user", "content": prompt}],
     }
-    response = app.NativeProxyClient().forward("/v1/messages", body)
+    response = NativeProxyClient().forward("/v1/messages", body)
     return _response_text("/v1/messages", response) or json.dumps(response, ensure_ascii=False)[:8000]
 
 
@@ -1319,12 +1408,21 @@ def _tool_connector_required(args: Json) -> str:
 
 # --- Real computer_use / GUI / image_generation implementations ---
 
+def _fail_if_json_tool_error(content: str) -> str:
+    try:
+        payload = json.loads(content)
+    except Exception:
+        return content
+    if isinstance(payload, dict) and payload.get("ok") is False:
+        raise ToolExecutionError(str(payload.get("error") or "tool backend unavailable"), failure_type="connector_required")
+    return content
+
 def _tool_computer_use_real(args: Json) -> str:
     try:
         from . import gateway_computer_use as _cu
     except ImportError:
         import gateway_computer_use as _cu
-    return _cu._tool_computer_use(args)
+    return _fail_if_json_tool_error(_cu._tool_computer_use(args))
 
 
 def _tool_click_real(args: Json) -> str:
@@ -1332,7 +1430,7 @@ def _tool_click_real(args: Json) -> str:
         from . import gateway_computer_use as _cu
     except ImportError:
         import gateway_computer_use as _cu
-    return _cu._tool_click(args)
+    return _fail_if_json_tool_error(_cu._tool_click(args))
 
 
 def _tool_type_text_real(args: Json) -> str:
@@ -1340,7 +1438,7 @@ def _tool_type_text_real(args: Json) -> str:
         from . import gateway_computer_use as _cu
     except ImportError:
         import gateway_computer_use as _cu
-    return _cu._tool_type_text(args)
+    return _fail_if_json_tool_error(_cu._tool_type_text(args))
 
 
 def _tool_press_key_real(args: Json) -> str:
@@ -1348,7 +1446,7 @@ def _tool_press_key_real(args: Json) -> str:
         from . import gateway_computer_use as _cu
     except ImportError:
         import gateway_computer_use as _cu
-    return _cu._tool_press_key(args)
+    return _fail_if_json_tool_error(_cu._tool_press_key(args))
 
 
 def _tool_scroll_real(args: Json) -> str:
@@ -1356,7 +1454,7 @@ def _tool_scroll_real(args: Json) -> str:
         from . import gateway_computer_use as _cu
     except ImportError:
         import gateway_computer_use as _cu
-    return _cu._tool_scroll(args)
+    return _fail_if_json_tool_error(_cu._tool_scroll(args))
 
 
 def _tool_image_generation_real(args: Json) -> str:
@@ -1364,9 +1462,9 @@ def _tool_image_generation_real(args: Json) -> str:
         from . import gateway_computer_use as _cu
     except ImportError:
         import gateway_computer_use as _cu
-    return _cu._tool_image_generation(args)
+    return _fail_if_json_tool_error(_cu._tool_image_generation(args))
 
-def _make_tools() -> dict[str, GatewayTool]:
+def _build_builtin_tools() -> dict[str, GatewayTool]:
     path_props = {
         "file_path": {"type": "string"},
         "path": {"type": "string"},
@@ -1395,7 +1493,7 @@ def _make_tools() -> dict[str, GatewayTool]:
             _tool_current_time,
             aliases=("gateway__get_current_time", "current_time"),
         ),
-        GatewayTool("Read", "Read a text file from the workspace.", _json_schema(path_props), _tool_read, "read_local", aliases=("read_file", "FileReadTool")),
+        GatewayTool("Read", "Read a text file from the workspace.", _json_schema(path_props), _tool_read, "read_local", aliases=("read_file", "FileReadTool", "view")),
         GatewayTool("ReadManyFiles", "Read multiple text files from the workspace.", _json_schema({"paths": {"type": "array"}, "max_files": {"type": "integer"}, "max_bytes_per_file": {"type": "integer"}}, ["paths"]), _tool_read_many_files, "read_local", aliases=("read_many_files", "read_files")),
         GatewayTool("FileInfo", "Return metadata for a workspace path.", _json_schema({"path": {"type": "string"}}, ["path"]), _tool_file_info, "read_local", aliases=("stat", "file_info")),
         GatewayTool("LS", "List a workspace directory.", _json_schema({"path": {"type": "string"}}), _tool_list_dir, "read_local", aliases=("list_dir",)),
@@ -1461,18 +1559,12 @@ def _make_tools() -> dict[str, GatewayTool]:
         GatewayTool("press_key", "Press a key or key combo (e.g. 'command+a', 'ctrl+shift+s', 'Enter').", _json_schema({"key": {"type": "string"}}, ["key"]), _tool_press_key_real, "gui", aliases=("key_press", "hotkey")),
         GatewayTool("scroll", "Scroll the mouse wheel. dx=horizontal, dy=vertical.", _json_schema({"dx": {"type": "integer"}, "dy": {"type": "integer"}, "x": {"type": "integer"}, "y": {"type": "integer"}}), _tool_scroll_real, "gui", aliases=("mouse_scroll",)),
     ]
-    connector_required: list[str] = []  # all former placeholders now have real implementations
     registry: dict[str, GatewayTool] = {}
     for tool in tools:
         registry[tool.name] = tool
         for alias in tool.aliases:
             registry[alias] = tool
-    for name in connector_required:
-        registry[name] = GatewayTool(
-            name,
-            f"{name} compatibility placeholder; requires marketplace/MCP/plugin connector.",
-            _json_schema({"_tool_name": {"type": "string"}}),
-            lambda args, tool_name=name: _tool_connector_required({**args, "_tool_name": tool_name}),
-            "connector_required",
-        )
     return registry
+
+# Build the builtin tools registry
+BUILTIN_TOOLS: dict[str, GatewayTool] = _build_builtin_tools()

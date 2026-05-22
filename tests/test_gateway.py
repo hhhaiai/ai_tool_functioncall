@@ -149,6 +149,68 @@ class NativeGatewayTests(unittest.TestCase):
                 else:
                     os.environ["GATEWAY_WORKSPACE_ROOT"] = old
 
+    def test_workspace_tools_reject_paths_outside_workspace_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td) / "workspace"
+            root.mkdir()
+            outside = pathlib.Path(td) / "outside.txt"
+            outside.write_text("secret\n", encoding="utf-8")
+            old_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = str(root)
+            try:
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = str(root)
+                cfg["gateway"]["allow_write_tools"] = True
+                gateway.save_config(cfg)
+
+                relative_escape = _execute_tool_call(
+                    ToolCall("escape_read", "Read", {"file_path": "../outside.txt"}, {})
+                )
+                absolute_escape = _execute_tool_call(
+                    ToolCall("escape_abs", "Read", {"file_path": str(outside)}, {})
+                )
+                write_escape = _execute_tool_call(
+                    ToolCall("escape_write", "Write", {"file_path": "../outside.txt", "content": "changed"}, {})
+                )
+
+                self.assertFalse(relative_escape.success)
+                self.assertFalse(absolute_escape.success)
+                self.assertFalse(write_escape.success)
+                self.assertEqual(relative_escape.failure_type, "permission_denied")
+                self.assertEqual(absolute_escape.failure_type, "permission_denied")
+                self.assertEqual(write_escape.failure_type, "permission_denied")
+                self.assertEqual(outside.read_text(encoding="utf-8"), "secret\n")
+            finally:
+                gateway.CONFIG_PATH = old_config
+                if old_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_root
+
+    def test_delete_path_refuses_workspace_root_even_recursive(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = td
+            try:
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = td
+                cfg["gateway"]["allow_write_tools"] = True
+                gateway.save_config(cfg)
+                result = _execute_tool_call(ToolCall("delroot", "DeletePath", {"path": ".", "recursive": True}, {}))
+                self.assertFalse(result.success)
+                self.assertEqual(result.failure_type, "permission_denied")
+                self.assertTrue(pathlib.Path(td).exists())
+            finally:
+                gateway.CONFIG_PATH = old_config
+                if old_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_root
+
     def test_read_long_file_is_chunked_by_default(self):
         with tempfile.TemporaryDirectory() as td:
             old_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
@@ -191,6 +253,53 @@ class NativeGatewayTests(unittest.TestCase):
                     os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
                 else:
                     os.environ["GATEWAY_WORKSPACE_ROOT"] = old
+
+    def test_downstream_api_key_env_creates_auth_key_and_snippet(self):
+        old_downstream = os.environ.get("DOWNSTREAM_API_KEY")
+        old_gateway = os.environ.get("GATEWAY_DOWNSTREAM_KEY")
+        try:
+            os.environ.pop("GATEWAY_DOWNSTREAM_KEY", None)
+            os.environ["DOWNSTREAM_API_KEY"] = "env-downstream-key"
+            cfg = gateway._default_config()
+            self.assertEqual(cfg["gateway"]["client_snippet_api_key"], "env-downstream-key")
+            self.assertEqual(len(cfg["downstream_keys"]), 1)
+            self.assertEqual(cfg["downstream_keys"][0]["prefix"], "env-down")
+
+            os.environ["GATEWAY_DOWNSTREAM_KEY"] = "gateway-key"
+            cfg = gateway._default_config()
+            self.assertEqual(cfg["gateway"]["client_snippet_api_key"], "env-downstream-key")
+            self.assertEqual(cfg["downstream_keys"][0]["prefix"], "gateway-")
+        finally:
+            if old_downstream is None:
+                os.environ.pop("DOWNSTREAM_API_KEY", None)
+            else:
+                os.environ["DOWNSTREAM_API_KEY"] = old_downstream
+            if old_gateway is None:
+                os.environ.pop("GATEWAY_DOWNSTREAM_KEY", None)
+            else:
+                os.environ["GATEWAY_DOWNSTREAM_KEY"] = old_gateway
+
+    def test_upstream_protocol_env_supports_current_and_legacy_names(self):
+        old_current = os.environ.get("GATEWAY_UPSTREAM_PROTOCOL")
+        old_legacy = os.environ.get("UPSTREAM_PROTOCOL")
+        try:
+            os.environ.pop("GATEWAY_UPSTREAM_PROTOCOL", None)
+            os.environ["UPSTREAM_PROTOCOL"] = "anthropic_messages"
+            self.assertEqual(gateway._env_upstream_protocol(), "anthropic_messages")
+            self.assertEqual(gateway._default_config()["upstream"]["protocol"], "anthropic_messages")
+
+            os.environ["GATEWAY_UPSTREAM_PROTOCOL"] = "openai_responses"
+            self.assertEqual(gateway._env_upstream_protocol(), "openai_responses")
+            self.assertEqual(gateway._default_config()["upstream"]["protocol"], "openai_responses")
+        finally:
+            if old_current is None:
+                os.environ.pop("GATEWAY_UPSTREAM_PROTOCOL", None)
+            else:
+                os.environ["GATEWAY_UPSTREAM_PROTOCOL"] = old_current
+            if old_legacy is None:
+                os.environ.pop("UPSTREAM_PROTOCOL", None)
+            else:
+                os.environ["UPSTREAM_PROTOCOL"] = old_legacy
 
     def test_direct_tool_call_accepts_openai_function_shape(self):
         result = execute_direct_tool_call(
@@ -451,6 +560,60 @@ class NativeGatewayTests(unittest.TestCase):
                 else:
                     os.environ["GATEWAY_WORKSPACE_ROOT"] = old_root
 
+    def test_image_generation_does_not_fake_success_when_providers_fail(self):
+        import urllib.request as _urllib_request
+        from src import gateway_computer_use as cu
+
+        old_urlopen = _urllib_request.urlopen
+        old_openai = os.environ.get("OPENAI_API_KEY")
+        old_image_key = os.environ.get("IMAGE_GEN_API_KEY")
+        old_hf = os.environ.get("HF_TOKEN")
+        old_hf2 = os.environ.get("HUGGINGFACE_TOKEN")
+        old_pil = cu._PIL_Image
+
+        class FakeImage:
+            width = 512
+            height = 512
+
+            def save(self, target, format=None):
+                if hasattr(target, "write"):
+                    target.write(b"fake-png")
+                else:
+                    pathlib.Path(target).write_bytes(b"fake-png")
+
+        class FakePIL:
+            @staticmethod
+            def new(*args, **kwargs):
+                return FakeImage()
+
+        try:
+            _urllib_request.urlopen = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("network unavailable"))
+            cu._PIL_Image = FakePIL
+            for key in ("OPENAI_API_KEY", "IMAGE_GEN_API_KEY", "HF_TOKEN", "HUGGINGFACE_TOKEN"):
+                os.environ.pop(key, None)
+            payload = json.loads(cu._tool_image_generation({"prompt": "draw a gateway"}))
+            self.assertFalse(payload["ok"])
+            self.assertNotEqual(payload.get("provider"), "local_placeholder")
+            self.assertIn("No real image generation provider", payload["error"])
+
+            result = _execute_tool_call(ToolCall("imggen", "image_generation", {"prompt": "draw a gateway"}, {}))
+            self.assertFalse(result.success)
+            self.assertEqual(result.failure_type, "connector_required")
+            self.assertIn("No real image generation provider", result.content)
+        finally:
+            _urllib_request.urlopen = old_urlopen
+            cu._PIL_Image = old_pil
+            for key, value in {
+                "OPENAI_API_KEY": old_openai,
+                "IMAGE_GEN_API_KEY": old_image_key,
+                "HF_TOKEN": old_hf,
+                "HUGGINGFACE_TOKEN": old_hf2,
+            }.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
     def test_extracts_and_appends_chat_tool_results(self):
         response = {
             "choices": [
@@ -558,8 +721,9 @@ class NativeGatewayTests(unittest.TestCase):
         calls = [gateway._normalize_tool_call(call) for call in _parse_text_tool_calls(text)]
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0].name, "Read")
-        self.assertEqual(calls[0].arguments["file_path"], "README.md")
-        self.assertEqual(calls[1].arguments["file_path"], "src/gateway_app.py")
+        # After normalization, file_path is mapped to path
+        self.assertEqual(calls[0].arguments["path"], "README.md")
+        self.assertEqual(calls[1].arguments["path"], "src/gateway_app.py")
 
     def test_text_function_markup_fallback_executes_local_tools(self):
         with tempfile.TemporaryDirectory() as td:
@@ -886,6 +1050,57 @@ class NativeGatewayTests(unittest.TestCase):
             finally:
                 gateway.CONFIG_PATH = old_config
 
+    def test_downstream_key_is_enforced_for_post_routes(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                cfg = gateway._default_config()
+                cfg["downstream_keys"] = [
+                    {
+                        "name": "tools",
+                        "key_hash": gateway._hash_secret("tools-key"),
+                        "prefix": "tools-ke",
+                        "enabled": True,
+                        "protocols": ["direct_tools"],
+                    }
+                ]
+                gateway.save_config(cfg)
+                base = f"http://127.0.0.1:{httpd.server_address[1]}"
+                body = json.dumps(
+                    {
+                        "name": "calculator",
+                        "arguments": {"expression": "1+2"},
+                    }
+                ).encode("utf-8")
+                unauth = urllib.request.Request(
+                    base + "/v1/tools/call",
+                    data=body,
+                    headers={"content-type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    urllib.request.urlopen(unauth, timeout=5).read()
+                self.assertEqual(cm.exception.code, 401)
+
+                valid = urllib.request.Request(
+                    base + "/v1/tools/call",
+                    data=body,
+                    headers={"content-type": "application/json", "authorization": "Bearer tools-key"},
+                    method="POST",
+                )
+                payload = json.loads(urllib.request.urlopen(valid, timeout=5).read().decode("utf-8"))
+                self.assertTrue(payload["success"])
+                self.assertEqual(payload["content"], "3")
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+
     def test_fanout_synthesis_prompt_does_not_resend_full_original(self):
         original = "分析这套项目\n" + ("README line xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n" * 2000)
         partials = ["partial " + str(i) + " " + ("evidence " * 1000) for i in range(8)]
@@ -1035,7 +1250,8 @@ class NativeGatewayTests(unittest.TestCase):
         )
         final = run_tool_orchestration("/v1/responses", {"model": "m", "input": "calc"}, client)
         self.assertEqual(final["output"][0]["type"], "message")
-        self.assertEqual(client.requests[1][1]["input"][-1]["output"], "10")
+        # Upstream request is in OpenAI Chat format, tool result content is a string
+        self.assertEqual(client.requests[1][1]["messages"][-1]["content"], "10")
 
     def test_responses_custom_tool_call_executes_and_appends_custom_output(self):
         response = {
@@ -1082,7 +1298,8 @@ class NativeGatewayTests(unittest.TestCase):
             client,
         )
         self.assertEqual(final["content"][0]["text"], "8")
-        self.assertEqual(client.requests[1][1]["messages"][-1]["content"][0]["content"], "8")
+        # Upstream request is in OpenAI Chat format, tool result content is a string
+        self.assertEqual(client.requests[1][1]["messages"][-1]["content"], "8")
 
     def test_mcp_stdio_tools_list_call_and_schema_merge(self):
         script = r'''
@@ -1157,7 +1374,9 @@ while True:
                 self.assertTrue(result.success)
                 self.assertEqual(result.content, "mcp:ok")
                 legacy_name = _mcp_legacy_public_name("test", "echo_mcp")
-                self.assertEqual(_mcp_parse_public_name(legacy_name), ("test", "echo_mcp"))
+                # Legacy format mcp_server_tool is ambiguous; only mcp__server__tool is parsed
+                self.assertIsNone(_mcp_parse_public_name(legacy_name))
+                self.assertEqual(_mcp_parse_public_name(public_name), ("test", "echo_mcp"))
                 merged = _merge_builtin_tools("/v1/chat/completions", {"messages": []})
                 names = [
                     t.get("function", {}).get("name")
@@ -1241,7 +1460,7 @@ while True:
                 templates = _execute_tool_call(ToolCall("lt", "list_mcp_resource_templates", {"server": "res"}, {}))
                 self.assertTrue(templates.success)
                 self.assertIn("uriTemplate", templates.content)
-                read = _execute_tool_call(ToolCall("rr", "mcp_read_resource", {"server": "res", "uri": "file:///demo.txt"}, {}))
+                read = _execute_tool_call(ToolCall("rr", "read_mcp_resource", {"server": "res", "uri": "file:///demo.txt"}, {}))
                 self.assertTrue(read.success)
                 self.assertIn("resource body", read.content)
                 prompt = _execute_tool_call(ToolCall("gp", "mcp_get_prompt", {"server": "res", "name": "p"}, {}))
@@ -1744,17 +1963,20 @@ while True:
                 gateway.save_config(cfg)
                 client = gateway.NativeProxyClient()
 
-                chat = client.forward(
+                chat = run_tool_orchestration(
                     "/v1/chat/completions",
                     {"model": "downstream", "messages": [{"role": "user", "content": "chat request"}]},
+                    client,
                 )
-                responses = client.forward(
+                responses = run_tool_orchestration(
                     "/v1/responses",
                     {"model": "downstream", "instructions": "be concise", "input": "responses request"},
+                    client,
                 )
-                messages = client.forward(
+                messages = run_tool_orchestration(
                     "/v1/messages",
-                    {"model": "downstream", "system": "system prompt", "messages": [{"role": "user", "content": [{"type": "text", "text": "messages request"}]}]},
+                    {"model": "downstream", "max_tokens": 100, "system": "system prompt", "messages": [{"role": "user", "content": [{"type": "text", "text": "messages request"}]}]},
+                    client,
                 )
 
                 self.assertEqual([item["path"] for item in ChatOnlyHandler.seen], ["/v1/chat/completions"] * 3)
@@ -2321,7 +2543,7 @@ class StreamingToolEventTests(unittest.TestCase):
             elif "GATEWAY_TOOL_MODE" in os.environ:
                 del os.environ["GATEWAY_TOOL_MODE"]
 
-    # ── run_streaming_orchestration stub ───────────────────────────
+    # ── run_streaming_orchestration signature smoke ─────────────────
 
     def test_streaming_orchestration_needs_handler_path_body(self):
         """Smoke: run_streaming_orchestration exists and has the right signature."""
@@ -2332,3 +2554,411 @@ class StreamingToolEventTests(unittest.TestCase):
         self.assertIn("path", params)
         self.assertIn("body", params)
 
+
+class ProtocolConversionTests(unittest.TestCase):
+    """Tests for Anthropic ↔ OpenAI protocol conversion functions."""
+
+    # ── _anthropic_tools_to_openai ───────────────────────────────
+
+    def test_anthropic_tools_to_openai_basic(self):
+        from src.gateway_app import _anthropic_tools_to_openai
+        tools = [
+            {
+                "name": "read_file",
+                "description": "Read a file",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            }
+        ]
+        result = _anthropic_tools_to_openai(tools)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["type"], "function")
+        self.assertEqual(result[0]["function"]["name"], "read_file")
+        self.assertEqual(result[0]["function"]["description"], "Read a file")
+        self.assertEqual(result[0]["function"]["parameters"]["type"], "object")
+        self.assertIn("path", result[0]["function"]["parameters"]["properties"])
+
+    def test_anthropic_tools_to_openai_empty(self):
+        from src.gateway_app import _anthropic_tools_to_openai
+        self.assertEqual(_anthropic_tools_to_openai([]), [])
+
+    def test_anthropic_tools_to_openai_skips_no_name(self):
+        from src.gateway_app import _anthropic_tools_to_openai
+        tools = [{"description": "no name"}, {"name": "ok", "input_schema": {}}]
+        result = _anthropic_tools_to_openai(tools)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["function"]["name"], "ok")
+
+    def test_anthropic_tools_to_openai_fallback_parameters(self):
+        """If input_schema is missing, falls back to 'parameters' key."""
+        from src.gateway_app import _anthropic_tools_to_openai
+        tools = [{"name": "tool1", "parameters": {"type": "object"}}]
+        result = _anthropic_tools_to_openai(tools)
+        self.assertEqual(result[0]["function"]["parameters"], {"type": "object"})
+
+    # ── _openai_tools_to_anthropic ───────────────────────────────
+
+    def test_openai_tools_to_anthropic_basic(self):
+        from src.gateway_app import _openai_tools_to_anthropic
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                },
+            }
+        ]
+        result = _openai_tools_to_anthropic(tools)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["name"], "read_file")
+        self.assertEqual(result[0]["description"], "Read a file")
+        self.assertIn("input_schema", result[0])
+        self.assertEqual(result[0]["input_schema"]["type"], "object")
+
+    def test_openai_tools_to_anthropic_roundtrip(self):
+        """Anthropic → OpenAI → Anthropic should preserve name and schema."""
+        from src.gateway_app import _anthropic_tools_to_openai, _openai_tools_to_anthropic
+        original = [
+            {
+                "name": "bash",
+                "description": "Run a command",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            }
+        ]
+        openai = _anthropic_tools_to_openai(original)
+        back = _openai_tools_to_anthropic(openai)
+        self.assertEqual(back[0]["name"], "bash")
+        self.assertEqual(back[0]["description"], "Run a command")
+        self.assertEqual(back[0]["input_schema"], original[0]["input_schema"])
+
+    # ── _anthropic_tool_choice_to_openai ─────────────────────────
+
+    def test_tool_choice_auto(self):
+        from src.gateway_app import _anthropic_tool_choice_to_openai
+        self.assertEqual(_anthropic_tool_choice_to_openai({"type": "auto"}), "auto")
+
+    def test_tool_choice_any(self):
+        from src.gateway_app import _anthropic_tool_choice_to_openai
+        self.assertEqual(_anthropic_tool_choice_to_openai({"type": "any"}), "required")
+
+    def test_tool_choice_specific(self):
+        from src.gateway_app import _anthropic_tool_choice_to_openai
+        result = _anthropic_tool_choice_to_openai({"type": "tool", "name": "bash"})
+        self.assertEqual(result, {"type": "function", "function": {"name": "bash"}})
+
+    def test_tool_choice_passthrough_non_dict(self):
+        from src.gateway_app import _anthropic_tool_choice_to_openai
+        self.assertEqual(_anthropic_tool_choice_to_openai("auto"), "auto")
+        self.assertIsNone(_anthropic_tool_choice_to_openai(None))
+
+    def test_tool_choice_tool_missing_name(self):
+        from src.gateway_app import _anthropic_tool_choice_to_openai
+        # type "tool" without name falls back to "auto"
+        self.assertEqual(_anthropic_tool_choice_to_openai({"type": "tool"}), "auto")
+
+    # ── _convert_anthropic_messages_to_openai ────────────────────
+
+    def test_convert_simple_text_messages(self):
+        from src.gateway_app import _convert_anthropic_messages_to_openai
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there"},
+        ]
+        result, reasoning = _convert_anthropic_messages_to_openai(messages)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["role"], "user")
+        self.assertEqual(result[0]["content"], "Hello")
+        self.assertEqual(result[1]["role"], "assistant")
+        self.assertEqual(result[1]["content"], "Hi there")
+        self.assertIsNone(reasoning)
+
+    def test_convert_tool_use_to_tool_calls(self):
+        from src.gateway_app import _convert_anthropic_messages_to_openai
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Let me read that file."},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_123",
+                        "name": "read_file",
+                        "input": {"path": "/tmp/test.txt"},
+                    },
+                ],
+            }
+        ]
+        result, reasoning = _convert_anthropic_messages_to_openai(messages)
+        self.assertEqual(len(result), 1)
+        msg = result[0]
+        self.assertEqual(msg["role"], "assistant")
+        self.assertEqual(msg["content"], "Let me read that file.")
+        self.assertIn("tool_calls", msg)
+        self.assertEqual(len(msg["tool_calls"]), 1)
+        tc = msg["tool_calls"][0]
+        self.assertEqual(tc["id"], "toolu_123")
+        self.assertEqual(tc["type"], "function")
+        self.assertEqual(tc["function"]["name"], "read_file")
+        self.assertEqual(json.loads(tc["function"]["arguments"]), {"path": "/tmp/test.txt"})
+
+    def test_convert_tool_result_to_role_tool(self):
+        from src.gateway_app import _convert_anthropic_messages_to_openai
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_123",
+                        "content": "file contents here",
+                    }
+                ],
+            }
+        ]
+        result, reasoning = _convert_anthropic_messages_to_openai(messages)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["role"], "tool")
+        self.assertEqual(result[0]["tool_call_id"], "toolu_123")
+        self.assertEqual(result[0]["content"], "file contents here")
+
+    def test_convert_tool_result_with_list_content(self):
+        from src.gateway_app import _convert_anthropic_messages_to_openai
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_456",
+                        "content": [
+                            {"type": "text", "text": "line 1"},
+                            {"type": "text", "text": "line 2"},
+                        ],
+                    }
+                ],
+            }
+        ]
+        result, _ = _convert_anthropic_messages_to_openai(messages)
+        self.assertEqual(len(result), 1)
+        self.assertIn("line 1", result[0]["content"])
+        self.assertIn("line 2", result[0]["content"])
+
+    def test_convert_thinking_block(self):
+        from src.gateway_app import _convert_anthropic_messages_to_openai
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "Let me reason about this..."},
+                    {"type": "text", "text": "The answer is 42."},
+                ],
+            }
+        ]
+        result, reasoning = _convert_anthropic_messages_to_openai(messages)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["content"], "The answer is 42.")
+        self.assertEqual(reasoning, "Let me reason about this...")
+
+    def test_convert_multiple_tool_calls_in_one_message(self):
+        from src.gateway_app import _convert_anthropic_messages_to_openai
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "I'll do both."},
+                    {"type": "tool_use", "id": "t1", "name": "read", "input": {"path": "a"}},
+                    {"type": "tool_use", "id": "t2", "name": "write", "input": {"path": "b", "content": "x"}},
+                ],
+            }
+        ]
+        result, _ = _convert_anthropic_messages_to_openai(messages)
+        self.assertEqual(len(result[0]["tool_calls"]), 2)
+        self.assertEqual(result[0]["tool_calls"][0]["function"]["name"], "read")
+        self.assertEqual(result[0]["tool_calls"][1]["function"]["name"], "write")
+
+    def test_convert_user_text_and_tool_result_mixed(self):
+        from src.gateway_app import _convert_anthropic_messages_to_openai
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Here's the result:"},
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "data"},
+                ],
+            }
+        ]
+        result, _ = _convert_anthropic_messages_to_openai(messages)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["role"], "user")
+        self.assertEqual(result[0]["content"], "Here's the result:")
+        self.assertEqual(result[1]["role"], "tool")
+        self.assertEqual(result[1]["tool_call_id"], "t1")
+
+    def test_convert_skips_non_dict_messages(self):
+        from src.gateway_app import _convert_anthropic_messages_to_openai
+        messages = [None, "not a dict", {"role": "user", "content": "ok"}]
+        result, _ = _convert_anthropic_messages_to_openai(messages)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["content"], "ok")
+
+    # ── _preserve_anthropic_fields ───────────────────────────────
+
+    def test_preserve_anthropic_fields(self):
+        from src.gateway_app import _preserve_anthropic_fields
+        body = {
+            "model": "claude-sonnet-4-20250514",
+            "thinking": {"type": "enabled", "budget_tokens": 10000},
+            "context_management": {"type": "auto"},
+            "stream": True,
+        }
+        payload: dict = {}
+        _preserve_anthropic_fields(body, payload)
+        ctx = payload["gateway_context"]
+        self.assertEqual(ctx["anthropic_thinking"]["type"], "enabled")
+        self.assertEqual(ctx["anthropic_context_management"]["type"], "auto")
+        self.assertNotIn("anthropic_output_config", ctx)
+        self.assertNotIn("anthropic_metadata", ctx)
+
+    def test_preserve_anthropic_fields_none_values(self):
+        from src.gateway_app import _preserve_anthropic_fields
+        body = {"model": "test"}
+        payload: dict = {}
+        _preserve_anthropic_fields(body, payload)
+        # gateway_context should be created but empty
+        self.assertEqual(payload["gateway_context"], {})
+
+    # ── _to_openai_chat_payload integration ──────────────────────
+
+    def test_to_openai_chat_converts_tools(self):
+        from src.gateway_app import _to_openai_chat_payload
+        body = {
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "name": "bash",
+                    "description": "Run command",
+                    "input_schema": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+                }
+            ],
+            "tool_choice": {"type": "auto"},
+        }
+        payload = _to_openai_chat_payload("/v1/messages", body)
+        # Tools should be converted, not stripped
+        self.assertIn("tools", payload)
+        self.assertEqual(len(payload["tools"]), 1)
+        self.assertEqual(payload["tools"][0]["type"], "function")
+        self.assertEqual(payload["tools"][0]["function"]["name"], "bash")
+        # tool_choice should be converted
+        self.assertEqual(payload["tool_choice"], "auto")
+
+    def test_to_openai_chat_preserves_tool_chain(self):
+        from src.gateway_app import _to_openai_chat_payload
+        body = {
+            "model": "test",
+            "messages": [
+                {"role": "user", "content": "read file"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "ok"},
+                        {"type": "tool_use", "id": "t1", "name": "read", "input": {"path": "/f"}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "t1", "content": "file data"},
+                    ],
+                },
+            ],
+            "stream": True,
+        }
+        payload = _to_openai_chat_payload("/v1/messages", body)
+        msgs = payload["messages"]
+        # Should have: user, assistant (with tool_calls), tool
+        self.assertEqual(len(msgs), 3)
+        self.assertEqual(msgs[0]["role"], "user")
+        self.assertEqual(msgs[1]["role"], "assistant")
+        self.assertIn("tool_calls", msgs[1])
+        self.assertEqual(msgs[1]["tool_calls"][0]["function"]["name"], "read")
+        self.assertEqual(msgs[2]["role"], "tool")
+        self.assertEqual(msgs[2]["tool_call_id"], "t1")
+        self.assertEqual(msgs[2]["content"], "file data")
+
+    def test_to_openai_chat_preserves_anthropic_fields(self):
+        from src.gateway_app import _to_openai_chat_payload
+        body = {
+            "model": "test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 5000},
+            "context_management": {"type": "auto"},
+            "stream": True,
+        }
+        payload = _to_openai_chat_payload("/v1/messages", body)
+        ctx = payload.get("gateway_context", {})
+        self.assertIn("anthropic_thinking", ctx)
+        self.assertEqual(ctx["anthropic_thinking"]["budget_tokens"], 5000)
+        self.assertIn("anthropic_context_management", ctx)
+        # These should NOT be in the payload root
+        self.assertNotIn("thinking", payload)
+        self.assertNotIn("context_management", payload)
+
+
+class ContextSummarizationTests(unittest.TestCase):
+    """Tests for LLM-based context summarization."""
+
+    def test_compact_messages_with_summary_fallback(self):
+        """When LLM is unavailable, falls back to text trimming."""
+        from src.gateway_app import _compact_messages_with_summary
+        messages = [
+            {"role": "user", "content": "Hello " * 1000},
+            {"role": "assistant", "content": "Hi there " * 1000},
+            {"role": "user", "content": "recent message"},
+            {"role": "assistant", "content": "recent response"},
+        ]
+        # keep_recent=2, so first 2 messages are "old"
+        result = _compact_messages_with_summary(messages, keep_recent=2, text_limit=500)
+        self.assertIsInstance(result, list)
+        # Should have old messages (trimmed or summarized) + recent messages
+        self.assertTrue(len(result) >= 2)
+        # Last message should be intact
+        self.assertEqual(result[-1]["content"], "recent response")
+
+    def test_compact_messages_with_summary_short_list(self):
+        """When messages fit within keep_recent, no summarization needed."""
+        from src.gateway_app import _compact_messages_with_summary
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi"},
+        ]
+        result = _compact_messages_with_summary(messages, keep_recent=5, text_limit=1000)
+        self.assertEqual(len(result), 2)
+
+    def test_compact_messages_with_summary_empty(self):
+        """Empty messages list returns empty."""
+        from src.gateway_app import _compact_messages_with_summary
+        result = _compact_messages_with_summary([], keep_recent=5, text_limit=1000)
+        self.assertEqual(result, [])
+
+    def test_summary_cache_hit(self):
+        """Same messages should return cached summary."""
+        from src.gateway_app import _SUMMARY_CACHE, _summarize_via_llm
+        # Pre-populate cache
+        test_msgs = [{"role": "user", "content": "test"}]
+        content_key = json.dumps(test_msgs, ensure_ascii=False, sort_keys=True)
+        content_hash = str(hash(content_key) & 0xFFFFFFFF)
+        _SUMMARY_CACHE[content_hash] = "cached summary"
+        result = _summarize_via_llm(test_msgs)
+        self.assertEqual(result, "cached summary")
+        # Cleanup
+        del _SUMMARY_CACHE[content_hash]

@@ -3,8 +3,9 @@
 # Usage: ./scripts/install_deps.sh [--check]
 #   --check  Only check what's installed, don't install anything.
 #
-# These are optional — the gateway works without them, but some tools
-# (OCR, PDF parsing, code formatting, git operations) need these binaries.
+# These are optional — the gateway core works with Python stdlib only.
+# Install/check only dependencies used by current built-in tools; heavier
+# integrations should be added as MCP servers or HTTP Actions.
 
 set -euo pipefail
 
@@ -18,6 +19,7 @@ NC='\033[0m'
 
 CHECK_ONLY=false
 [[ "${1:-}" == "--check" ]] && CHECK_ONLY=true
+MISSING_COUNT=0
 
 ok()   { echo -e "  ${GREEN}[OK]${NC} $1"; }
 miss() { echo -e "  ${RED}[MISSING]${NC} $1"; }
@@ -32,7 +34,8 @@ install() {
     fi
     miss "$name"
     if $CHECK_ONLY; then
-        return 1
+        MISSING_COUNT=$((MISSING_COUNT + 1))
+        return 0
     fi
     if command -v brew &>/dev/null; then
         echo "  -> brew install $brew_pkg"
@@ -55,7 +58,8 @@ pip_install() {
     fi
     miss "$name (pip)"
     if $CHECK_ONLY; then
-        return 1
+        MISSING_COUNT=$((MISSING_COUNT + 1))
+        return 0
     fi
     echo "  -> pip3 install $name"
     pip3 install "$name"
@@ -66,17 +70,15 @@ echo ""
 
 echo "[CLI Binaries]"
 install git
-install tesseract tesseract
-install pandoc pandoc
-install ffmpeg ffmpeg
-install gh gh
 install jq jq
 
 echo ""
 echo "[Python Packages]"
 pip_install Pillow PIL
-pip_install pypdf pypdf
-pip_install black black
+pip_install pyautogui pyautogui
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    pip_install pyobjc-framework-Quartz Quartz
+fi
 
 echo ""
 echo "[Summary]"
@@ -95,12 +97,8 @@ check_tool() {
 check_tool "Read/Write/Edit/Glob/Grep/LS/Tree" "python3"
 check_tool "Bash/shell exec"            "python3"
 check_tool "Git operations"             "git"
-check_tool "OCR (image text)"           "tesseract"
-check_tool "PDF parsing"                "python3"
-check_tool "Code formatting"            "python3"
-check_tool "Document conversion"        "pandoc"
-check_tool "Audio/video processing"     "ffmpeg"
-check_tool "GitHub operations"          "gh"
+check_tool "Image metadata/screenshot"  "python3"
+check_tool "GUI automation backend"     "python3"
 check_tool "Web search (DuckDuckGo)"    "python3"
 check_tool "Web fetch/HTTP"             "python3"
 check_tool "Calculator/time"            "python3"
@@ -110,4 +108,8 @@ echo ""
 echo -e "$TOOLS_STATUS"
 
 echo "Done. Gateway core needs only Python 3.9+."
-echo "Optional tools above add OCR, PDF, formatting, etc."
+echo "Optional tools above add image metadata and desktop automation support."
+if $CHECK_ONLY && [[ "$MISSING_COUNT" -gt 0 ]]; then
+    echo "Missing optional dependencies: $MISSING_COUNT"
+    exit 1
+fi

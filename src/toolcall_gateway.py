@@ -7,12 +7,16 @@ compatibility with existing tests and callers that monkeypatch module globals.
 """
 from __future__ import annotations
 
+import pathlib
 import sys
 
 try:  # package import: import src.toolcall_gateway
     from . import gateway_app as _app
 except ImportError:  # script execution: python src/toolcall_gateway.py
-    import gateway_app as _app  # type: ignore
+    project_root = pathlib.Path(__file__).resolve().parents[1]
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+    import src.gateway_app as _app  # type: ignore
 
 if __name__ == "__main__":
     _app.main()

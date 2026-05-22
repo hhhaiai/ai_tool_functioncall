@@ -112,10 +112,10 @@ def main() -> int:
         checks.append("project_tree")
 
         globbed = call_tool(args.base_url, args.key, "Glob", {"pattern": "src/*.py"})
-        assert_contains("Glob", globbed["content"], "src/gateway_app.py")
+        assert_contains("Glob", globbed["content"], "src/gateway_http_handler.py")
         checks.append("project_glob")
 
-        symbols = call_tool(args.base_url, args.key, "PythonSymbols", {"file_path": "src/gateway_app.py"})
+        symbols = call_tool(args.base_url, args.key, "PythonSymbols", {"file_path": "src/gateway_http_handler.py"})
         assert_contains("PythonSymbols", symbols["content"], "GatewayHandler")
         checks.append("python_symbols")
 
@@ -152,7 +152,7 @@ def main() -> int:
         assert_contains("AnalyzeImage", image["content"], '"width": 1')
         checks.append("vision_image")
 
-        intent = call_tool(args.base_url, args.key, "IntentDetect", {"text": "分析 @src/gateway_app.py 并修改代码，然后运行测试和查询网络"})
+        intent = call_tool(args.base_url, args.key, "IntentDetect", {"text": "分析 @src/gateway_http_handler.py 并修改代码，然后运行测试和查询网络"})
         assert_contains("IntentDetect", intent["content"], "project_analysis")
         assert_contains("IntentDetect", intent["content"], "code_change")
         assert_contains("IntentDetect", intent["content"], "network")

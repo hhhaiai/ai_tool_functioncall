@@ -28,16 +28,17 @@
 | curl | - | ✅ | 健康检查 |
 | screen / nohup | - | 可选 | 后台运行方式 |
 
-**可选依赖**（用于 computer_use 工具）：
+**可选依赖**（用于 `view_image` / `computer_use` / GUI 输入工具）：
 
 ```bash
-# Linux 截图/键鼠控制
-pip install pyautogui pillow
+# 本地图片解析 / 截图保存
+pip install pillow
 
-# OCR 文字识别
-pip install pytesseract
-apt install tesseract-ocr  # Linux
-brew install tesseract      # macOS
+# Linux/Windows 截图、鼠标、键盘后端
+pip install pyautogui
+
+# macOS 截图、鼠标、键盘后端
+pip install pyobjc-framework-Quartz
 ```
 
 ---
@@ -191,11 +192,14 @@ curl http://127.0.0.1:8885/healthz
 | `UPSTREAM_BASE_URL` | upstream.base_url | 上游 API 地址 |
 | `UPSTREAM_API_KEY` | upstream.api_key | 上游 API Key |
 | `UPSTREAM_MODEL` | upstream.model | 默认模型 |
+| `GATEWAY_UPSTREAM_PROTOCOL` | upstream.protocol | 上游协议类型，优先于 legacy `UPSTREAM_PROTOCOL` |
+| `UPSTREAM_PROTOCOL` | upstream.protocol | 兼容旧环境变量，未设置 `GATEWAY_UPSTREAM_PROTOCOL` 时生效 |
 | `GATEWAY_DOWNSTREAM_KEY` | gateway.client_snippet_api_key | 下游 API Key |
 | `GATEWAY_ADMIN_PASSWORD` | admin.password | 管理员密码 |
 | `GATEWAY_WORKSPACE_ROOT` | gateway.workspace_root | 工作目录 |
 | `GATEWAY_PORT` | - | 监听端口（默认 8885） |
 | `GATEWAY_HOST` | - | 监听地址（默认 0.0.0.0） |
+| `GATEWAY_SQLITE_LOG_PATH` | gateway.sqlite_log_path | SQLite 请求/工具/记忆日志路径 |
 
 ---
 
@@ -284,7 +288,7 @@ curl http://127.0.0.1:8885/v1/models \
 ### 5.4 运行测试套件
 
 ```bash
-# 运行全部测试（97 个）
+# 运行全部测试（当前 131 个）
 python3 -m unittest discover -s tests -v
 
 # 运行集成测试
@@ -342,16 +346,15 @@ response = client.chat.completions.create(
 ### 7.1 安全配置
 
 ```bash
-# 1. 修改管理员密码
-vi .gateway_service.json
-# 设置 admin.password 为强密码
+# 1. 修改管理员密码（推荐用环境变量，不提交本地配置）
+export GATEWAY_ADMIN_PASSWORD='replace-with-strong-password'
 
-# 2. 设置下游 API Key
-# 设置 gateway.client_snippet_api_key
+# 2. 强制下游 API Key 鉴权
+export GATEWAY_DOWNSTREAM_KEY='replace-with-client-key'
 
-# 3. 限制工具权限
-# gateway.allow_write_tools: false（如不需要文件写入）
-# gateway.allow_shell_tools: false（如不需要 Shell 执行）
+# 3. 最小权限工具策略；仅可信本地 coding-agent workspace 才开启
+export GATEWAY_ALLOW_WRITE_TOOLS=0
+export GATEWAY_ALLOW_SHELL_TOOLS=0
 ```
 
 ### 7.2 Linux systemd 服务
@@ -481,7 +484,7 @@ curl $UPSTREAM_BASE_URL/v1/models -H "Authorization: Bearer $UPSTREAM_API_KEY"
 tail -f .gateway_runtime/gateway-8885.log
 
 # SQLite 日志查询
-sqlite3 gateway_log.sqlite3 "SELECT * FROM request_log ORDER BY id DESC LIMIT 10;"
+sqlite3 gateway_log.sqlite3 "SELECT * FROM request_logs ORDER BY id DESC LIMIT 10;"
 ```
 
 ### Q: Linux 上 computer_use 工具不工作
@@ -506,10 +509,10 @@ Xvfb :99 -screen 0 1024x768x24 &
 ai_tool_functioncall/
 ├── src/
 │   ├── toolcall_gateway.py      # 入口文件
-│   ├── gateway_app.py           # 核心应用逻辑
+│   ├── gateway_app.py           # 入口 + 兼容重导出
 │   ├── gateway_builtin_tools.py # 内置工具实现
 │   ├── gateway_streaming.py     # SSE 流式处理
-│   ├── gateway_tool_runtime.py  # 工具运行时
+│   ├── gateway_tool_runtime.py  # 工具运行时 / 编排
 │   └── gateway_computer_use.py  # 电脑控制工具
 ├── scripts/
 │   └── mimo_gateway.sh          # 启动脚本

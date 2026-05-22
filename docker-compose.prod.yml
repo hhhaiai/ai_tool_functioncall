@@ -1,0 +1,88 @@
+version: "3.8"
+
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai-gateway-prod
+    restart: always
+    ports:
+      - "${GATEWAY_PORT:-8885}:8885"
+    environment:
+      # Upstream API configuration
+      - UPSTREAM_BASE_URL=${UPSTREAM_BASE_URL:?set UPSTREAM_BASE_URL}
+      - UPSTREAM_API_KEY=${UPSTREAM_API_KEY:?set UPSTREAM_API_KEY}
+      - UPSTREAM_MODEL=${UPSTREAM_MODEL:?set UPSTREAM_MODEL}
+      - GATEWAY_UPSTREAM_PROTOCOL=${GATEWAY_UPSTREAM_PROTOCOL}
+      - UPSTREAM_PROTOCOL=${UPSTREAM_PROTOCOL:-openai_chat}
+      # Gateway configuration
+      - GATEWAY_PORT=8885
+      - GATEWAY_HOST=0.0.0.0
+      - GATEWAY_ADMIN_PASSWORD=${GATEWAY_ADMIN_PASSWORD:?set GATEWAY_ADMIN_PASSWORD}
+      - GATEWAY_TOOL_MODE=${GATEWAY_TOOL_MODE:-orchestrate}
+      - GATEWAY_MAX_TOOL_ROUNDS=${GATEWAY_MAX_TOOL_ROUNDS:-10}
+      # Context management
+      - GATEWAY_CONTEXT_ENABLED=${GATEWAY_CONTEXT_ENABLED:-1}
+      - GATEWAY_CONTEXT_MAX_INPUT_TOKENS=${GATEWAY_CONTEXT_MAX_INPUT_TOKENS:-24000}
+      - GATEWAY_CONTEXT_FANOUT_ENABLED=${GATEWAY_CONTEXT_FANOUT_ENABLED:-1}
+      # Tool configuration
+      - GATEWAY_EXPOSE_BUILTIN_TOOLS=${GATEWAY_EXPOSE_BUILTIN_TOOLS:-1}
+      - GATEWAY_ALLOW_WRITE_TOOLS=${GATEWAY_ALLOW_WRITE_TOOLS:-0}
+      - GATEWAY_ALLOW_SHELL_TOOLS=${GATEWAY_ALLOW_SHELL_TOOLS:-0}
+      # Streaming
+      - GATEWAY_UPSTREAM_STREAM_AGGREGATE=${GATEWAY_UPSTREAM_STREAM_AGGREGATE:-1}
+      # Memory
+      - GATEWAY_MEMORY_ENABLED=${GATEWAY_MEMORY_ENABLED:-1}
+      # Security
+      - GATEWAY_DOWNSTREAM_KEY=${GATEWAY_DOWNSTREAM_KEY:?set GATEWAY_DOWNSTREAM_KEY}
+    volumes:
+      # Persist runtime data (logs, config, stats)
+      - gateway-data:/app/data
+      # Mount workspace for file tools
+      - ${GATEWAY_WORKSPACE_ROOT:-./workspace}:/app/workspace
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8885/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  nginx:
+    image: nginx:alpine
+    container_name: gateway-nginx
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - nginx-cache:/var/cache/nginx
+    depends_on:
+      gateway:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+
+volumes:
+  gateway-data:
+    driver: local
+  nginx-cache:
+    driver: local

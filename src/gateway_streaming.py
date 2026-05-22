@@ -1,17 +1,18 @@
 # =============================================================================
-# Streaming tool event parsing (StreamingToolEventTests)
-# Extracted from gateway_app.py lines 5237–5517 (EOF)
+# Streaming tool event parsing and SSE orchestration
+# Owns downstream SSE emission for passthrough and gateway-orchestrated tool calls.
 # =============================================================================
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from gateway_app import ToolResult
+    from .gateway_app import ToolResult
 
 
 # =============================================================================
@@ -287,12 +288,249 @@ def _forced_tool_name(path: str, body: dict) -> str:
 # Streaming orchestration entry point
 # =============================================================================
 
+
 def run_streaming_orchestration(
     handler: Any, path: str, body: dict
 ) -> None:
-    """Streaming orchestration entry point (stub — full impl in gateway_streaming.py)."""
+    """Streaming orchestration with tool call support."""
+    from .gateway_config import _config_env, _gateway_config, _upstream_protocol
+    from .gateway_context import (
+        _context_config,
+        _inject_recalled_memories,
+        _maybe_compact_request_for_upstream,
+        _remember_conversation_turn,
+    )
+    from .gateway_proxy import NativeProxyClient
+    from .gateway_protocol import _convert_request_to_upstream, _convert_response_to_downstream
+    from .gateway_tool_runtime import (
+        _append_text_tool_results,
+        _append_tool_results,
+        _convert_response_to_path,
+        _execute_tool_call,
+        _extract_text_tool_calls,
+        _extract_tool_calls,
+    )
+
     _send_sse_headers(handler)
-    handler.wfile.write(b'data: {"error": "streaming not implemented"}\r\n\r\n')
+
+    gateway_cfg = _gateway_config()
+    mode = str(os.environ.get("GATEWAY_TOOL_MODE") or gateway_cfg.get("tool_mode") or "orchestrate").lower()
+    upstream_protocol = _upstream_protocol()
+
+    if mode in {"passthrough", "native_passthrough", "proxy"}:
+        _stream_upstream_passthrough(handler, path, body)
+        return
+
+    max_rounds = int(_config_env("GATEWAY_MAX_TOOL_ROUNDS", "5"))
+    upstream = NativeProxyClient()
+    memory_body = _inject_recalled_memories(path, body)
+    context_cfg = _context_config()
+    request_body = _merge_builtin_tools(path, _maybe_compact_request_for_upstream(path, memory_body, context_cfg))
+
+    upstream_path, request_body = _convert_request_to_upstream(path, request_body, upstream_protocol)
+    # The gateway is responsible for emitting downstream SSE in orchestrate
+    # mode. Keep the upstream request non-streaming unless passthrough is used.
+    request_body = dict(request_body)
+    request_body["stream"] = False
+
+    tools_stripped = False
+    for _round in range(max_rounds):
+        try:
+            response = upstream.forward(upstream_path, request_body)
+        except Exception as exc:
+            from .gateway_errors import UpstreamHTTPError
+            if isinstance(exc, UpstreamHTTPError) and exc.upstream_status == 400 and not tools_stripped and request_body.get("tools"):
+                from .gateway_protocol import _inject_tools_as_text_prompt, _without_tools
+                request_body = _without_tools(request_body)
+                request_body = _inject_tools_as_text_prompt(request_body, [])
+                tools_stripped = True
+                continue
+            _write_sse(handler, {"error": str(exc)}, event="error")
+            _write_sse(handler, "[DONE]", event="done")
+            return
+
+        upstream_response = _convert_response_to_path(upstream_path, response)
+        downstream_response = _convert_response_to_downstream(path, response, upstream_protocol)
+        calls = _extract_tool_calls(path, downstream_response)
+        text_fallback = False
+        if not calls:
+            calls = _extract_text_tool_calls(path, downstream_response)
+            text_fallback = bool(calls)
+
+        if not calls:
+            _stream_final_response(handler, path, downstream_response)
+            _remember_conversation_turn(path, body, downstream_response)
+            return
+
+        results = []
+        for call in calls:
+            _write_sse(handler, {
+                "type": "tool_start",
+                "call_id": call.call_id,
+                "name": call.name,
+            }, event="tool_start")
+            result = _execute_tool_call(call, provider="streaming")
+            results.append(result)
+            _write_sse(handler, {
+                "type": "tool_result",
+                "call_id": result.call_id,
+                "name": result.name,
+                "success": result.success,
+                "failure_type": result.failure_type,
+                "content": result.content,
+            }, event="tool_result")
+
+        if text_fallback:
+            request_body = _append_text_tool_results(upstream_path, request_body, upstream_response, calls, results)
+        else:
+            request_body = _append_tool_results(upstream_path, request_body, upstream_response, results)
+
+    _write_sse(handler, {"error": "max tool rounds exceeded"}, event="error")
+    _write_sse(handler, "[DONE]", event="done")
+
+
+def _tools_enabled_for_upstream() -> str:
+    """Check if tools should be enabled for the upstream API."""
+    from .gateway_config import _upstream_config
+    cfg = _upstream_config()
+    return cfg.get("tools_enabled", "auto")
+
+
+def _merge_builtin_tools(path: str, body: dict) -> dict:
+    """Merge builtin tools into request body. Respects tools_enabled config."""
+    from .gateway_builtin_tools import BUILTIN_TOOLS
+    from .gateway_mcp import _mcp_tool_schemas
+    from .gateway_http_actions import _http_action_schemas
+    from .gateway_protocol import _inject_tools_as_text_prompt
+    from .gateway_mcp import _tool_schema_for_path
+
+    import copy
+    body = copy.deepcopy(body)
+
+    tools_enabled = _tools_enabled_for_upstream()
+    if tools_enabled == "off":
+        # Strip native tools and inject as text prompt
+        body.pop("tools", None)
+        body.pop("tool_choice", None)
+        # Collect all available tools for text injection
+        all_tools = []
+        for tool in BUILTIN_TOOLS.values():
+            all_tools.append({"name": tool.name, "description": tool.description, "parameters": tool.parameters})
+        mcp_schemas = _mcp_tool_schemas(path)
+        all_tools.extend(mcp_schemas)
+        action_schemas = _http_action_schemas(path)
+        all_tools.extend(action_schemas)
+        body = _inject_tools_as_text_prompt(body, all_tools)
+        return body
+
+    # Get existing tools
+    tools = body.get("tools", [])
+    if not isinstance(tools, list):
+        tools = []
+
+    # Add builtin tools
+    for tool in BUILTIN_TOOLS.values():
+        schema = _tool_schema_for_path(path, tool)
+        tools.append(schema)
+
+    # Add MCP tools
+    mcp_schemas = _mcp_tool_schemas(path)
+    tools.extend(mcp_schemas)
+
+    # Add HTTP action tools
+    action_schemas = _http_action_schemas(path)
+    tools.extend(action_schemas)
+
+    if tools_enabled == "text_only":
+        # Strip native tools and inject as text prompt
+        body.pop("tools", None)
+        body.pop("tool_choice", None)
+        body = _inject_tools_as_text_prompt(body, tools)
+        return body
+
+    body["tools"] = tools
+    return body
+
+
+def _stream_upstream_passthrough(handler: Any, path: str, body: dict) -> None:
+    """Stream response directly from upstream."""
+    from .gateway_proxy import NativeProxyClient
+    import urllib.request
+    import json
+
+    client = NativeProxyClient()
+    url = client._url(path)
+    headers = client._headers()
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=client.timeout) as resp:
+            for line in resp:
+                handler.wfile.write(line)
+                handler.wfile.flush()
+    except Exception as exc:
+        _write_sse(handler, {"error": str(exc)}, event="error")
+    finally:
+        _write_sse(handler, "[DONE]", event="done")
+
+
+def _stream_final_response(handler: Any, path: str, response: dict) -> None:
+    """Stream the final response to client."""
+    if "/chat/completions" in path:
+        choices = response.get("choices", [])
+        for choice in choices:
+            message = choice.get("message", {})
+            if message.get("content"):
+                _write_sse(handler, {
+                    "id": response.get("id", ""),
+                    "object": "chat.completion.chunk",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": message["content"]},
+                        "finish_reason": None,
+                    }],
+                })
+        _write_sse(handler, {
+            "id": response.get("id", ""),
+            "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        })
+    elif "/messages" in path:
+        content = response.get("content", [])
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                _write_sse(handler, {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                })
+                _write_sse(handler, {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": item["text"]},
+                })
+                _write_sse(handler, {
+                    "type": "content_block_stop",
+                    "index": 0,
+                })
+        _write_sse(handler, {"type": "message_stop"})
+    elif "/responses" in path:
+        output = response.get("output", [])
+        for item in output:
+            if isinstance(item, dict) and item.get("type") == "message":
+                content_parts = item.get("content", [])
+                for part in content_parts:
+                    if isinstance(part, dict) and part.get("type") == "output_text":
+                        _write_sse(handler, {
+                            "type": "response.output_text.delta",
+                            "delta": part.get("text", ""),
+                        })
+        _write_sse(handler, {"type": "response.completed"})
+
+    _write_sse(handler, "[DONE]", event="done")
+
+
 
 
 def _streaming_tool_event_for_path(
@@ -308,16 +546,19 @@ def _streaming_tool_event_for_path(
     events: list[tuple[str, dict]] = []
     args_str = json.dumps(arguments)
     if "/chat/completions" in path:
-        # First event: None event name (data-only), contains the tool_calls structure
-        events.append((None, {
-            "id": call_id,
-            "index": index,
-            "function": {"name": name, "arguments": args_str},
-            "type": "function",
+        events.append(("chatcmpl", {
+            "id": msg_id,
+            "object": "chat.completion.chunk",
+            "choices": [{
+                "index": index,
+                "finish_reason": None,
+                "delta": {"tool_calls": [{"id": call_id, "index": index, "function": {"name": name, "arguments": args_str}, "type": "function"}]},
+            }],
         }))
         events.append(("chatcmpl", {
             "id": msg_id,
-            "choices": [{"index": index, "finish_reason": "tool_calls", "delta": {"tool_calls": [{"id": call_id, "function": {"name": name, "arguments": args_str}, "type": "function"}]}}],
+            "object": "chat.completion.chunk",
+            "choices": [{"index": index, "finish_reason": "tool_calls", "delta": {}}],
         }))
     elif "/messages" in path:
         # Anthropic: content_block_start → content_block_delta → content_block_stop
@@ -363,12 +604,23 @@ def _streaming_tool_event_for_path(
 # Re-export them from here so existing imports continue to work.
 
 def _send_sse_headers(handler: Any) -> None:
-    """Send SSE response headers. Stub for backward compatibility."""
+    """Send SSE response headers."""
     handler.send_response(200)
     handler.send_header("Content-Type", "text/event-stream")
     handler.send_header("Cache-Control", "no-cache")
     handler.send_header("X-Accel-Buffering", "no")
     handler.end_headers()
+
+
+def _write_sse(handler: Any, payload: Any, *, event: str | None = None) -> None:
+    """Write an SSE event to the handler."""
+    if event:
+        handler.wfile.write(f"event: {event}\n".encode("utf-8"))
+    data = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
+    for line in data.splitlines() or [""]:
+        handler.wfile.write(f"data: {line}\n".encode("utf-8"))
+    handler.wfile.write(b"\n")
+    handler.wfile.flush()
 
 
 __all__ = [
@@ -381,4 +633,5 @@ __all__ = [
     "_streaming_tool_event_for_path",
     # backward-compat stubs
     "_send_sse_headers",
+    "_write_sse",
 ]

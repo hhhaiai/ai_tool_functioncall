@@ -71,6 +71,9 @@ def main() -> int:
     status, body = request("POST", base + "/v1/tools/call", key=args.key, payload={"tool": "DeletePath", "arguments": {"path": "."}})
     add("destructive_delete_directory_requires_recursive", status == 200 and isinstance(body, dict) and body.get("success") is False, body)
 
+    status, body = request("POST", base + "/v1/tools/call", key=args.key, payload={"tool": "DeletePath", "arguments": {"path": ".", "recursive": True}})
+    add("destructive_delete_workspace_root_denied", status == 200 and isinstance(body, dict) and body.get("success") is False and body.get("failure_type") == "permission_denied", body)
+
     status, body = request("GET", base + "/client-config.json", admin=args.admin)
     redacted_safe = status == 200 and isinstance(body, dict) and "codex_config_toml" in body and "claude_bash_profile_function" in body
     add("client_config_generation_ok", redacted_safe, {"status": status, "keys": list(body.keys()) if isinstance(body, dict) else None})

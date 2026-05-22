@@ -72,11 +72,11 @@ Gateway 是一个**真实的工具执行 runtime**，不是 prompt faker。
 |---|------|--------|------|
 | 1 | **文本级工具调用识别与执行** - 解析模型文本输出中的工具调用语法，执行真实工具 | P0 | **已实现** |
 | 2 | **code_interpreter 本地沙箱** - 在 Gateway 本地执行 Python 代码 | P1 | **已实现** |
-| 3 | **智能执行流水线** - 高风险工具走5步流程（语义分析→执行→检查→反思→结论） | P1 | 待实现 |
-| 4 | **无限上下文** - 支持超长输入的分片处理和上下文压缩 | P1 | 部分实现 |
+| 3 | **高风险工具治理** - 写入、Shell、GUI 工具默认关闭，按 workspace/root 权限执行并记录失败 | P1 | **已实现基础治理；可继续增强审批流** |
+| 4 | **无限上下文** - 支持超长输入的分片处理、上下文压缩、SQLite 记忆召回 | P1 | **已实现并有回归测试** |
 | 5 | **支持稳定真实 tool calls** - 覆盖项目识别、文件读写改、Shell/coding、网络查询、并行工具、SQLite 记录 | P0 | **已实现并有 smoke 测试** |
-| 6 | **兼容性强** - 支持多种上游 API 和客户端格式 | P1 | 部分实现 |
-| 7 | **稳定运行** - 多并发支持，生产级稳定性 | P1 | 待加固 |
+| 6 | **兼容性强** - 支持 OpenAI Chat / Responses / Anthropic Messages 三协议转换和下游兼容路径 | P1 | **已实现并有回归测试** |
+| 7 | **稳定运行** - 并发 HTTP、SQLite WAL、fan-out worker、Docker/compose 部署和安全默认值 | P1 | **已实现基础生产化；真实 provider 矩阵需持续 smoke** |
 
 
 ### 3.4 当前收敛范围（2026-05-16）
@@ -131,7 +131,7 @@ python3 -m unittest discover -s tests -v
 
 ### 4.1 文本级工具调用解析器
 
-**已实现位置：** `src/gateway_app.py` 第2174行 `_parse_text_tool_calls()`
+**已实现位置：** `src/gateway_tool_runtime.py:_parse_text_tool_calls()`；三协议结构化提取在 `src/gateway_tool_runtime.py:_extract_tool_calls()`。
 
 **支持的格式：**
 

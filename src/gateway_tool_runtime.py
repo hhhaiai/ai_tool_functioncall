@@ -1,3 +1,348 @@
+#!/usr/bin/env python3
+"""Tool runtime for the gateway.
+
+Handles tool call parsing, normalization, execution, and orchestration.
+"""
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import re
+import subprocess
+import threading
+import uuid
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler
+from typing import Any
+
+from .gateway_builtin_tools import (
+    BUILTIN_TOOLS,
+    ToolCall,
+    ToolResult,
+    _parse_json_arguments,
+    _resolve_workspace_path,
+    _response_text,
+    _workspace_root,
+)
+from .gateway_config import (
+    SUPPORTED_PATHS,
+    _config_env,
+    _gateway_config,
+    _upstream_config,
+    load_config,
+)
+from .gateway_context import (
+    _approx_token_count,
+    _body_token_estimate,
+    _context_config,
+    _inject_recalled_memories,
+    _maybe_compact_request_for_upstream,
+    _remember_conversation_turn,
+    _run_context_fanout,
+)
+from .gateway_errors import GatewayError, ToolExecutionError, UpstreamHTTPError
+from .gateway_http_actions import _call_http_action, _http_action_by_name
+from .gateway_logging import _record_tool_failure, _record_tool_stat
+from .gateway_mcp import _mcp_call_tool, _mcp_parse_public_name, _mcp_server_by_name
+from .gateway_protocol import (
+    _convert_request_to_upstream,
+    _convert_response_to_downstream,
+    _from_openai_chat_response,
+    _last_user_text,
+    _replace_last_user_text,
+    _without_tools,
+)
+from .gateway_proxy import NativeProxyClient
+from .gateway_streaming import _merge_builtin_tools
+
+Json = dict[str, Any]
+
+DEFAULT_MAX_TOOL_ROUNDS = 5
+
+# Concurrency control globals
+_REQUEST_SEMAPHORE_LOCK = threading.Lock()
+_REQUEST_SEMAPHORE: threading.BoundedSemaphore | None = None
+_REQUEST_SEMAPHORE_SIZE: int = 0
+
+# Path-like regex for cleaning text tool paths
+_PATHISH_RE = re.compile(
+    r"@?(?P<path>"
+    r"(?:~?/|/|\.{1,2}/)[^\s<>'\"`|]+"
+    r"|(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.@%+=:,/-]+"
+    r"|[A-Za-z0-9_.-]+\.(?:py|pyi|js|jsx|ts|tsx|json|jsonl|toml|yaml|yml|md|txt|sh|bash|zsh|env|ini|cfg|conf|html|css|sql|go|rs|java|kt|swift|c|cc|cpp|h|hpp)"
+    r")"
+)
+
+
+# =============================================================================
+# Tool-runtime parsing and normalization utilities
+# =============================================================================
+
+def _first_present(args: Json, names: tuple[str, ...]) -> Any:
+    """Return the first present (non-None) value from args for the given names."""
+    for name in names:
+        if name in args and args[name] is not None:
+            return args[name]
+    return None
+
+
+def _clean_tool_string(value: Any) -> Any:
+    """Clean tool string by stripping whitespace and XML-like tags."""
+    if not isinstance(value, str):
+        return value
+    cleaned = value.strip()
+    cdata = re.fullmatch(r"<!\[CDATA\[(.*)\]\]>", cleaned, flags=re.S)
+    if cdata:
+        cleaned = cdata.group(1).strip()
+    cleaned = re.sub(r"</?(?:parameter|function|tool|tool_call|invoke)>", "", cleaned, flags=re.I).strip()
+    return cleaned
+
+
+def _clean_text_tool_path(value: Any) -> Any:
+    """Extract a single path from noisy text-tool fallback parameters.
+
+    Weak upstreams sometimes put prose after a path, e.g.
+    ``README.md\n<tool_call>`` or ``src/app.py\n\n--- report``. Passing the
+    whole blob to filesystem tools causes false not_found/File name too long
+    failures, so path-like parameters are reduced to the first path token.
+    """
+    cleaned = _clean_tool_string(value)
+    if not isinstance(cleaned, str):
+        return cleaned
+    text = cleaned.strip()
+    if not text:
+        return text
+    for line in text.splitlines():
+        candidate = line.strip().strip("`'\"")
+        if not candidate:
+            continue
+        match = _PATHISH_RE.search(candidate)
+        if match:
+            return match.group("path").rstrip(".,;:)")
+        if not re.match(r"^(?:[-*_]{3,}|#{1,6}\s|[*>]|\*\*)", candidate):
+            return candidate.rstrip(".,;:)")
+    return text
+
+
+def _normalize_relative_pattern(value: Any) -> Any:
+    """Normalize relative glob patterns to workspace-root relative."""
+    value = _clean_tool_string(value)
+    if isinstance(value, str) and value.startswith("/") and not value.startswith("//"):
+        return value.lstrip("/") or "*"
+    return value
+
+
+def _copy_model_override(body: Json) -> Json:
+    """Copy body and override model with configured upstream model."""
+    copied = dict(body)
+    model = _config_env("UPSTREAM_MODEL", "")
+    if model:
+        copied["model"] = model
+    return copied
+
+
+def _has_requested_tools(body: Json) -> bool:
+    """Check if the request body has tools defined."""
+    tools = body.get("tools")
+    return isinstance(tools, list) and bool(tools)
+
+
+def _response_has_tool_calls(path: str, response: Json) -> bool:
+    """Check if a response contains tool_calls in any protocol format."""
+    if path == "/v1/chat/completions":
+        for choice in response.get("choices") or []:
+            if not isinstance(choice, dict):
+                continue
+            msg = choice.get("message") or {}
+            if isinstance(msg, dict) and (msg.get("tool_calls") or msg.get("function_call")):
+                return True
+        return False
+    if path == "/v1/messages":
+        for block in response.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                return True
+        if response.get("stop_reason") == "tool_use":
+            return True
+        return False
+    if path == "/v1/responses":
+        for item in response.get("output") or []:
+            if isinstance(item, dict) and item.get("type") == "function_call":
+                return True
+        return False
+    return False
+
+
+def _extract_openai_tool_calls_for_stream(response: Json) -> list[dict]:
+    """Extract tool_calls from an OpenAI response formatted for SSE streaming chunks.
+    Returns list of delta-style tool_call objects with index field."""
+    result: list[dict] = []
+    choice = (response.get("choices") or [{}])[0] if isinstance(response.get("choices"), list) else {}
+    message = choice.get("message") if isinstance(choice, dict) else {}
+    if not isinstance(message, dict):
+        return result
+    tc_list = message.get("tool_calls")
+    if isinstance(tc_list, list):
+        for idx, tc in enumerate(tc_list):
+            if not isinstance(tc, dict):
+                continue
+            func = tc.get("function") or {}
+            result.append({
+                "index": idx,
+                "id": tc.get("id") or f"call_{uuid.uuid4().hex}",
+                "type": "function",
+                "function": {
+                    "name": func.get("name") or "",
+                    "arguments": func.get("arguments") or "{}",
+                },
+            })
+    return result
+
+
+def _fallback_response(path: str, text: str, *, status_note: str = "gateway_fallback") -> Json:
+    """Generate a fallback response when upstream is unavailable."""
+    model = _config_env("UPSTREAM_MODEL", "")
+    usage = {"input_tokens": 0, "output_tokens": _approx_token_count(text)}
+    if path == "/v1/messages":
+        return {
+            "id": f"msg_gateway_{uuid.uuid4().hex}",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": text}],
+            "model": model,
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": usage,
+            "gateway_context": {"strategy": status_note},
+        }
+    if path == "/v1/responses":
+        return {
+            "id": f"resp_gateway_{uuid.uuid4().hex}",
+            "object": "response",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}],
+            "model": model,
+            "gateway_context": {"strategy": status_note},
+        }
+    return {
+        "id": f"chatcmpl_gateway_{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "model": model,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+        "usage": usage,
+        "gateway_context": {"strategy": status_note},
+    }
+
+
+def _acquire_request_slot() -> threading.BoundedSemaphore | None:
+    """Acquire a concurrency slot for request processing."""
+    global _REQUEST_SEMAPHORE, _REQUEST_SEMAPHORE_SIZE
+    gateway = _gateway_config()
+    limit = int(gateway.get("max_concurrent_requests") or 0)
+    if limit <= 0:
+        return None
+    with _REQUEST_SEMAPHORE_LOCK:
+        if _REQUEST_SEMAPHORE is None or _REQUEST_SEMAPHORE_SIZE != limit:
+            _REQUEST_SEMAPHORE = threading.BoundedSemaphore(limit)
+            _REQUEST_SEMAPHORE_SIZE = limit
+        sem = _REQUEST_SEMAPHORE
+    timeout = float(gateway.get("concurrency_queue_timeout_seconds") or 0)
+    ok = sem.acquire(timeout=timeout) if timeout > 0 else sem.acquire(blocking=False)
+    if not ok:
+        from .gateway_errors import GatewayBusyError
+        raise GatewayBusyError(f"gateway concurrency limit reached ({limit})")
+    return sem
+
+
+def _get_marketplace():
+    """Lazy import for marketplace to avoid circular imports."""
+    if not hasattr(_get_marketplace, '_cache'):
+        try:
+            from marketplace import list_mcp_marketplace
+            _get_marketplace._cache = list_mcp_marketplace
+        except Exception:
+            _get_marketplace._cache = lambda: []
+    return _get_marketplace._cache
+
+
+def _request_workspace_root(body: Json) -> pathlib.Path:
+    """Extract workspace root from request body or use default."""
+    custom_root = body.get("workspace_root") or body.get("gateway_workspace")
+    if custom_root:
+        return pathlib.Path(custom_root)
+    return _workspace_root()
+
+
+@contextmanager
+def _workspace_scope(root: pathlib.Path):
+    """Context manager that temporarily changes the workspace root."""
+    from . import gateway_builtin_tools as _bt
+    old_root = getattr(_bt, '_WORKSPACE_ROOT_OVERRIDE', None)
+    _bt._WORKSPACE_ROOT_OVERRIDE = root
+    try:
+        yield root
+    finally:
+        if old_root is None:
+            if hasattr(_bt, '_WORKSPACE_ROOT_OVERRIDE'):
+                delattr(_bt, '_WORKSPACE_ROOT_OVERRIDE')
+        else:
+            _bt._WORKSPACE_ROOT_OVERRIDE = old_root
+
+def _normalize_tool_name(name: str) -> str:
+    """Normalize tool name to match builtin registry."""
+    if not name:
+        return name
+    # Direct match
+    if name in BUILTIN_TOOLS:
+        return name
+    # Case-insensitive match
+    lower = name.lower()
+    for key in BUILTIN_TOOLS:
+        if key.lower() == lower:
+            return key
+    # Strip common prefixes
+    for prefix in ("gateway_", "gw_", "tool_"):
+        if lower.startswith(prefix):
+            stripped = name[len(prefix):]
+            if stripped in BUILTIN_TOOLS:
+                return stripped
+    return name
+
+
+def _normalize_tool_args(name: str, arguments: Json) -> Json:
+    """Normalize tool arguments to match expected schema."""
+    if not isinstance(arguments, dict):
+        return arguments
+    tool = BUILTIN_TOOLS.get(name)
+    if not tool or not tool.parameters:
+        return arguments
+    props = tool.parameters.get("properties", {})
+    if not props:
+        return arguments
+    # Map common aliases
+    alias_map = {
+        "command": "cmd",
+        "cmd": "command",
+        "file": "path",
+        "file_path": "path",
+        "filepath": "path",
+        "dir": "path",
+        "directory": "path",
+        "folder": "path",
+        "input": "content",
+        "text": "content",
+        "data": "content",
+        "value": "expression",
+    }
+    result = {}
+    for key, value in arguments.items():
+        mapped_key = alias_map.get(key, key)
+        if mapped_key in props:
+            result[mapped_key] = value
+        else:
+            result[key] = value
+    return result
+
+
 def _normalize_tool_call(call: ToolCall) -> ToolCall:
     name = _normalize_tool_name(call.name)
     arguments = _normalize_tool_args(name, call.arguments)
@@ -85,14 +430,17 @@ def _response_tool_call_from_item(item: Json) -> ToolCall | None:
         return None
     raw_args = item.get("arguments")
     allow_text = item_type == "custom_tool_call"
+    custom_string_input = False
     if raw_args is None and item_type == "custom_tool_call":
         raw_args = item.get("input")
+        custom_string_input = raw_args is not None and not isinstance(raw_args, dict)
     if raw_args is None:
         raw_args = item.get("input") if isinstance(item.get("input"), dict) else item.get("action")
+    arguments = {"input": raw_args} if custom_string_input else _parse_json_arguments(raw_args, allow_text=allow_text)
     return ToolCall(
         call_id=str(item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex}"),
         name=str(name),
-        arguments=_parse_json_arguments(raw_args, allow_text=allow_text),
+        arguments=arguments,
         raw=item,
     )
 
@@ -104,7 +452,8 @@ def _strip_xmlish_closing_tags(value: str) -> str:
 
 def _parse_parameter_blocks(text: str) -> list[tuple[str, str]]:
     blocks: list[tuple[str, str]] = []
-    parameter_re = re.compile(r"<parameter=([A-Za-z0-9_.:-]+)>\s*(.*?)(?=<parameter=[A-Za-z0-9_.:-]+>|<function=[A-Za-z0-9_.:-]+>|\Z)", re.S)
+    # Stop at parameter, function, or tool_call tags
+    parameter_re = re.compile(r"<parameter=([A-Za-z0-9_.:-]+)>\s*(.*?)(?=<parameter=[A-Za-z0-9_.:-]+>|<function=[A-Za-z0-9_.:-]+>|<tool_call>|\Z)", re.S)
     for param in parameter_re.finditer(text or ""):
         key = param.group(1).strip()
         value = _strip_xmlish_closing_tags(param.group(2))
@@ -114,7 +463,12 @@ def _parse_parameter_blocks(text: str) -> list[tuple[str, str]]:
 
 
 def _inline_text_before_parameter_blocks(text: str) -> str:
-    return re.sub(r"<parameter=[A-Za-z0-9_.:-]+>.*", "", text or "", flags=re.S).strip()
+    raw = re.sub(r"<parameter=[A-Za-z0-9_.:-]+>.*", "", text or "", flags=re.S).strip()
+    # Strip trailing junk after first blank line or markdown header
+    raw = re.sub(r"\n\n.*", "", raw, flags=re.S).strip()
+    # Strip trailing markdown headers
+    raw = re.sub(r"\s*---.*", "", raw, flags=re.S).strip()
+    return raw
 
 
 def _repair_shell_command_spacing(command: str) -> str:
@@ -507,6 +861,8 @@ def _build_local_planner_context(user_text: str) -> str:
 
 
 def _apply_local_planner_context(path: str, body: Json) -> Json:
+    if isinstance(body.get("gateway_context"), dict) and body["gateway_context"].get("compacted"):
+        return body
     if not _should_build_local_planner_context(path, body):
         return body
     user_text = _last_user_text(path, body)
@@ -530,816 +886,6 @@ def _apply_local_planner_context(path: str, body: Json) -> Json:
     return updated
 
 
-def _failure_log_path() -> pathlib.Path:
-    return pathlib.Path(os.environ.get("GATEWAY_TOOL_FAILURE_LOG") or ".gateway_tool_failures.jsonl")
-
-
-def _logging_backend() -> str:
-    backend = str(_gateway_config().get("logging_backend") or os.environ.get("GATEWAY_LOGGING_BACKEND") or "sqlite").lower()
-    if backend == "sqlite":
-        return "sqlite"
-    # High-frequency gateway logs must not fall back to JSON/JSONL files unless
-    # explicitly enabled for a one-off legacy/debug run. Legacy files are still
-    # imported/read, but normal runtime writes stay in SQLite WAL.
-    if os.environ.get("GATEWAY_ALLOW_FILE_LOGGING", "0").lower() not in {"1", "true", "yes"}:
-        return "sqlite"
-    return backend
-
-
-def _sqlite_insert_tool_failure(event: Json) -> None:
-    _sqlite_init()
-    with SQLITE_LOCK:
-        conn = _sqlite_connect()
-        try:
-            conn.execute(
-                """
-                INSERT INTO tool_failures
-                (ts, tool_name, call_id, failure_type, arguments_keys_json, content, fake_prompt_tools, execution_ms, retry_count, provider)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event["ts"],
-                    event["tool_name"],
-                    event["call_id"],
-                    event.get("failure_type"),
-                    json.dumps(event.get("arguments_keys") or [], ensure_ascii=False),
-                    event.get("content") or "",
-                    1 if event.get("fake_prompt_tools") else 0,
-                    event.get("execution_ms"),
-                    event.get("retry_count") or 0,
-                    event.get("provider"),
-                ),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-
-def _sqlite_record_tool_stat(name: str, success: bool, failure_type: str | None = None) -> None:
-    _sqlite_init()
-    now = _dt.datetime.now(_dt.timezone.utc).isoformat()
-    with SQLITE_LOCK:
-        conn = _sqlite_connect()
-        try:
-            row = conn.execute("SELECT calls, success, failure, failures_json FROM tool_stats WHERE tool_name = ?", (name,)).fetchone()
-            if row:
-                calls, ok_count, fail_count, failures_raw = row
-                failures = json.loads(failures_raw or "{}")
-            else:
-                calls = ok_count = fail_count = 0
-                failures = {}
-            calls += 1
-            if success:
-                ok_count += 1
-            else:
-                fail_count += 1
-                key = failure_type or "unknown"
-                failures[key] = failures.get(key, 0) + 1
-            conn.execute(
-                """
-                INSERT INTO tool_stats(tool_name, calls, success, failure, failures_json, last_called_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(tool_name) DO UPDATE SET
-                    calls=excluded.calls,
-                    success=excluded.success,
-                    failure=excluded.failure,
-                    failures_json=excluded.failures_json,
-                    last_called_at=excluded.last_called_at
-                """,
-                (name, calls, ok_count, fail_count, json.dumps(failures, ensure_ascii=False), now),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-
-def _sqlite_record_request_stat(path: str, status: int) -> None:
-    _sqlite_init()
-    now = _dt.datetime.now(_dt.timezone.utc).isoformat()
-    status_key = str(status)
-    with SQLITE_LOCK:
-        conn = _sqlite_connect()
-        try:
-            conn.execute("INSERT INTO request_stats(key, value) VALUES ('total', 1) ON CONFLICT(key) DO UPDATE SET value=value+1")
-            conn.execute("INSERT INTO request_stats(key, value) VALUES ('last_request_at_epoch', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (int(time.time()),))
-            conn.execute("INSERT INTO request_stats(key, value) VALUES ('last_request_at_iso', 0) ON CONFLICT(key) DO UPDATE SET value=0")
-            conn.execute("INSERT INTO request_stats_by_path(path, value) VALUES (?, 1) ON CONFLICT(path) DO UPDATE SET value=value+1", (path,))
-            conn.execute("INSERT INTO request_stats_by_status(status, value) VALUES (?, 1) ON CONFLICT(status) DO UPDATE SET value=value+1", (status_key,))
-            conn.commit()
-        finally:
-            conn.close()
-
-
-def _sqlite_insert_request_log(event: Json) -> None:
-    _sqlite_init()
-    with SQLITE_LOCK:
-        conn = _sqlite_connect()
-        try:
-            conn.execute(
-                """
-                INSERT INTO request_logs
-                (ts, request_id, path, status, downstream_key, request_json, response_json, fake_prompt_tools)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event["ts"],
-                    event["request_id"],
-                    event["path"],
-                    int(event["status"]),
-                    event.get("downstream_key"),
-                    json.dumps(event.get("request") or {}, ensure_ascii=False),
-                    json.dumps(event.get("response"), ensure_ascii=False) if event.get("response") is not None else None,
-                    1 if event.get("fake_prompt_tools") else 0,
-                ),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-
-def _sqlite_stats_snapshot() -> Json:
-    _sqlite_init()
-    conn = _sqlite_connect()
-    try:
-        tools: Json = {}
-        for name, calls, success, failure, failures_raw, last_called_at in conn.execute(
-            "SELECT tool_name, calls, success, failure, failures_json, last_called_at FROM tool_stats ORDER BY tool_name"
-        ):
-            tools[name] = {
-                "calls": calls,
-                "success": success,
-                "failure": failure,
-                "failures": json.loads(failures_raw or "{}"),
-                "last_called_at": last_called_at,
-            }
-        total_row = conn.execute("SELECT value FROM request_stats WHERE key='total'").fetchone()
-        last_ts = conn.execute("SELECT ts FROM request_logs ORDER BY id DESC LIMIT 1").fetchone()
-        by_path = {path: value for path, value in conn.execute("SELECT path, value FROM request_stats_by_path")}
-        by_status = {status: value for status, value in conn.execute("SELECT status, value FROM request_stats_by_status")}
-        memory_total_row = conn.execute("SELECT COUNT(*) FROM conversation_memories").fetchone()
-        return {
-            "tools": tools,
-            "memory": {"total": int(memory_total_row[0]) if memory_total_row else 0},
-            "requests": {
-                "total": int(total_row[0]) if total_row else 0,
-                "by_path": by_path,
-                "by_status": by_status,
-                "last_request_at": last_ts[0] if last_ts else None,
-            },
-            "backend": "sqlite",
-            "sqlite_path": str(_sqlite_path()),
-        }
-    finally:
-        conn.close()
-
-
-def _sqlite_tail_requests(limit: int = 50) -> list[Json]:
-    _sqlite_init()
-    conn = _sqlite_connect()
-    try:
-        rows = conn.execute(
-            "SELECT ts, request_id, path, status, downstream_key, request_json, response_json, fake_prompt_tools FROM request_logs ORDER BY id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-    finally:
-        conn.close()
-    out = []
-    for ts, request_id, path, status, downstream_key, request_raw, response_raw, fake_prompt_tools in reversed(rows):
-        out.append(
-            {
-                "ts": ts,
-                "request_id": request_id,
-                "path": path,
-                "status": status,
-                "downstream_key": downstream_key,
-                "request": json.loads(request_raw or "{}"),
-                "response": json.loads(response_raw) if response_raw else None,
-                "fake_prompt_tools": bool(fake_prompt_tools),
-            }
-        )
-    return out
-
-
-def _sqlite_tail_failures(limit: int = 50) -> list[Json]:
-    _sqlite_init()
-    conn = _sqlite_connect()
-    try:
-        rows = conn.execute(
-            "SELECT ts, tool_name, call_id, failure_type, arguments_keys_json, content, fake_prompt_tools FROM tool_failures ORDER BY id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-    finally:
-        conn.close()
-    out = []
-    for ts, tool_name, call_id, failure_type, keys_raw, content, fake_prompt_tools in reversed(rows):
-        out.append(
-            {
-                "ts": ts,
-                "tool_name": tool_name,
-                "call_id": call_id,
-                "failure_type": failure_type,
-                "arguments_keys": json.loads(keys_raw or "[]"),
-                "content": content,
-                "fake_prompt_tools": bool(fake_prompt_tools),
-            }
-        )
-    return out
-
-
-def _record_tool_failure(
-    call: ToolCall,
-    result: ToolResult,
-    *,
-    execution_ms: float | None = None,
-    retry_count: int | None = None,
-    provider: str | None = None,
-) -> None:
-    if result.success:
-        return
-    if not _gateway_config().get("record_unsupported_tools", True):
-        return
-    event: dict = {
-        "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-        "tool_name": call.name,
-        "call_id": call.call_id,
-        "failure_type": result.failure_type,
-        "arguments_keys": sorted(call.arguments.keys()),
-        "content": result.content[:1000] if result.content else "",
-        "fake_prompt_tools": False,
-    }
-    if execution_ms is not None:
-        event["execution_ms"] = execution_ms
-    if retry_count is not None:
-        event["retry_count"] = retry_count
-    if provider is not None:
-        event["provider"] = provider
-    try:
-        if _logging_backend() == "sqlite":
-            _sqlite_insert_tool_failure(event)
-        else:
-            with _failure_log_path().open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(event, ensure_ascii=False) + "\n")
-    except Exception:
-        if os.environ.get("DEBUG"):
-            traceback.print_exc()
-
-
-def _read_json_file(path: pathlib.Path, default: Any) -> Any:
-    try:
-        if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        if os.environ.get("DEBUG"):
-            traceback.print_exc()
-    return copy.deepcopy(default)
-
-
-def _write_json_file(path: pathlib.Path, payload: Any) -> None:
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def _record_tool_stat(name: str, success: bool, failure_type: str | None = None) -> None:
-    if _logging_backend() == "sqlite":
-        _sqlite_record_tool_stat(name, success, failure_type)
-        return
-    stats = _read_json_file(STATS_PATH, {"tools": {}, "requests": {"total": 0}})
-    tools = stats.setdefault("tools", {})
-    item = tools.setdefault(name, {"calls": 0, "success": 0, "failure": 0, "failures": {}})
-    item["calls"] += 1
-    if success:
-        item["success"] += 1
-    else:
-        item["failure"] += 1
-        failures = item.setdefault("failures", {})
-        failures[failure_type or "unknown"] = failures.get(failure_type or "unknown", 0) + 1
-    item["last_called_at"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
-    _write_json_file(STATS_PATH, stats)
-
-
-def _record_request_stat(path: str, status: int) -> None:
-    if _logging_backend() == "sqlite":
-        _sqlite_record_request_stat(path, status)
-        return
-    stats = _read_json_file(STATS_PATH, {"tools": {}, "requests": {"total": 0}})
-    requests = stats.setdefault("requests", {"total": 0})
-    requests["total"] = requests.get("total", 0) + 1
-    by_path = requests.setdefault("by_path", {})
-    by_path[path] = by_path.get(path, 0) + 1
-    by_status = requests.setdefault("by_status", {})
-    status_key = str(status)
-    by_status[status_key] = by_status.get(status_key, 0) + 1
-    requests["last_request_at"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
-    _write_json_file(STATS_PATH, stats)
-
-
-def _redact_payload(value: Any) -> Any:
-    if isinstance(value, dict):
-        out = {}
-        for key, val in value.items():
-            if key.lower() in {"authorization", "api_key", "x-api-key", "key", "token", "password", "secret"}:
-                out[key] = "***"
-            else:
-                out[key] = _redact_payload(val)
-        return out
-    if isinstance(value, list):
-        return [_redact_payload(v) for v in value]
-    return value
-
-
-def _write_request_log(path: str, body: Json, status: int, response: Json | None, downstream_key: str | None) -> None:
-    if not load_config().get("gateway", {}).get("request_logging", True):
-        return
-    event = {
-        "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-        "request_id": f"req_{uuid.uuid4().hex}",
-        "path": path,
-        "status": status,
-        "downstream_key": downstream_key,
-        "request": _redact_payload(body),
-        "response": _redact_payload(response) if response is not None else None,
-        "fake_prompt_tools": False,
-    }
-    if _logging_backend() == "sqlite":
-        _sqlite_insert_request_log(event)
-    else:
-        with REQUEST_LOG_PATH.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(event, ensure_ascii=False) + "\n")
-
-
-def _tail_jsonl(path: pathlib.Path, limit: int = 50) -> list[Json]:
-    if not path.exists():
-        return []
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
-    rows = []
-    for line in lines:
-        try:
-            item = json.loads(line)
-            if isinstance(item, dict):
-                rows.append(item)
-        except Exception:
-            continue
-    return rows
-
-
-def _stats_snapshot() -> Json:
-    if _logging_backend() == "sqlite":
-        return _sqlite_stats_snapshot()
-    return _read_json_file(STATS_PATH, {"tools": {}, "requests": {}})
-
-
-def _tail_requests(limit: int = 50) -> list[Json]:
-    if _logging_backend() == "sqlite":
-        return _sqlite_tail_requests(limit)
-    return _tail_jsonl(REQUEST_LOG_PATH, limit)
-
-
-def _tail_failures(limit: int = 50) -> list[Json]:
-    if _logging_backend() == "sqlite":
-        return _sqlite_tail_failures(limit)
-    return _tail_jsonl(_failure_log_path(), limit)
-
-
-def _tool_catalog_snapshot() -> Json:
-    unique: dict[str, GatewayTool] = {}
-    aliases: dict[str, list[str]] = {}
-    for public_name, tool in BUILTIN_TOOLS.items():
-        unique.setdefault(tool.name, tool)
-        if public_name != tool.name:
-            aliases.setdefault(tool.name, []).append(public_name)
-    tools = [
-        {
-            "name": tool.name,
-            "aliases": sorted(set(aliases.get(tool.name, []))),
-            "description": tool.description,
-            "risk": tool.risk,
-            "status": "connector_required" if tool.risk == "connector_required" else "ready",
-            "parameters": tool.parameters,
-        }
-        for tool in sorted(unique.values(), key=lambda item: item.name.lower())
-    ]
-    failures = _tail_failures(500)
-    failure_counts: dict[str, Json] = {}
-    for failure in failures:
-        name = str(failure.get("tool_name") or failure.get("tool") or "unknown")
-        row = failure_counts.setdefault(name, {"tool": name, "count": 0, "failure_types": {}})
-        row["count"] += 1
-        failure_type = str(failure.get("failure_type") or "unknown")
-        row["failure_types"][failure_type] = row["failure_types"].get(failure_type, 0) + 1
-    unsupported = sorted(failure_counts.values(), key=lambda item: int(item["count"]), reverse=True)
-    return {"tools": tools, "unsupported_or_failed": unsupported}
-
-
-def _text_response(handler: BaseHTTPRequestHandler, status: int, payload: str, content_type: str = "text/html; charset=utf-8") -> None:
-    data = payload.encode("utf-8")
-    handler.send_response(status)
-    handler.send_header("content-type", content_type)
-    handler.send_header("content-length", str(len(data)))
-    handler.end_headers()
-    handler.wfile.write(data)
-
-
-def _parse_basic_auth(header: str | None) -> tuple[str, str] | None:
-    if not header or not header.startswith("Basic "):
-        return None
-    try:
-        decoded = base64.b64decode(header.split(" ", 1)[1]).decode("utf-8")
-        username, password = decoded.split(":", 1)
-        return username, password
-    except Exception:
-        return None
-
-
-def _check_admin(handler: BaseHTTPRequestHandler) -> bool:
-    cfg = load_config()
-    parsed = _parse_basic_auth(handler.headers.get("authorization"))
-    admin = cfg.get("admin", {})
-    if parsed and parsed[0] == admin.get("username", "admin") and _hash_secret(parsed[1]) == admin.get("password_hash"):
-        return True
-    handler.send_response(401)
-    handler.send_header("www-authenticate", 'Basic realm="Gateway Admin"')
-    handler.send_header("content-type", "text/plain; charset=utf-8")
-    handler.end_headers()
-    handler.wfile.write(b"admin authentication required")
-    return False
-
-
-def _check_downstream_key(handler: BaseHTTPRequestHandler) -> str | None:
-    cfg = load_config()
-    keys = cfg.get("downstream_keys") or []
-    if not keys:
-        return "no-key-configured"
-    auth = handler.headers.get("authorization") or ""
-    supplied = ""
-    if auth.startswith("Bearer "):
-        supplied = auth.split(" ", 1)[1].strip()
-    elif handler.headers.get("x-api-key"):
-        supplied = handler.headers.get("x-api-key", "").strip()
-    if not supplied:
-        raise DownstreamAuthError("missing downstream API key")
-    supplied_hash = _hash_secret(supplied)
-    path = handler.path.split("?", 1)[0]
-    protocol_by_path = {
-        "/v1/chat/completions": "chat_completions",
-        "/v1/responses": "responses",
-        "/v1/messages": "messages",
-        "/v1/messages/count_tokens": "messages",
-        "/v1/tools/call": "direct_tools",
-        "/v1/functions/call": "direct_tools",
-        "/tools/call": "direct_tools",
-        "/v1/models": "models",
-    }
-    requested_protocol = protocol_by_path.get(path)
-    for item in keys:
-        if item.get("enabled", True) and item.get("key_hash") == supplied_hash:
-            allowed = item.get("protocols")
-            if isinstance(allowed, list) and requested_protocol and requested_protocol not in allowed and "all" not in allowed:
-                # Backward compatibility: older configs created before per-key protocol
-                # support did not list `models`; allow model-list discovery for keys
-                # that can call at least one conversation protocol.
-                if not (
-                    requested_protocol == "models"
-                    and any(proto in allowed for proto in ("chat_completions", "responses", "messages"))
-                ):
-                    raise DownstreamAuthError(f"downstream key is not allowed to use protocol: {requested_protocol}")
-            return str(item.get("name") or item.get("prefix") or "key")
-    raise DownstreamAuthError("invalid downstream API key")
-
-
-def _read_form(handler: BaseHTTPRequestHandler) -> dict[str, str]:
-    length = int(handler.headers.get("content-length") or "0")
-    raw = handler.rfile.read(length).decode("utf-8", errors="replace")
-    parsed = urllib.parse.parse_qs(raw, keep_blank_values=True)
-    return {k: v[-1] if v else "" for k, v in parsed.items()}
-
-
-def _client_snippet_context() -> Json:
-    cfg = load_config()
-    gateway = cfg.get("gateway", {}) if isinstance(cfg.get("gateway"), dict) else {}
-    upstream = cfg.get("upstream", {}) if isinstance(cfg.get("upstream"), dict) else {}
-    base_url = str(gateway.get("public_base_url") or os.environ.get("GATEWAY_PUBLIC_BASE_URL") or "http://127.0.0.1:8885").rstrip("/")
-    api_key = str(gateway.get("client_snippet_api_key") or os.environ.get("DOWNSTREAM_API_KEY") or os.environ.get("GATEWAY_DOWNSTREAM_KEY") or "")
-    model = str(gateway.get("downstream_model_alias") or upstream.get("model") or os.environ.get("UPSTREAM_MODEL") or "mimo-v2.5-pro")
-    review_model = str(gateway.get("review_model_alias") or model)
-    context_window = int(gateway.get("client_context_window") or 1_000_000)
-    auto_compact = int(gateway.get("client_auto_compact_token_limit") or max(context_window - 100_000, 1_000))
-    output_limit = int(gateway.get("client_output_token_limit") or upstream.get("max_output_tokens") or 128_000)
-    reasoning_effort = str(gateway.get("codex_reasoning_effort") or "xhigh")
-    return {
-        "base_url": base_url,
-        "base_url_v1": f"{base_url}/v1",
-        "api_key": api_key,
-        "model": model,
-        "review_model": review_model,
-        "context_window": context_window,
-        "auto_compact_token_limit": auto_compact,
-        "output_token_limit": output_limit,
-        "reasoning_effort": reasoning_effort,
-    }
-
-
-def _toml_string(value: Any) -> str:
-    return json.dumps(str(value), ensure_ascii=False)
-
-
-def _client_config_snippets() -> Json:
-    c = _client_snippet_context()
-    codex_config_toml = "\n".join(
-        [
-            'model_provider = "Gateway"',
-            f"model = {_toml_string(c['model'])}",
-            f"review_model = {_toml_string(c['review_model'])}",
-            f"model_reasoning_effort = {_toml_string(c['reasoning_effort'])}",
-            "disable_response_storage = true",
-            'network_access = "enabled"',
-            "windows_wsl_setup_acknowledged = true",
-            f"model_context_window = {int(c['context_window'])}",
-            f"model_auto_compact_token_limit = {int(c['auto_compact_token_limit'])}",
-            "",
-            "[model_providers.Gateway]",
-            'name = "Gateway"',
-            f"base_url = {_toml_string(c['base_url'])}",
-            'wire_api = "responses"',
-            "requires_openai_auth = true",
-            "",
-        ]
-    )
-    codex_auth_json = json.dumps({"OPENAI_API_KEY": c["api_key"]}, ensure_ascii=False, indent=2)
-    opencode_json = json.dumps(
-        {
-            "provider": {
-                "openai": {
-                    "options": {
-                        "baseURL": c["base_url_v1"],
-                        "apiKey": c["api_key"],
-                    },
-                    "models": {
-                        c["model"]: {
-                            "name": c["model"],
-                            "limit": {
-                                "context": c["context_window"],
-                                "output": c["output_token_limit"],
-                            },
-                            "options": {"store": False},
-                            "variants": {"low": {}, "medium": {}, "high": {}, "xhigh": {}},
-                        }
-                    },
-                }
-            },
-            "agent": {
-                "build": {"options": {"store": False}},
-                "plan": {"options": {"store": False}},
-            },
-            "$schema": "https://opencode.ai/config.json",
-        },
-        ensure_ascii=False,
-        indent=2,
-    )
-    claude_bash_profile_function = "\n".join(
-        [
-            "claude_m1() {",
-            f'    export ANTHROPIC_BASE_URL="{c["base_url"]}"',
-            "    export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
-            f'    export ANTHROPIC_AUTH_TOKEN="{c["api_key"]}"',
-            '    export ANTHROPIC_API_KEY=""',
-            f'    export ANTHROPIC_DEFAULT_OPUS_MODEL="{c["model"]}"',
-            f'    export ANTHROPIC_DEFAULT_SONNET_MODEL="{c["model"]}"',
-            f'    export ANTHROPIC_DEFAULT_HAIKU_MODEL="{c["model"]}"',
-            f'    export ANTHROPIC_MODEL="{c["model"]}"',
-            f'    export ANTHROPIC_SMALL_FAST_MODEL="{c["model"]}"',
-            '    export ENABLE_LSP_TOOL="1"',
-            '    /usr/local/bin/claude --dangerously-skip-permissions "$@"',
-            "}",
-        ]
-    )
-    claude_terminal_env = "\n".join(
-        [
-            f'export ANTHROPIC_BASE_URL="{c["base_url"]}"',
-            f'export ANTHROPIC_AUTH_TOKEN="{c["api_key"]}"',
-            "export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
-            "export CLAUDE_CODE_ATTRIBUTION_HEADER=0",
-        ]
-    )
-    vscode_claude_settings_json = json.dumps(
-        {
-            "env": {
-                "ANTHROPIC_BASE_URL": c["base_url"],
-                "ANTHROPIC_AUTH_TOKEN": c["api_key"],
-                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-                "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
-            }
-        },
-        ensure_ascii=False,
-        indent=2,
-    )
-    return {
-        "context": c,
-        "codex_config_toml": codex_config_toml,
-        "codex_auth_json": codex_auth_json,
-        "opencode_json": opencode_json,
-        "claude_bash_profile_function": claude_bash_profile_function,
-        "claude_terminal_env": claude_terminal_env,
-        "vscode_claude_settings_json": vscode_claude_settings_json,
-    }
-
-
-def _render_client_config_ui() -> str:
-    snippets = _client_config_snippets()
-    c = snippets["context"]
-    cards = [
-        ("~/.codex/config.toml", snippets["codex_config_toml"]),
-        ("~/.codex/auth.json", snippets["codex_auth_json"]),
-        ("opencode.json", snippets["opencode_json"]),
-        ("~/.bash_profile: claude_m1", snippets["claude_bash_profile_function"]),
-        ("Terminal env", snippets["claude_terminal_env"]),
-        ("~/.claude/settings.json", snippets["vscode_claude_settings_json"]),
-    ]
-    rendered_cards = "\n".join(
-        f'<section><h2>{html.escape(title)}</h2><textarea rows="14" readonly>{html.escape(text)}</textarea></section>'
-        for title, text in cards
-    )
-    return f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>Gateway Client Config</title>
-<style>
-body{{font-family:system-ui;margin:24px;max-width:1200px}}
-input,textarea{{width:100%;box-sizing:border-box;margin:4px 0 10px;padding:8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}}
-section{{margin:18px 0;padding:14px;border:1px solid #ddd;border-radius:10px}}
-a{{margin-right:12px}} button{{padding:8px 14px}}
-</style></head><body>
-<h1>Gateway Client Config / 下游客户端配置</h1>
-<p><a href="/ui">Admin</a><a href="/client-config.json">JSON</a><a href="/healthz">Health</a></p>
-<p>只生成配置片段，不自动写入 <code>~/.codex</code>、<code>~/.claude</code> 或 <code>.bash_profile</code>，避免破坏你现有环境。</p>
-<form method="post" action="/admin/client-config">
-<h2>生成参数</h2>
-<label>Gateway Public Base URL</label><input name="public_base_url" value="{html.escape(c['base_url'])}">
-<label>Downstream API Key</label><input name="client_snippet_api_key" value="{html.escape(c['api_key'])}">
-<label>Model</label><input name="downstream_model_alias" value="{html.escape(c['model'])}">
-<label>Review Model</label><input name="review_model_alias" value="{html.escape(c['review_model'])}">
-<label>Codex Reasoning Effort</label><input name="codex_reasoning_effort" value="{html.escape(c['reasoning_effort'])}">
-<label>Client Context Window</label><input name="client_context_window" value="{int(c['context_window'])}">
-<label>Auto Compact Token Limit</label><input name="client_auto_compact_token_limit" value="{int(c['auto_compact_token_limit'])}">
-<label>Output Token Limit</label><input name="client_output_token_limit" value="{int(c['output_token_limit'])}">
-<button>保存并刷新配置片段</button>
-</form>
-{rendered_cards}
-</body></html>"""
-
-
-def _render_admin_ui() -> str:
-    cfg = load_config()
-    redacted = _redacted_config(cfg)
-    stats = _stats_snapshot()
-    failures = _tail_failures(20)
-    requests = _tail_requests(20)
-    upstream = cfg.get("upstream", {})
-    gateway = cfg.get("gateway", {})
-    capabilities = upstream.get("capabilities", {}) if isinstance(upstream.get("capabilities"), dict) else {}
-    upstream_paths = upstream.get("paths", {}) if isinstance(upstream.get("paths"), dict) else {}
-    context = cfg.get("context", {}) if isinstance(cfg.get("context"), dict) else {}
-    tool_rows = "\n".join(
-        f"<tr><td>{html.escape(name)}</td><td>{item.get('calls', 0)}</td><td>{item.get('success', 0)}</td><td>{item.get('failure', 0)}</td><td><code>{html.escape(json.dumps(item.get('failures', {}), ensure_ascii=False))}</code></td></tr>"
-        for name, item in sorted((stats.get("tools") or {}).items())
-    )
-    key_rows = "\n".join(
-        f"<tr><td>{html.escape(str(k.get('name')))}</td><td>{html.escape(str(k.get('prefix')))}</td><td>{'yes' if k.get('enabled', True) else 'no'}</td><td>{html.escape(','.join(k.get('protocols') or ['chat_completions','responses','messages','direct_tools']))}</td></tr>"
-        for k in cfg.get("downstream_keys", [])
-    )
-    failure_rows = "\n".join(
-        f"<tr><td>{html.escape(str(x.get('ts')))}</td><td>{html.escape(str(x.get('tool_name')))}</td><td>{html.escape(str(x.get('failure_type')))}</td><td><code>{html.escape(str(x.get('content')))}</code></td></tr>"
-        for x in failures
-    )
-    request_rows = "\n".join(
-        f"<tr><td>{html.escape(str(x.get('ts')))}</td><td>{html.escape(str(x.get('path')))}</td><td>{x.get('status')}</td><td>{html.escape(str(x.get('downstream_key')))}</td></tr>"
-        for x in requests
-    )
-    mcp_json = html.escape(json.dumps(cfg.get("mcp", {}).get("servers", []), ensure_ascii=False, indent=2))
-    http_actions_json = html.escape(json.dumps(cfg.get("http_actions", {}).get("actions", []), ensure_ascii=False, indent=2))
-    mcp_session_count = len(MCP_SESSIONS)
-    mcp_cache_count = len(MCP_TOOL_CATALOG_CACHE)
-    mcp_health_rows = "\n".join(
-        f"<tr><td>{html.escape(str(row.get('name')))}</td><td>{html.escape(str(row.get('status', 'unknown')))}</td><td>{html.escape(str(row.get('session')))}</td><td>{html.escape(str(row.get('cache')))}</td><td>{row.get('tool_count', row.get('cached_tool_count', 0))}</td><td><code>{html.escape(str(row.get('detail', '')))}</code></td></tr>"
-        for row in _mcp_health_snapshot(probe=False)
-    )
-    upstream_profile_rows = "\n".join(
-        f"<tr><td>{'✅' if str(profile.get('id')) == str(cfg.get('active_upstream')) else ''}</td><td><code>{html.escape(str(profile.get('id')))}</code></td><td>{html.escape(str(profile.get('name')))}</td><td>{html.escape(str(profile.get('protocol')))}</td><td>{html.escape(str(profile.get('model')))}</td><td>{html.escape(str(profile.get('base_url')))}</td><td><form method='post' action='/admin/upstream-profile' style='display:inline'><input type='hidden' name='profile_id' value='{html.escape(str(profile.get('id')))}'><button name='action' value='activate'>设为默认</button></form> <form method='post' action='/admin/upstream-profile' style='display:inline'><input type='hidden' name='profile_id' value='{html.escape(str(profile.get('id')))}'><button name='action' value='delete'>删除</button></form></td></tr>"
-        for profile in cfg.get("upstream_profiles", []) if isinstance(profile, dict)
-    )
-    return f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>Gateway Admin</title>
-<style>body{{font-family:system-ui;margin:24px;max-width:1200px}} input,select,textarea{{width:100%;box-sizing:border-box;margin:4px 0 10px;padding:8px}} table{{border-collapse:collapse;width:100%;margin:12px 0}} td,th{{border:1px solid #ddd;padding:6px;vertical-align:top}} code,pre{{background:#f6f6f6;padding:2px 4px}} .grid{{display:grid;grid-template-columns:1fr 1fr;gap:20px}} button{{padding:8px 14px}}</style>
-</head><body>
-<h1>Tool Call Gateway Admin</h1>
-<p><a href="/client-config">下游客户端配置生成器</a> <a href="/client-config.json">Client config JSON</a> <a href="/healthz">Health</a></p>
-<p>生产环境请通过环境变量 <code>GATEWAY_ADMIN_PASSWORD</code> 和 <code>GATEWAY_DOWNSTREAM_KEY</code> 配置管理员密码和下游 API Key。开发环境默认 admin/admin 和 local-gateway-key。</p>
-<div class="grid">
-<section><h2>上游 API</h2>
-<p>支持添加多个上游 API；每个上游可以独立设置协议、路由、模型、streaming、tool call、识图、网络检索等能力。当前默认上游会用于所有下游协议请求。</p>
-<table><tr><th>Active</th><th>ID</th><th>Name</th><th>Protocol</th><th>Model</th><th>Base URL</th><th>Actions</th></tr>{upstream_profile_rows}</table>
-<form method="post" action="/admin/config">
-<h3>添加/编辑上游 API 详情</h3>
-<label>Profile ID（新 ID 会新增；已有 ID 会更新）</label><input name="profile_id" value="{html.escape(str(upstream.get('id','default')))}">
-<label>Profile Name</label><input name="profile_name" value="{html.escape(str(upstream.get('name','default')))}">
-<label>Base URL</label><input name="base_url" value="{html.escape(str(upstream.get('base_url','')))}">
-<label>API Key（留空则不修改）</label><input name="api_key" type="password" placeholder="keep unchanged">
-<label>Model</label><input name="model" value="{html.escape(str(upstream.get('model','')))}">
-<label>Timeout Seconds</label><input name="upstream_timeout_seconds" value="{html.escape(str(upstream.get('timeout_seconds', 60)))}">
-<label>Max Input Tokens</label><input name="upstream_max_input_tokens" value="{html.escape(str(upstream.get('max_input_tokens', 128000)))}">
-<label>Max Output Tokens</label><input name="upstream_max_output_tokens" value="{html.escape(str(upstream.get('max_output_tokens', 8192)))}">
-<label>Upstream Max Concurrency</label><input name="upstream_max_concurrency" value="{html.escape(str(upstream.get('max_concurrency', 32)))}">
-<label>Protocol</label><select name="protocol">
-{''.join(f'<option value="{p}" {"selected" if upstream.get("protocol") == p else ""}>{p}</option>' for p in ["openai_chat","openai_responses","anthropic_messages","openai_compatible"])}
-</select>
-<p><b>协议转换说明：</b>当上游 Protocol 选择 <code>openai_chat</code> / <code>openai_compatible</code> 时，下游仍可同时调用 <code>/v1/chat/completions</code>、<code>/v1/responses</code>、<code>/v1/messages</code>；Gateway 会把三种请求统一转换为上游 <code>Chat Completions Path</code>，再把返回转换回下游协议。</p>
-<label>Tools Enabled</label><select name="tools_enabled">
-{''.join(f'<option value="{p}" {"selected" if upstream.get("tools_enabled") == p else ""}>{p}</option>' for p in ["auto","on","off","native_only"])}
-</select>
-<label><input type="checkbox" name="native_tools_verified" value="1" {"checked" if upstream.get("native_tools_verified") else ""} style="width:auto"> Native tools 已验证</label>
-<label><input type="checkbox" name="use_for_coding" value="1" {"checked" if upstream.get("use_for_coding", True) else ""} style="width:auto"> 用于 coding agent</label>
-<h3>Upstream Capabilities / 能力开关</h3>
-<label><input type="checkbox" name="cap_supports_streaming" value="1" {"checked" if capabilities.get("supports_streaming", True) else ""} style="width:auto"> 支持 streaming</label>
-<label><input type="checkbox" name="cap_supports_tools" value="1" {"checked" if capabilities.get("supports_tools", True) else ""} style="width:auto"> 支持 tool calls</label>
-<label><input type="checkbox" name="cap_supports_function_calls" value="1" {"checked" if capabilities.get("supports_function_calls", True) else ""} style="width:auto"> 支持 function calls</label>
-<label><input type="checkbox" name="cap_supports_parallel_tool_calls" value="1" {"checked" if capabilities.get("supports_parallel_tool_calls", True) else ""} style="width:auto"> 支持 parallel tool calls</label>
-<label><input type="checkbox" name="cap_supports_vision" value="1" {"checked" if capabilities.get("supports_vision") else ""} style="width:auto"> 支持识图 / vision</label>
-<label><input type="checkbox" name="cap_supports_network" value="1" {"checked" if capabilities.get("supports_network") else ""} style="width:auto"> 支持网络 / web</label>
-<label><input type="checkbox" name="cap_supports_web_search" value="1" {"checked" if capabilities.get("supports_web_search") or capabilities.get("supports_network") else ""} style="width:auto"> 支持网络检索 / web search</label>
-<label><input type="checkbox" name="cap_supports_json_schema" value="1" {"checked" if capabilities.get("supports_json_schema", True) else ""} style="width:auto"> 支持 JSON Schema / structured outputs</label>
-<h3>Upstream Routes / 路由适配</h3>
-<label>Models Path</label><input name="path_models" value="{html.escape(str(upstream_paths.get('models','/v1/models')))}">
-<label>Chat Completions Path</label><input name="path_chat_completions" value="{html.escape(str(upstream_paths.get('chat_completions','/v1/chat/completions')))}">
-<label>Responses Path</label><input name="path_responses" value="{html.escape(str(upstream_paths.get('responses','/v1/responses')))}">
-<label>Messages Path</label><input name="path_messages" value="{html.escape(str(upstream_paths.get('messages','/v1/messages')))}">
-	<h3>Gateway Runtime</h3>
-	<label>Tool Mode</label><select name="tool_mode">
-	{''.join(f'<option value="{p}" {"selected" if gateway.get("tool_mode") == p else ""}>{p}</option>' for p in ["orchestrate","passthrough"])}
-	</select>
-	<label>Max Tool Rounds</label><input name="max_tool_rounds" value="{html.escape(str(gateway.get('max_tool_rounds', DEFAULT_MAX_TOOL_ROUNDS)))}">
-	<label>Max Concurrent Requests</label><input name="max_concurrent_requests" value="{html.escape(str(gateway.get('max_concurrent_requests', 32)))}">
-	<label>Concurrency Queue Timeout Seconds</label><input name="concurrency_queue_timeout_seconds" value="{html.escape(str(gateway.get('concurrency_queue_timeout_seconds', 5)))}">
-	<label>Tool Execution Timeout Seconds</label><input name="tool_execution_timeout_seconds" value="{html.escape(str(gateway.get('tool_execution_timeout_seconds', 60)))}">
-	<label>Workspace Root</label><input name="workspace_root" value="{html.escape(str(gateway.get('workspace_root','')))}">
-		<label><input type="checkbox" name="allow_write_tools" value="1" {"checked" if gateway.get("allow_write_tools") else ""} style="width:auto"> 允许写入工具</label>
-		<label><input type="checkbox" name="allow_shell_tools" value="1" {"checked" if gateway.get("allow_shell_tools") else ""} style="width:auto"> 允许 Shell 工具</label>
-	<label><input type="checkbox" name="request_logging" value="1" {"checked" if gateway.get("request_logging", True) else ""} style="width:auto"> 保留下游请求和响应</label>
-		<label><input type="checkbox" name="record_unsupported_tools" value="1" {"checked" if gateway.get("record_unsupported_tools", True) else ""} style="width:auto"> 记录不支持/失败的 tools，方便后续增强</label>
-		<label><input type="checkbox" name="text_tool_call_fallback_enabled" value="1" {"checked" if gateway.get("text_tool_call_fallback_enabled", True) else ""} style="width:auto"> 上游只输出文本 &lt;function=...&gt; 时，本地识别并执行工具</label>
-		<h3>Context Router / 分流压缩</h3>
-		<label><input type="checkbox" name="context_enabled" value="1" {"checked" if context.get("enabled") else ""} style="width:auto"> 启用上下文治理</label>
-		<label><input type="checkbox" name="context_fanout_enabled" value="1" {"checked" if context.get("fanout_enabled") else ""} style="width:auto"> 超大请求 fan-out 分流分析后综合</label>
-		<label><input type="checkbox" name="context_quality_review_enabled" value="1" {"checked" if context.get("quality_review_enabled", True) else ""} style="width:auto"> 分流综合后再做检查/反思/调整</label>
-		<label>Max Input Tokens</label><input name="context_max_input_tokens" value="{html.escape(str(context.get('max_input_tokens', 24000)))}">
-		<label>Fanout Chunk Tokens</label><input name="context_fanout_chunk_tokens" value="{html.escape(str(context.get('fanout_chunk_tokens', 12000)))}">
-		<label>Fanout Max Chunks（0 = 不限制，按内容切完）</label><input name="context_fanout_max_chunks" value="{html.escape(str(context.get('fanout_max_chunks', 0)))}">
-		<label>Fanout Max Workers</label><input name="context_fanout_max_workers" value="{html.escape(str(context.get('fanout_max_workers', 4)))}">
-	<button>保存上游和运行配置</button>
-</form></section>
-<section><h2>下游 API Keys</h2>
-<p>可添加多个下游 key；每个 key 默认可访问 Chat Completions / Responses / Anthropic Messages，Gateway 会按需要转换到当前上游协议。</p>
-<table><tr><th>Name</th><th>Prefix</th><th>Enabled</th><th>Protocols</th></tr>{key_rows}</table>
-<form method="post" action="/admin/downstream-key">
-<label>Name</label><input name="name" placeholder="codex-local">
-<label>Key</label><input name="key" placeholder="your-api-key">
-<label><input type="checkbox" name="key_proto_models" value="1" checked style="width:auto"> /v1/models</label>
-<label><input type="checkbox" name="key_proto_chat" value="1" checked style="width:auto"> /v1/chat/completions</label>
-<label><input type="checkbox" name="key_proto_responses" value="1" checked style="width:auto"> /v1/responses</label>
-<label><input type="checkbox" name="key_proto_messages" value="1" checked style="width:auto"> /v1/messages</label>
-<label><input type="checkbox" name="key_proto_tools" value="1" checked style="width:auto"> direct tools/functions</label>
-<button>添加/更新 Key</button>
-</form>
-<h2>修改管理员密码</h2>
-<form method="post" action="/admin/password">
-<label>New password</label><input type="password" name="password">
-<button>修改密码</button>
-</form></section>
-</div>
-<section><h2>本地 MCP / Connector Catalog</h2>
-<form method="post" action="/admin/mcp">
-<textarea name="servers" rows="8">{mcp_json}</textarea>
-<button>保存 MCP 配置</button>
-</form>
-<form method="post" action="/admin/mcp-reload"><button>刷新 MCP 连接和工具缓存</button></form>
-<p>当前已支持 stdio MCP <code>initialize</code> / <code>tools/list</code> / <code>tools/call</code>，ready tools 会以 <code>mcp__server__tool</code> 形式自动暴露，并兼容 DeepSeek-TUI 风格 <code>mcp_server_tool</code> 名称。</p>
-<p>MCP sessions: <code>{mcp_session_count}</code>，catalog cache: <code>{mcp_cache_count}</code>。查看 <code>/admin/mcp-tools.json</code>。</p>
-<table><tr><th>Server</th><th>Status</th><th>Session</th><th>Cache</th><th>Tools</th><th>Detail</th></tr>{mcp_health_rows}</table>
-</section>
-<section><h2>HTTP Actions</h2>
-<form method="post" action="/admin/http-actions">
-<textarea name="actions" rows="8">{http_actions_json}</textarea>
-<button>保存 HTTP Actions</button>
-</form>
-<p>HTTP action 会作为真实 tool/function executor 暴露，默认直接使用 action <code>name</code>。POST/PUT/PATCH 会把工具参数作为 JSON body；GET/DELETE 会把参数放到 query。</p>
-<p>示例：<code>{{"name":"lookup_user","method":"POST","url":"http://127.0.0.1:9000/lookup","input_schema":{{"type":"object","properties":{{"id":{{"type":"string"}}}}}}}}</code></p>
-</section>
-<section><h2>Tool 调用频次</h2><table><tr><th>Tool</th><th>Calls</th><th>Success</th><th>Failure</th><th>Failures</th></tr>{tool_rows}</table></section>
-<section><h2>失败/不支持 Function Calls / Tool Calls</h2><table><tr><th>Time</th><th>Tool</th><th>Type</th><th>Content</th></tr>{failure_rows}</table><p>这些会进入 marketplace/backlog 搜索与后续实现。</p></section>
-<section><h2>最近下游请求</h2><table><tr><th>Time</th><th>Path</th><th>Status</th><th>Key</th></tr>{request_rows}</table></section>
-<section><h2>当前配置（脱敏）</h2><pre>{html.escape(json.dumps(redacted, ensure_ascii=False, indent=2))}</pre></section>
-</body></html>"""
-
-
-def _redirect(handler: BaseHTTPRequestHandler, location: str = "/ui") -> None:
-    handler.send_response(303)
-    handler.send_header("location", location)
-    handler.end_headers()
 
 
 def _execute_tool_call(call: ToolCall, provider: str | None = None) -> ToolResult:
@@ -1348,7 +894,7 @@ def _execute_tool_call(call: ToolCall, provider: str | None = None) -> ToolResul
     original_name = call.name
     call = _normalize_tool_call(call)
     tool = BUILTIN_TOOLS.get(call.name)
-    mcp_target = _mcp_parse_public_name(call.name)
+    mcp_target = None if tool else _mcp_parse_public_name(call.name)
     cfg = _gateway_config() if callable(_gateway_config) else _gateway_config
     max_retries = cfg.get("tool_max_retries", 1) if isinstance(cfg, dict) else 1
     provider = provider or "unknown"
@@ -1365,7 +911,16 @@ def _execute_tool_call(call: ToolCall, provider: str | None = None) -> ToolResul
                         content=f"connector_required: MCP server {server_name} is not configured or enabled",
                         success=False, failure_type="connector_required",
                     )
-                    _record_tool_failure(call, result, execution_ms=_time.time()-_start, retry_count=attempt, provider=provider)
+                    _record_tool_failure(
+                        tool_name=call.name,
+                        call_id=call.call_id,
+                        failure_type="connector_required",
+                        arguments_keys=sorted(call.arguments.keys()),
+                        content=result.content[:1000] if result.content else "",
+                        execution_ms=_time.time()-_start,
+                        retry_count=attempt,
+                        provider=provider,
+                    )
                     _record_tool_stat(call.name, False, "connector_required")
                     return result
                 content = _mcp_call_tool(server, mcp_tool_name, call.arguments)
@@ -1382,7 +937,16 @@ def _execute_tool_call(call: ToolCall, provider: str | None = None) -> ToolResul
                     content=f"ToolNotFound: {call.name} is not implemented or installed in Gateway runtime",
                     success=False, failure_type="tool_not_found",
                 )
-                _record_tool_failure(call, result, execution_ms=_time.time()-_start, retry_count=attempt, provider=provider)
+                _record_tool_failure(
+                    tool_name=call.name,
+                    call_id=call.call_id,
+                    failure_type="tool_not_found",
+                    arguments_keys=sorted(call.arguments.keys()),
+                    content=result.content[:1000] if result.content else "",
+                    execution_ms=_time.time()-_start,
+                    retry_count=attempt,
+                    provider=provider,
+                )
                 _record_tool_stat(call.name, False, "tool_not_found")
                 return result
             content = tool.handler(call.arguments)
@@ -1411,7 +975,16 @@ def _execute_tool_call(call: ToolCall, provider: str | None = None) -> ToolResul
             # transient failure — retry if attempts remain
     # All attempts exhausted
     failure_type = getattr(last_exc, "failure_type", "execution_failed") if last_exc and isinstance(last_exc, ToolExecutionError) else getattr(last_result, "failure_type", "execution_failed") if last_result else "execution_failed"
-    _record_tool_failure(call, last_result, execution_ms=_time.time()-_start, retry_count=max_retries, provider=provider)
+    _record_tool_failure(
+        tool_name=call.name,
+        call_id=call.call_id,
+        failure_type=failure_type,
+        arguments_keys=sorted(call.arguments.keys()),
+        content=last_result.content[:1000] if last_result and last_result.content else "",
+        execution_ms=_time.time()-_start,
+        retry_count=max_retries,
+        provider=provider,
+    )
     _record_tool_stat(call.name, False, failure_type)
     return last_result
 
@@ -1487,60 +1060,116 @@ def run_tool_orchestration(path: str, body: Json, client: NativeProxyClient | No
         return _run_tool_orchestration_scoped(path, body, client)
 
 
+def _convert_response_to_path(target_path: str, response: Json) -> Json:
+    """Convert a response to the format matching the target path.
+
+    Detects the actual response format and converts if needed.
+    """
+    from .gateway_protocol import (
+        _is_anthropic_response, _is_openai_chat_response, _is_openai_responses_response,
+        _from_openai_chat_response, _from_anthropic_response_to_openai,
+        _from_openai_chat_to_responses_response, _from_responses_response_to_openai,
+    )
+    # If already in the target format, return as-is
+    if "/chat/completions" in target_path and _is_openai_chat_response(response):
+        return response
+    if "/responses" in target_path and _is_openai_responses_response(response):
+        return response
+    if "/messages" in target_path and _is_anthropic_response(response):
+        return response
+    # Convert to target format
+    if "/chat/completions" in target_path:
+        if _is_anthropic_response(response):
+            return _from_anthropic_response_to_openai(response)
+        if _is_openai_responses_response(response):
+            return _from_responses_response_to_openai(response)
+    if "/responses" in target_path:
+        if _is_openai_chat_response(response):
+            return _from_openai_chat_to_responses_response(response)
+        if _is_anthropic_response(response):
+            return _from_openai_chat_to_responses_response(_from_anthropic_response_to_openai(response))
+    if "/messages" in target_path:
+        if _is_openai_chat_response(response):
+            return _from_openai_chat_response(target_path, response)
+        if _is_openai_responses_response(response):
+            return _from_openai_chat_response(target_path, _from_responses_response_to_openai(response))
+    return response
+
+
 def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyClient | None = None) -> Json:
-    mode = _config_env("GATEWAY_TOOL_MODE", "orchestrate").lower()
+    gateway_cfg = _gateway_config()
+    mode = str(os.environ.get("GATEWAY_TOOL_MODE") or gateway_cfg.get("tool_mode") or "orchestrate").lower()
     memory_body = _inject_recalled_memories(path, body)
+    upstream = client or NativeProxyClient()
+    from .gateway_config import _upstream_protocol
+    upstream_protocol = _upstream_protocol()
+
+    # Convert request to upstream protocol format
+    upstream_path, converted_body = _convert_request_to_upstream(path, memory_body, upstream_protocol)
+
+    # Override model with configured upstream model
+    upstream_model = _config_env("UPSTREAM_MODEL", "") or _upstream_config().get("model", "")
+    if upstream_model and "model" in converted_body:
+        converted_body["model"] = upstream_model
+
     if mode in {"passthrough", "native_passthrough", "proxy"}:
-        response = (client or NativeProxyClient()).forward(path, memory_body)
+        response = upstream.forward(upstream_path, converted_body)
+        # Convert response back to downstream format
+        response = _convert_response_to_downstream(path, response, upstream_protocol)
         _verify_native_if_forced(path, memory_body, response)
         _remember_conversation_turn(path, body, response)
         return response
     max_rounds = int(_config_env("GATEWAY_MAX_TOOL_ROUNDS", str(DEFAULT_MAX_TOOL_ROUNDS)))
-    upstream = client or NativeProxyClient()
+    full_cfg = load_config()
     context_cfg = _context_config()
-    fanout_response = _run_context_fanout(path, memory_body, upstream, context_cfg)
+    fanout_response = _run_context_fanout(path, memory_body, upstream, full_cfg)
     if fanout_response is not None:
         _remember_conversation_turn(path, body, fanout_response)
         return fanout_response
     request_body = _merge_builtin_tools(path, _apply_local_planner_context(path, _maybe_compact_request_for_upstream(path, memory_body, context_cfg)))
+    # Convert merged request to upstream format
+    upstream_path, request_body = _convert_request_to_upstream(path, request_body, upstream_protocol)
+    # Override model with configured upstream model
+    if upstream_model and "model" in request_body:
+        request_body["model"] = upstream_model
+    tools_stripped = False
     for _round in range(max_rounds):
-        response = upstream.forward(path, request_body)
-        response_text = _response_text(path, response)
+        try:
+            response = upstream.forward(upstream_path, request_body)
+        except UpstreamHTTPError as exc:
+            # Tool rejection fallback: if upstream rejects tools (400), strip and retry as text
+            if exc.upstream_status == 400 and not tools_stripped and request_body.get("tools"):
+                from .gateway_protocol import _inject_tools_as_text_prompt
+                request_body = _without_tools(request_body)
+                request_body = _inject_tools_as_text_prompt(request_body, [])
+                tools_stripped = True
+                continue
+            raise
+        # Convert response to the format matching upstream_path for tool result appending
+        upstream_response = _convert_response_to_path(upstream_path, response)
+        # Convert response back to downstream format for tool extraction
+        downstream_response = _convert_response_to_downstream(path, response, upstream_protocol)
+        response_text = _response_text(path, downstream_response)
         if _looks_like_context_rejection(response_text):
-            forced_fanout = _run_context_fanout(path, memory_body, upstream, context_cfg, force=True)
+            forced_fanout = _run_context_fanout(path, memory_body, upstream, full_cfg, force=True)
             if forced_fanout is not None:
                 _remember_conversation_turn(path, body, forced_fanout)
                 return forced_fanout
-        _verify_native_if_forced(path, request_body, response)
-        calls = _extract_tool_calls(path, response)
+        _verify_native_if_forced(path, request_body, downstream_response)
+        calls = _extract_tool_calls(path, downstream_response)
         text_fallback = False
         if not calls:
-            calls = _extract_text_tool_calls(path, response)
+            calls = _extract_text_tool_calls(path, downstream_response)
             text_fallback = bool(calls)
         if not calls:
-            _remember_conversation_turn(path, body, response)
-            return response
+            _remember_conversation_turn(path, body, downstream_response)
+            return downstream_response
         results = [_execute_tool_call(call) for call in calls]
         if text_fallback:
-            request_body = _append_text_tool_results(path, request_body, response, calls, results)
+            request_body = _append_text_tool_results(upstream_path, request_body, upstream_response, calls, results)
         else:
-            request_body = _append_tool_results(path, request_body, response, results)
+            request_body = _append_tool_results(upstream_path, request_body, upstream_response, results)
     raise GatewayError("max tool rounds exceeded", detail={"max_tool_rounds": max_rounds})
-
-
-def _error_payload(message: str, *, detail: Any | None = None, upstream_status: int | None = None) -> Json:
-    payload: Json = {
-        "error": {
-            "message": message,
-            "type": "native_tool_gateway_error",
-            "fake_prompt_tools": False,
-        }
-    }
-    if detail is not None:
-        payload["error"]["detail"] = detail
-    if upstream_status is not None:
-        payload["error"]["upstream_status"] = upstream_status
-    return payload
 
 
 def _stream_mode_passthrough() -> bool:
@@ -1609,20 +1238,203 @@ def _stream_tool_error(handler: BaseHTTPRequestHandler, call_id: str, name: str,
 
 
 # ---------------------------------------------------------------------------
-# Backward-compat re-exports
-# Allow: from gateway_tool_runtime import run_tool_orchestration
+# Native tool verification
 # ---------------------------------------------------------------------------
 
-# Re-exported from gateway_app (must be imported at runtime to avoid circular)
-def __getattr__(name: str):
-    _mod = None
+def _verify_native_if_forced(path: str, body: Json, response: Json) -> None:
+    """Verify that native tool calls are present when tool_choice forces them.
+
+    Raises NativeToolVerificationError if the upstream fails to return native
+    tool calls when the request requires them.
+    """
+    from .gateway_errors import NativeToolVerificationError
+
+    tool_choice = body.get("tool_choice")
+    if not tool_choice:
+        return
+
+    # Only check when tool_choice forces a specific function
+    is_forced = False
+    if isinstance(tool_choice, str):
+        is_forced = tool_choice in {"required", "any"}
+    elif isinstance(tool_choice, dict):
+        choice_type = tool_choice.get("type", "")
+        is_forced = choice_type in {"function", "tool", "required"}
+
+    if not is_forced:
+        return
+
+    # Check if response contains native tool calls
+    calls = _extract_tool_calls(path, response)
+    if not calls:
+        # Also check for text-based tool calls as fallback
+        text_calls = _extract_text_tool_calls(path, response)
+        if not text_calls:
+            raise NativeToolVerificationError(
+                "upstream failed to return native tool calls when tool_choice forced a function call",
+                detail={"path": path, "tool_choice": tool_choice},
+            )
+
+
+def _native_tool_signal(path: str, response: Json) -> bool:
+    """Check if a response contains native tool call signals.
+
+    Returns True if the response indicates native tool calls were made.
+    """
+    if path.startswith("/v1/chat/completions"):
+        choices = response.get("choices") or []
+        for choice in choices:
+            message = choice.get("message") or {}
+            if message.get("tool_calls"):
+                return True
+            if choice.get("finish_reason") == "tool_calls":
+                return True
+        return False
+    elif path.startswith("/v1/responses"):
+        output = response.get("output") or []
+        for item in output:
+            if isinstance(item, dict) and item.get("type") in {"function_call", "tool_call", "custom_tool_call"}:
+                return True
+        return False
+    elif path.startswith("/v1/messages"):
+        content = response.get("content") or []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                return True
+        return False
+    return False
+
+
+def _is_forced_tool_choice(path: str, body: Json) -> bool:
+    """Check if tool_choice forces a specific tool call.
+
+    Returns True if the request requires a specific tool to be called.
+    """
+    tool_choice = body.get("tool_choice")
+    if not tool_choice:
+        return False
+
+    if path.startswith("/v1/chat/completions"):
+        if isinstance(tool_choice, dict):
+            return tool_choice.get("type") == "function"
+        return tool_choice in {"required", "any"}
+    elif path.startswith("/v1/responses"):
+        if isinstance(tool_choice, dict):
+            return tool_choice.get("type") == "function"
+        return tool_choice in {"required", "any"}
+    elif path.startswith("/v1/messages"):
+        if isinstance(tool_choice, dict):
+            return tool_choice.get("type") == "tool"
+        return False
+    return False
+
+
+def _probe_body(path: str, model: str | None = None) -> Json:
+    """Create a minimal request body for probing native tool support.
+
+    Uses the echo_probe tool to test if the upstream properly handles
+    native tool calls.
+    """
+    if path.startswith("/v1/chat/completions") or path == "/v1/chat/completions":
+        return {
+            "model": model or "gpt-3.5-turbo",
+            "messages": [{"role": "user", "content": "Say hello"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "echo_probe",
+                        "description": "Return the input value. Used to verify real native tool calling.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "value": {"type": "string", "description": "The value to echo back"},
+                            },
+                            "required": ["value"],
+                        },
+                    },
+                }
+            ],
+            "tool_choice": {"type": "function", "function": {"name": "echo_probe"}},
+            "max_tokens": 100,
+        }
+    elif path.startswith("/v1/responses"):
+        return {
+            "model": model or "gpt-4o-mini",
+            "input": "Say hello",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "echo_probe",
+                    "description": "Return the input value. Used to verify real native tool calling.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "value": {"type": "string", "description": "The value to echo back"},
+                        },
+                        "required": ["value"],
+                    },
+                }
+            ],
+            "tool_choice": {"type": "function", "name": "echo_probe"},
+        }
+    else:
+        # Anthropic Messages format
+        return {
+            "model": model or "claude-3-haiku-20240307",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "Say hello"}],
+            "tools": [
+                {
+                    "name": "echo_probe",
+                    "description": "Return the input value. Used to verify real native tool calling.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "value": {"type": "string", "description": "The value to echo back"},
+                        },
+                        "required": ["value"],
+                    },
+                }
+            ],
+            "tool_choice": {"type": "tool", "name": "echo_probe"},
+        }
+
+
+def run_native_probe(path: str, client: NativeProxyClient | None = None) -> Json:
+    """Run a probe to check if the upstream supports native tool calls.
+
+    Returns a status object indicating whether native tools are supported.
+    """
     try:
-        from . import gateway_app as _mod
-    except ImportError:
-        try:
-            import gateway_app as _mod
-        except ImportError:
-            raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    if hasattr(_mod, name):
-        return getattr(_mod, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+        body = _probe_body(path)
+        upstream = client or NativeProxyClient()
+        response = upstream.forward(path, body)
+        calls = _extract_tool_calls(path, response)
+        if calls:
+            return {
+                "status": "ok",
+                "native_tools": True,
+                "probe_tool": calls[0].name,
+                "message": "Native tool calls working correctly",
+            }
+        text_calls = _extract_text_tool_calls(path, response)
+        if text_calls:
+            return {
+                "status": "partial",
+                "native_tools": False,
+                "text_fallback": True,
+                "message": "Upstream returned text-based tool calls (no native support)",
+            }
+        return {
+            "status": "unsupported",
+            "native_tools": False,
+            "message": "Upstream did not return any tool calls",
+        }
+    except Exception as exc:
+        return {
+            "status": "error",
+            "native_tools": False,
+            "error": str(exc),
+            "message": f"Probe failed: {exc}",
+        }

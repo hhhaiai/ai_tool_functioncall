@@ -6,7 +6,7 @@ Date: 2026-05-16
 
 - Runtime request/failure database: `gateway_log.sqlite3`.
 - Legacy imported failures: `.gateway_tool_failures.jsonl`.
-- Current real runtime implementation: `src/gateway_app.py`, `src/gateway_builtin_tools.py`.
+- Current real runtime implementation: split `src/gateway_*` modules, especially `gateway_tool_runtime.py`, `gateway_builtin_tools.py`, `gateway_http_handler.py`, and `gateway_context.py`.
 - Verification entrypoint: `tests/integration/smoke_gateway_tools.py`.
 
 ## Observed request shape
@@ -92,6 +92,6 @@ python3 -m unittest discover -s tests -v
 
 Latest result:
 
-- Unit tests: `Ran 40 tests ... OK`.
+- Unit tests: latest full suite `Ran 131 tests ... OK`.
 - Smoke repeated twice: `ok=true`.
 - Smoke checks cover: project tree, glob, Python symbols, write/edit/read, Bash coding, code interpreter, web fetch, web search, image/vision metadata, intent detection, parallel tools, cleanup, SQLite-only logging.
