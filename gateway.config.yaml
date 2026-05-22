@@ -53,14 +53,14 @@ upstream:
 # ----------------------------------------------------------------------------
 gateway:
   # 工作目录（工具读写的根目录）
-  workspace_root: /Users/sanbo/Desktop/ai_tool_functioncall
+  workspace_root: ./workspace
 
   # 工具模式：orchestrate（本地编排）| passthrough（直通上游）
   tool_mode: orchestrate
 
   # 工具权限
-  allow_write_tools: true            # 允许文件写入工具
-  allow_shell_tools: true            # 允许 Shell 执行工具
+  allow_write_tools: false           # 允许文件写入工具；仅可信本地 coding-agent 场景开启
+  allow_shell_tools: false           # 允许 Shell 执行工具；生产默认关闭
 
   # 工具执行
   max_tool_rounds: 10                # 最大工具调用轮数

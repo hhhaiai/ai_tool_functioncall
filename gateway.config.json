@@ -30,10 +30,10 @@
     }
   },
   "gateway": {
-    "workspace_root": "/Users/sanbo/Desktop/ai_tool_functioncall",
+    "workspace_root": "./workspace",
     "tool_mode": "orchestrate",
-    "allow_write_tools": true,
-    "allow_shell_tools": true,
+    "allow_write_tools": false,
+    "allow_shell_tools": false,
     "max_tool_rounds": 10,
     "tool_execution_timeout_seconds": 60,
     "max_concurrent_requests": 32,

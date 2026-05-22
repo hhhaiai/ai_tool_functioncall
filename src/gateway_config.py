@@ -86,7 +86,7 @@ def _default_config() -> Json:
             "created_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
         })
 
-    return {
+    cfg = {
         "admin": {
             "username": "admin",
             "password_hash": admin_password_hash,
@@ -180,11 +180,15 @@ def _default_config() -> Json:
             "actions": [],
         },
     }
+    _ensure_client_snippet_downstream_key(cfg)
+    return cfg
 
 
 def load_config() -> Json:
     if not CONFIG_PATH.exists():
-        cfg = _sync_active_upstream(_default_config())
+        cfg = _default_config()
+        _ensure_client_snippet_downstream_key(cfg)
+        cfg = _sync_active_upstream(cfg)
         save_config(cfg)
         return cfg
     try:
@@ -194,12 +198,17 @@ def load_config() -> Json:
     except Exception:
         loaded = {}
     cfg = _default_config()
+    _normalize_admin_credentials(loaded)
     _deep_update(cfg, loaded)
+    _ensure_client_snippet_downstream_key(cfg)
     return _sync_active_upstream(cfg)
 
 
 def save_config(config: Json) -> None:
-    CONFIG_PATH.write_text(json.dumps(_sync_active_upstream(config), ensure_ascii=False, indent=2), encoding="utf-8")
+    normalized = copy.deepcopy(config)
+    _normalize_admin_credentials(normalized)
+    _ensure_client_snippet_downstream_key(normalized)
+    CONFIG_PATH.write_text(json.dumps(_sync_active_upstream(normalized), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _deep_update(base: Json, updates: Json) -> Json:
@@ -209,6 +218,67 @@ def _deep_update(base: Json, updates: Json) -> Json:
         else:
             base[key] = value
     return base
+
+
+def _normalize_admin_credentials(config: Json) -> Json:
+    """Convert legacy/template ``admin.password`` to ``password_hash``.
+
+    Public templates historically used a plain ``admin.password`` field for
+    readability, while runtime authentication only checks ``password_hash``.
+    Normalizing at load/save keeps old templates usable without persisting the
+    plain password back to disk.
+    """
+    admin = config.get("admin")
+    if not isinstance(admin, dict):
+        return config
+    plain_password = admin.pop("password", None)
+    if plain_password and not admin.get("password_hash"):
+        password = str(plain_password)
+        admin["password_hash"] = _hash_secret(password)
+        admin.setdefault("must_change_password", password == "admin")
+    return config
+
+
+def _ensure_client_snippet_downstream_key(config: Json) -> Json:
+    """Make copied client snippets authenticate without extra manual key setup."""
+    gateway_cfg = config.get("gateway")
+    if not isinstance(gateway_cfg, dict):
+        return config
+    snippet_key = str(gateway_cfg.get("client_snippet_api_key") or "").strip()
+    if not snippet_key:
+        return config
+    downstream_keys = config.get("downstream_keys")
+    if not isinstance(downstream_keys, list):
+        downstream_keys = []
+        config["downstream_keys"] = downstream_keys
+    key_hash = _hash_secret(snippet_key)
+    protocols = ["models", "chat_completions", "responses", "messages", "direct_tools"]
+    for item in downstream_keys:
+        if not isinstance(item, dict):
+            continue
+        if item.get("key_hash") == key_hash:
+            item["prefix"] = item.get("prefix") or snippet_key[:8]
+            item["enabled"] = True
+            item["protocols"] = protocols
+            return config
+        if item.get("name") == "client-snippet":
+            item.update({
+                "key_hash": key_hash,
+                "prefix": snippet_key[:8],
+                "enabled": True,
+                "protocols": protocols,
+            })
+            item["updated_at"] = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
+            return config
+    downstream_keys.append({
+        "name": "client-snippet",
+        "key_hash": key_hash,
+        "prefix": snippet_key[:8],
+        "enabled": True,
+        "protocols": protocols,
+        "created_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+    })
+    return config
 
 
 def _upstream_profile_id(profile: Json) -> str:

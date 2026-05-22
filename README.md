@@ -60,7 +60,7 @@
 
 ```bash
 python3 -m unittest discover -s tests -v
-# 131 tests OK
+# 135 tests OK
 ```
 
 ---
@@ -84,7 +84,7 @@ curl http://127.0.0.1:8885/healthz
 ```text
 API:       http://127.0.0.1:8885/v1/...
 Admin UI:  http://127.0.0.1:8885/ui
-管理员:    admin / admin（仅开发默认值）
+管理员:    admin / admin（仅开发默认值；首次配置请改强密码）
 ```
 
 ---
@@ -178,5 +178,7 @@ src/
 
 - Gateway 不把假的 tool result 伪装成真实成功。
 - 文本 fallback 只是一种弱上游兼容方式；工具仍由 Gateway/MCP/HTTP Action/真实 executor 执行。
-- 写文件、Shell、GUI、网络类工具要通过配置显式授权。
+- 写文件、Shell、GUI、网络类工具要通过配置显式授权；公开模板和 Docker 默认关闭写入/Shell。
+- `admin.password` 模板字段会在加载/保存时转换为 `password_hash`，避免明文密码被回写。
+- `gateway.client_snippet_api_key` 会自动同步成可认证的 downstream key，避免复制出的客户端配置不可用。
 - `gateway_app.py` 当前保留旧单体兼容导出层，新增实现应优先放入对应 `gateway_*` 模块。

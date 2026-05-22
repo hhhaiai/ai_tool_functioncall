@@ -279,6 +279,123 @@ class NativeGatewayTests(unittest.TestCase):
             else:
                 os.environ["GATEWAY_DOWNSTREAM_KEY"] = old_gateway
 
+    def test_admin_plain_password_config_is_hashed_and_not_persisted(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                gateway.CONFIG_PATH.write_text(
+                    json.dumps(
+                        {
+                            "admin": {"username": "admin", "password": "configured-admin-pass"},
+                            "upstream": {"base_url": "http://upstream.local", "model": "m"},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                cfg = gateway.load_config()
+                self.assertEqual(cfg["admin"]["password_hash"], gateway._hash_secret("configured-admin-pass"))
+                self.assertNotIn("password", cfg["admin"])
+
+                gateway.save_config(cfg)
+                saved = json.loads(gateway.CONFIG_PATH.read_text(encoding="utf-8"))
+                self.assertEqual(saved["admin"]["password_hash"], gateway._hash_secret("configured-admin-pass"))
+                self.assertNotIn("password", saved["admin"])
+                self.assertNotIn("configured-admin-pass", gateway.CONFIG_PATH.read_text(encoding="utf-8"))
+            finally:
+                gateway.CONFIG_PATH = old_config
+
+    def test_admin_password_hash_takes_precedence_over_plain_password(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                expected_hash = gateway._hash_secret("hash-wins")
+                gateway.CONFIG_PATH.write_text(
+                    json.dumps(
+                        {
+                            "admin": {
+                                "username": "admin",
+                                "password": "ignored-plain-password",
+                                "password_hash": expected_hash,
+                            }
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                cfg = gateway.load_config()
+                self.assertEqual(cfg["admin"]["password_hash"], expected_hash)
+                self.assertNotIn("password", cfg["admin"])
+            finally:
+                gateway.CONFIG_PATH = old_config
+
+    def test_client_snippet_key_is_normalized_into_downstream_auth(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                gateway.CONFIG_PATH.write_text(
+                    json.dumps({"gateway": {"client_snippet_api_key": "snippet-only-key"}, "downstream_keys": []}),
+                    encoding="utf-8",
+                )
+                cfg = gateway.load_config()
+                self.assertTrue(
+                    any(
+                        isinstance(item, dict) and item.get("key_hash") == gateway._hash_secret("snippet-only-key")
+                        for item in cfg["downstream_keys"]
+                    )
+                )
+                gateway.save_config(cfg)
+                saved = json.loads(gateway.CONFIG_PATH.read_text(encoding="utf-8"))
+                snippet_entries = [item for item in saved["downstream_keys"] if item.get("name") == "client-snippet"]
+                self.assertEqual(len(snippet_entries), 1)
+                self.assertEqual(snippet_entries[0]["key_hash"], gateway._hash_secret("snippet-only-key"))
+                self.assertNotIn("key", snippet_entries[0])
+
+                gateway.CONFIG_PATH.write_text(
+                    json.dumps(
+                        {
+                            "gateway": {"client_snippet_api_key": "disabled-existing-key"},
+                            "downstream_keys": [
+                                {
+                                    "name": "old-disabled",
+                                    "key_hash": gateway._hash_secret("disabled-existing-key"),
+                                    "prefix": "",
+                                    "enabled": False,
+                                    "protocols": ["models"],
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                repaired = gateway.load_config()["downstream_keys"][0]
+                self.assertTrue(repaired["enabled"])
+                self.assertEqual(repaired["prefix"], "disabled")
+                self.assertEqual(repaired["protocols"], ["models", "chat_completions", "responses", "messages", "direct_tools"])
+            finally:
+                gateway.CONFIG_PATH = old_config
+
+    def test_public_runtime_templates_keep_safe_defaults(self):
+        repo_root = pathlib.Path(__file__).resolve().parents[1]
+        template = json.loads((repo_root / "gateway.config.json").read_text(encoding="utf-8"))
+        self.assertEqual(template["gateway"]["workspace_root"], "./workspace")
+        self.assertFalse(template["gateway"]["allow_write_tools"])
+        self.assertFalse(template["gateway"]["allow_shell_tools"])
+
+        yaml_text = (repo_root / "gateway.config.yaml").read_text(encoding="utf-8")
+        self.assertIn("workspace_root: ./workspace", yaml_text)
+        self.assertIn("allow_write_tools: false", yaml_text)
+        self.assertIn("allow_shell_tools: false", yaml_text)
+
+        dockerfile = (repo_root / "Dockerfile").read_text(encoding="utf-8")
+        compose = (repo_root / "docker-compose.yml").read_text(encoding="utf-8")
+        prod_compose = (repo_root / "docker-compose.prod.yml").read_text(encoding="utf-8")
+        self.assertNotIn("GATEWAY_ADMIN_PASSWORD=admin", dockerfile)
+        self.assertIn("GATEWAY_ADMIN_PASSWORD=${GATEWAY_ADMIN_PASSWORD:-}", compose)
+        self.assertIn("GATEWAY_ADMIN_PASSWORD=${GATEWAY_ADMIN_PASSWORD:?set GATEWAY_ADMIN_PASSWORD}", prod_compose)
+
     def test_upstream_protocol_env_supports_current_and_legacy_names(self):
         old_current = os.environ.get("GATEWAY_UPSTREAM_PROTOCOL")
         old_legacy = os.environ.get("UPSTREAM_PROTOCOL")
@@ -2190,6 +2307,22 @@ while True:
                 saved = gateway.load_config()
                 self.assertEqual(saved["gateway"]["public_base_url"], "http://gateway.local:8885")
                 self.assertEqual(saved["gateway"]["downstream_model_alias"], "gpt-5.4")
+                self.assertTrue(
+                    any(
+                        isinstance(item, dict) and item.get("key_hash") == gateway._hash_secret("new-api-key")
+                        for item in saved["downstream_keys"]
+                    )
+                )
+                tool_req = urllib.request.Request(
+                    base + "/v1/tools/call",
+                    data=json.dumps({"tool": "calculator", "arguments": {"expression": "6*7"}}).encode("utf-8"),
+                    headers={"authorization": "Bearer new-api-key", "content-type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(tool_req, timeout=5) as resp:
+                    tool_payload = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(tool_payload["success"])
+                self.assertEqual(tool_payload["content"], "42")
             finally:
                 httpd.shutdown()
                 httpd.server_close()

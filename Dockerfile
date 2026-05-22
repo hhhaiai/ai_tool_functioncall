@@ -33,7 +33,6 @@ RUN mkdir -p /app/data /app/workspace
 # Environment variables with sensible defaults
 ENV GATEWAY_PORT=8885 \
     GATEWAY_HOST=0.0.0.0 \
-    GATEWAY_ADMIN_PASSWORD=admin \
     GATEWAY_SQLITE_LOG_PATH=/app/data/gateway_log.sqlite3 \
     GATEWAY_CONFIG_PATH=/app/data/.gateway_service.json \
     GATEWAY_STATS_PATH=/app/data/.gateway_stats.json \

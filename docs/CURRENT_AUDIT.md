@@ -118,6 +118,18 @@
    - 问题：在 write tools 已开启且传入 `recursive=true` 时，`DeletePath path=.` 会删除整个 workspace root。
    - 修复：显式拒绝删除 workspace root，返回 `permission_denied`；新增回归测试。
 
+20. **配置模板的开发机路径与高权限默认不适合公开发布**
+   - 问题：`gateway.config.*` 曾包含本机绝对路径并默认开启 write/shell，复制模板后容易把高危工具暴露给非可信部署。
+   - 修复：模板统一使用 `./workspace`，默认关闭 `allow_write_tools` / `allow_shell_tools`；Docker 镜像不再注入 `GATEWAY_ADMIN_PASSWORD=admin`，开发 compose 的空密码环境保持 must-change 语义；新增模板安全默认回归测试。
+
+21. **`admin.password` 模板字段与真实认证逻辑不一致**
+   - 问题：公开模板和运行文档展示 `admin.password`，但 runtime 只校验 `password_hash`，用户修改明文字段可能以为已改密码。
+   - 修复：`load_config()` / `save_config()` 会把 `admin.password` 归一化为 `password_hash` 且不回写明文；已有 hash 优先；新增回归测试。
+
+22. **客户端配置片段里的 API Key 可能不可认证**
+   - 问题：只设置 `gateway.client_snippet_api_key` 时，`/client-config` 会生成下游片段，但 `downstream_keys` 可能没有对应 hash。
+   - 修复：保存/加载配置时自动为 `client_snippet_api_key` 生成或更新 `client-snippet` downstream key；新增端到端回归，验证复制出的 key 可调用受保护 `/v1/tools/call`。
+
 ## 4. 当前验证结果
 
 ```bash
@@ -128,7 +140,7 @@ bash -n scripts/mimo_gateway.sh scripts/deploy.sh scripts/generate-ssl.sh script
 # OK
 
 python3 -m unittest discover -s tests -v
-# Ran 131 tests ... OK
+# Ran 135 tests ... OK
 
 # HTTP/UI smoke
 # GET /, /healthz, /ui, /client-config.json, /client-config

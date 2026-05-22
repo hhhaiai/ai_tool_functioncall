@@ -75,7 +75,7 @@ vi .gateway_service.json
     "model": "gpt-4o"
   },
   "gateway": {
-    "workspace_root": "/opt/ai-tool-functioncall",
+    "workspace_root": "./workspace",
     "client_snippet_api_key": "your-gateway-api-key"
   },
   "admin": {
@@ -136,10 +136,10 @@ curl http://127.0.0.1:8885/healthz
     "max_concurrency": 32
   },
   "gateway": {
-    "workspace_root": "/path/to/project",
+    "workspace_root": "./workspace",
     "tool_mode": "orchestrate",
-    "allow_write_tools": true,
-    "allow_shell_tools": true,
+    "allow_write_tools": false,
+    "allow_shell_tools": false,
     "max_tool_rounds": 10,
     "tool_execution_timeout_seconds": 60,
     "max_concurrent_requests": 32,
@@ -173,16 +173,16 @@ curl http://127.0.0.1:8885/healthz
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `admin.password` | admin | 管理员密码，生产环境必须修改 |
+| `admin.password` | admin | 管理员密码；加载/保存时会归一化为 `password_hash`，生产环境必须改为强密码或使用 `GATEWAY_ADMIN_PASSWORD` |
 | `upstream.base_url` | - | 上游 LLM API 地址 |
 | `upstream.api_key` | - | 上游 API Key |
 | `upstream.model` | - | 默认模型名称 |
 | `upstream.protocol` | openai_chat | 上游协议类型 |
-| `gateway.workspace_root` | 当前目录 | 工具读写的根目录 |
+| `gateway.workspace_root` | `./workspace`（模板）/ 当前目录（无配置时） | 工具读写的根目录 |
 | `gateway.tool_mode` | orchestrate | 工具模式：orchestrate / passthrough |
 | `gateway.allow_write_tools` | false | 是否允许文件写入 |
 | `gateway.allow_shell_tools` | false | 是否允许 Shell 执行 |
-| `gateway.client_snippet_api_key` | - | 客户端连接 Gateway 的 API Key |
+| `gateway.client_snippet_api_key` | - | 客户端连接 Gateway 的 API Key；保存配置时会自动同步为可认证的 downstream key |
 | `context.max_input_tokens` | 24000 | 超过此值触发上下文压缩 |
 
 ### 3.4 环境变量对照表
@@ -194,7 +194,7 @@ curl http://127.0.0.1:8885/healthz
 | `UPSTREAM_MODEL` | upstream.model | 默认模型 |
 | `GATEWAY_UPSTREAM_PROTOCOL` | upstream.protocol | 上游协议类型，优先于 legacy `UPSTREAM_PROTOCOL` |
 | `UPSTREAM_PROTOCOL` | upstream.protocol | 兼容旧环境变量，未设置 `GATEWAY_UPSTREAM_PROTOCOL` 时生效 |
-| `GATEWAY_DOWNSTREAM_KEY` | gateway.client_snippet_api_key | 下游 API Key |
+| `GATEWAY_DOWNSTREAM_KEY` | downstream key + gateway.client_snippet_api_key | 下游 API Key；环境变量会同时用于认证和客户端片段 |
 | `GATEWAY_ADMIN_PASSWORD` | admin.password | 管理员密码 |
 | `GATEWAY_WORKSPACE_ROOT` | gateway.workspace_root | 工作目录 |
 | `GATEWAY_PORT` | - | 监听端口（默认 8885） |

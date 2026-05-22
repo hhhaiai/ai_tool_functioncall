@@ -17,7 +17,7 @@ services:
       # Gateway configuration
       - GATEWAY_PORT=8885
       - GATEWAY_HOST=0.0.0.0
-      - GATEWAY_ADMIN_PASSWORD=${GATEWAY_ADMIN_PASSWORD:-admin}
+      - GATEWAY_ADMIN_PASSWORD=${GATEWAY_ADMIN_PASSWORD:-}
       - GATEWAY_TOOL_MODE=${GATEWAY_TOOL_MODE:-orchestrate}
       - GATEWAY_MAX_TOOL_ROUNDS=${GATEWAY_MAX_TOOL_ROUNDS:-5}
       # Context management
