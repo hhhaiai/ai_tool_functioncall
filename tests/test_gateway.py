@@ -1465,6 +1465,30 @@ class NativeGatewayTests(unittest.TestCase):
                     urllib.request.urlopen(unauth, timeout=5).read()
                 self.assertEqual(cm.exception.code, 401)
 
+                malformed_unauth = urllib.request.Request(
+                    base + "/v1/tools/call",
+                    data=b"{",
+                    headers={"content-type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    urllib.request.urlopen(malformed_unauth, timeout=5).read()
+                self.assertEqual(cm.exception.code, 401)
+
+                cfg["gateway"]["max_request_body_bytes"] = 16
+                gateway.save_config(cfg)
+                oversized_unauth = urllib.request.Request(
+                    base + "/v1/tools/call",
+                    data=json.dumps({"padding": "x" * 128}).encode("utf-8"),
+                    headers={"content-type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    urllib.request.urlopen(oversized_unauth, timeout=5).read()
+                self.assertEqual(cm.exception.code, 401)
+
+                cfg["gateway"]["max_request_body_bytes"] = 64 * 1024 * 1024
+                gateway.save_config(cfg)
                 valid = urllib.request.Request(
                     base + "/v1/tools/call",
                     data=body,

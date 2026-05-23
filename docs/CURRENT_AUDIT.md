@@ -150,6 +150,10 @@
    - 问题：`_read_json()` / `_read_form()` 直接按 `Content-Length` 把请求体读入内存。即使后续上下文压缩能处理大 prompt，恶意或误配置的大请求也会在进入业务逻辑前消耗网关内存；Admin form 也可能在校验前读取超大 body。
    - 修复：新增 `gateway.max_request_body_bytes` / `GATEWAY_MAX_REQUEST_BODY_BYTES`，默认 64MB；API JSON 与 Admin form 共用 `_read_limited_body()`，超限在读取前返回结构化 413 `request body too large`，并避免 Admin 配置被修改；新增 2 条回归测试。
 
+28. **受保护 API POST 在鉴权前解析 body**
+   - 问题：`/v1/*` 与 direct tool POST 路由先 `_read_json()` 再 `_check_downstream_key()`；当配置了下游 key 时，未授权请求仍会触发 JSON 解析、请求体大小检查和潜在 500/413，增加无效请求的资源消耗与错误面。
+   - 修复：受保护 API POST 现在先校验 downstream key，再读取/解析 JSON body；未授权 malformed JSON 和 oversized body 都稳定返回 401，不再进入 body 解析路径；扩展下游鉴权回归测试覆盖该顺序。
+
 ## 4. 当前验证结果
 
 ```bash

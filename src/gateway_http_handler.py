@@ -596,8 +596,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 _redirect(self, "/ui")
                 return
             if path in SUPPORTED_PATHS or path in TOKEN_COUNT_PATHS or path in DIRECT_TOOL_CALL_PATHS:
-                body = _read_json(self)
                 downstream_key = _check_downstream_key(self)
+                body = _read_json(self)
                 if path in TOKEN_COUNT_PATHS:
                     from .gateway_tool_runtime import token_count_response
                     response = token_count_response(body)

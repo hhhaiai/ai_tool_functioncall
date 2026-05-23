@@ -207,7 +207,7 @@ curl http://127.0.0.1:8885/healthz
 
 HTTP Action 执行遵循真实 executor 契约：`GET` / `DELETE` 使用 query，`POST` / `PUT` / `PATCH` 使用 JSON body，`headers` 可通过 `${ENV_NAME}` 注入环境变量，`max_bytes` 默认限制响应体为 1MB；HTTP/URL/响应超限错误会记录为 tool failure，且默认不重试以避免外部副作用重复执行。
 
-Gateway 会在读取前限制 HTTP POST 请求体大小：`gateway.max_request_body_bytes` / `GATEWAY_MAX_REQUEST_BODY_BYTES` 默认 64MB，超限返回结构化 413，避免 API 请求或 Admin form 在进入上下文压缩/业务校验前占用过多内存。
+Gateway 会在读取前限制 HTTP POST 请求体大小：`gateway.max_request_body_bytes` / `GATEWAY_MAX_REQUEST_BODY_BYTES` 默认 64MB，超限返回结构化 413，避免 API 请求或 Admin form 在进入上下文压缩/业务校验前占用过多内存。配置了 downstream key 时，受保护 `/v1/*` 和 direct-tool POST 会先校验 key，再读取/解析 JSON body；未授权 malformed/oversized body 仍返回 401。
 
 请求/响应日志和 Admin 配置展示会递归遮盖常见敏感字段，包括 `Authorization`、`X-API-Key`、`Cookie`、token、secret、password、`key_hash` 等；`must_change_password` 等非敏感状态字段会保留原值。
 
