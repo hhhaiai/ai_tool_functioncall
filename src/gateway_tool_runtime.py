@@ -895,8 +895,15 @@ def _execute_tool_call(call: ToolCall, provider: str | None = None) -> ToolResul
     call = _normalize_tool_call(call)
     tool = BUILTIN_TOOLS.get(call.name)
     mcp_target = None if tool else _mcp_parse_public_name(call.name)
+    http_action = None if tool or mcp_target else (_http_action_by_name(call.name) or _http_action_by_name(original_name))
     cfg = _gateway_config() if callable(_gateway_config) else _gateway_config
     max_retries = cfg.get("tool_max_retries", 1) if isinstance(cfg, dict) else 1
+    if http_action:
+        try:
+            max_retries = int(http_action.get("max_retries", 0) or 0)
+        except (TypeError, ValueError):
+            max_retries = 0
+        max_retries = max(0, max_retries)
     provider = provider or "unknown"
     last_exc: Exception | None = None
     last_result: ToolResult | None = None
@@ -926,7 +933,6 @@ def _execute_tool_call(call: ToolCall, provider: str | None = None) -> ToolResul
                 content = _mcp_call_tool(server, mcp_tool_name, call.arguments)
                 _record_tool_stat(call.name, True)
                 return ToolResult(call_id=call.call_id, name=call.name, content=content, success=True)
-            http_action = _http_action_by_name(call.name) or _http_action_by_name(original_name)
             if http_action:
                 content = _call_http_action(http_action, call.arguments)
                 _record_tool_stat(call.name, True)

@@ -3,7 +3,7 @@
 **Project:** ai_tool_functioncall gateway
 **Last Updated:** 2026-05-23
 **Status:** Core conversions and runtime lifecycle verified in the split-module gateway
-**Test Suite:** 142 unittest cases passing
+**Test Suite:** 146 unittest cases passing
 
 ---
 
@@ -258,7 +258,7 @@ Current probe sends a simple request with tools and checks if the response conta
 ## 6. Test Coverage Summary
 
 ```
-Total tests:    142 unittest cases
+Total tests:    146 unittest cases
 Result:         OK
 Coverage focus: protocol conversion, streaming tool events, tool orchestration, context fan-out, SQLite memory/logging, HTTP routing/auth, MCP, HTTP Actions, workspace sandbox, provider failure semantics
 ```
@@ -281,4 +281,4 @@ Coverage focus: protocol conversion, streaming tool events, tool orchestration, 
 
 - `case.txt` — Real curl commands and responses from fufu and 47.85 providers
 - `tool_gateway_audit_report.md` — Comprehensive audit of architecture and gaps
-- Test suite — 130 automated unittest cases covering protocol conversion, streaming, orchestration, auth, context, MCP, HTTP Actions, sandboxing, and tracing
+- Test suite — 146 automated unittest cases covering protocol conversion, streaming, orchestration, auth, context, MCP, HTTP Actions, sandboxing, provider failure semantics, and tracing

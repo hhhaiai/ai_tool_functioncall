@@ -60,7 +60,7 @@
 
 ```bash
 python3 -m unittest discover -s tests -v
-# 142 tests OK
+# 146 tests OK
 ```
 
 ---

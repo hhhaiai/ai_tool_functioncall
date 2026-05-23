@@ -2019,6 +2019,196 @@ while True:
                 else:
                     os.environ["GATEWAY_WORKSPACE_ROOT"] = old_root
 
+    def test_http_action_get_uses_query_and_expands_env_headers(self):
+        class EchoHandler(BaseHTTPRequestHandler):
+            seen = []
+
+            def log_message(self, fmt, *args):
+                return
+
+            def do_GET(self):  # noqa: N802
+                parsed = urllib.parse.urlparse(self.path)
+                EchoHandler.seen.append(
+                    {
+                        "path": parsed.path,
+                        "query": urllib.parse.parse_qs(parsed.query),
+                        "authorization": self.headers.get("authorization"),
+                    }
+                )
+                payload = json.dumps({"ok": True}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            old_token = os.environ.get("LOOKUP_TOKEN")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = td
+            os.environ["LOOKUP_TOKEN"] = "Bearer env-token"
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), EchoHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                cfg = gateway._default_config()
+                cfg["http_actions"] = {
+                    "enabled": True,
+                    "actions": [
+                        {
+                            "name": "lookup_http",
+                            "description": "Lookup through HTTP action",
+                            "method": "GET",
+                            "url": f"http://127.0.0.1:{httpd.server_address[1]}/lookup",
+                            "headers": {"authorization": "${LOOKUP_TOKEN}"},
+                        }
+                    ],
+                }
+                gateway.save_config(cfg)
+                result = _execute_tool_call(
+                    ToolCall("http_get", "lookup_http", {"id": "42", "active": True, "leak": "${LOOKUP_TOKEN}"}, {})
+                )
+                self.assertTrue(result.success)
+                self.assertEqual(EchoHandler.seen[0]["path"], "/lookup")
+                self.assertEqual(
+                    EchoHandler.seen[0]["query"],
+                    {"id": ["42"], "active": ["true"], "leak": ["${LOOKUP_TOKEN}"]},
+                )
+                self.assertEqual(EchoHandler.seen[0]["authorization"], "Bearer env-token")
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+                if old_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_root
+                if old_token is None:
+                    os.environ.pop("LOOKUP_TOKEN", None)
+                else:
+                    os.environ["LOOKUP_TOKEN"] = old_token
+
+    def test_http_action_http_error_records_tool_failure(self):
+        class FailingHandler(BaseHTTPRequestHandler):
+            calls = 0
+
+            def log_message(self, fmt, *args):
+                return
+
+            def do_POST(self):  # noqa: N802
+                FailingHandler.calls += 1
+                payload = b'{"error":"bad upstream"}'
+                self.send_response(503)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_sqlite_env = os.environ.get("GATEWAY_SQLITE_LOG_PATH")
+            old_ready = gateway.SQLITE_READY
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_SQLITE_LOG_PATH"] = str(pathlib.Path(td) / "trace.sqlite3")
+            gateway.SQLITE_READY = False
+            gateway._sqlite_init()
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), FailingHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                cfg = gateway._default_config()
+                cfg["http_actions"] = {
+                    "enabled": True,
+                    "actions": [
+                        {
+                            "name": "failing_http",
+                            "method": "POST",
+                            "url": f"http://127.0.0.1:{httpd.server_address[1]}/fail",
+                        }
+                    ],
+                }
+                gateway.save_config(cfg)
+                result = _execute_tool_call(ToolCall("http_fail", "failing_http", {"value": "x"}, {}), provider="test")
+                self.assertFalse(result.success)
+                self.assertEqual(result.failure_type, "http_action_failed")
+                self.assertIn("HTTP 503", result.content)
+                self.assertEqual(FailingHandler.calls, 1)
+                failures = gateway._tail_failures(10)
+                self.assertTrue(any(f.get("tool_name") == "failing_http" and f.get("failure_type") == "http_action_failed" for f in failures))
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+                gateway.SQLITE_READY = old_ready
+                if old_sqlite_env is None:
+                    os.environ.pop("GATEWAY_SQLITE_LOG_PATH", None)
+                else:
+                    os.environ["GATEWAY_SQLITE_LOG_PATH"] = old_sqlite_env
+
+    def test_http_action_response_max_bytes_is_enforced(self):
+        class LargeHandler(BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                return
+
+            def do_POST(self):  # noqa: N802
+                payload = b"x" * 64
+                self.send_response(200)
+                self.send_header("content-type", "text/plain")
+                self.send_header("content-length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), LargeHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                cfg = gateway._default_config()
+                cfg["http_actions"] = {
+                    "enabled": True,
+                    "actions": [
+                        {
+                            "name": "large_http",
+                            "method": "POST",
+                            "url": f"http://127.0.0.1:{httpd.server_address[1]}/large",
+                            "max_bytes": 16,
+                        }
+                    ],
+                }
+                gateway.save_config(cfg)
+                result = _execute_tool_call(ToolCall("http_large", "large_http", {}, {}))
+                self.assertFalse(result.success)
+                self.assertEqual(result.failure_type, "response_too_large")
+                self.assertIn("exceeded max_bytes", result.content)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+
+    def test_http_action_invalid_url_fails_as_tool_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                cfg = gateway._default_config()
+                cfg["http_actions"] = {
+                    "enabled": True,
+                    "actions": [{"name": "bad_http", "method": "POST", "url": "file:///etc/passwd"}],
+                }
+                gateway.save_config(cfg)
+                result = _execute_tool_call(ToolCall("http_bad", "bad_http", {}, {}))
+                self.assertFalse(result.success)
+                self.assertIn(result.failure_type, {"invalid_input", "http_action_failed"})
+            finally:
+                gateway.CONFIG_PATH = old_config
+
     def test_streaming_chat_request_returns_sse_without_upstream_stream_in_orchestrate_mode(self):
         class UpstreamHandler(BaseHTTPRequestHandler):
             seen_bodies = []

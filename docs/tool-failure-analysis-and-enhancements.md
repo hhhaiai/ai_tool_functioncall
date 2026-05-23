@@ -66,6 +66,16 @@ Aliases added: `ImageInfo`, `AnalyzeImage`, `image_info`, `analyze_image`, `insp
 
 `code_interpreter` now accepts markdown fenced Python code in `description`, in addition to `code` / `input` / `script` / `source`.
 
+### HTTP Actions
+
+HTTP Action executor now matches the documented production contract:
+
+- `GET` / `DELETE` arguments are encoded into query strings; mutating methods send JSON body.
+- Header values can reference environment variables with `${ENV_NAME}` so credentials do not need to live in config files.
+- Success and error responses are capped by `max_bytes` (default 1MB) to prevent large connector replies from bloating context or logs.
+- HTTP status errors, connection failures, invalid URL schemes, and response-size violations are recorded as real tool failures.
+- Actions do not retry by default, avoiding duplicate side effects for POST/PUT/PATCH services; per-action `max_retries` remains available as an explicit opt-in.
+
 ### Text intent recognition
 
 Added `IntentDetect` tool with aliases `intent_detect`, `intent_recognition`, `TextIntent`, `text_intent`.
@@ -92,6 +102,6 @@ python3 -m unittest discover -s tests -v
 
 Latest result:
 
-- Unit tests: latest full suite `Ran 142 tests ... OK`.
+- Unit tests: latest full suite `Ran 146 tests ... OK`.
 - Smoke repeated twice: `ok=true`.
 - Smoke checks cover: project tree, glob, Python symbols, write/edit/read, Bash coding, code interpreter, web fetch, web search, image/vision metadata, intent detection, parallel tools, cleanup, SQLite-only logging.
