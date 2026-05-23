@@ -299,7 +299,7 @@ def _record_tool_failure(*args, **kwargs) -> None:
             call_id=result.call_id or call.call_id,
             failure_type=result.failure_type,
             arguments_keys=sorted(call.arguments.keys()) if isinstance(call.arguments, dict) else [],
-            content=result.content[:1000] if result.content else "",
+            content=result.content if result.content else "",
             **kwargs,
         )
         return

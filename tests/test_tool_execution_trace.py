@@ -83,6 +83,38 @@ class TestToolFailureTraceFields(unittest.TestCase):
         providers = {r[4] for r in rows}
         self.assertEqual(providers, {"openai", "anthropic", "direct", "unknown"})
 
+    def test_failure_content_is_redacted_and_bounded(self):
+        saved_config = gateway._gateway_config
+        cfg_val = gateway._gateway_config() if callable(gateway._gateway_config) else dict(gateway._gateway_config)
+        cfg_val["max_log_payload_chars"] = 220
+        gateway._gateway_config = (lambda: cfg_val) if callable(saved_config) else cfg_val
+        try:
+            secret = "Bearer " + "live-token-value"
+            large_text = "x" * 1000
+            gateway._record_tool_failure(
+                tool_name="bad_tool",
+                call_id="t_secret",
+                failure_type="execution_failed",
+                arguments_keys=["Authorization", "safe"],
+                content=f"HTTP 500 Authorization: {secret} {large_text}",
+                execution_ms=1.0,
+                retry_count=0,
+                provider="openai",
+            )
+            conn = sqlite3.connect(self._path)
+            row = conn.execute("SELECT arguments_keys_json, content FROM tool_failures").fetchone()
+            conn.close()
+            keys = json.loads(row[0])
+            content = row[1]
+            self.assertEqual(keys, ["Authorization", "safe"])
+            self.assertLessEqual(len(content), 220)
+            self.assertIn("gateway_truncated", content)
+            self.assertIn("Authorization: Bearer ***", content)
+            self.assertNotIn("live-token-value", content)
+            self.assertNotIn(large_text, content)
+        finally:
+            gateway._gateway_config = saved_config
+
 
 class TestExecuteToolCallTiming(unittest.TestCase):
     """Verify _execute_tool_call measures execution_ms and passes it to failure records."""

@@ -9,6 +9,7 @@ import datetime as _dt
 import json
 import os
 import pathlib
+import re
 import sqlite3
 import threading
 import uuid
@@ -188,7 +189,7 @@ def _sqlite_import_legacy_logs_locked(conn: sqlite3.Connection) -> None:
                         event.get("call_id") or f"legacy_{uuid.uuid4().hex}",
                         event.get("failure_type"),
                         json.dumps(event.get("arguments_keys") or [], ensure_ascii=False),
-                        event.get("content") or "",
+                        _sanitize_tool_failure_content(event.get("content") or ""),
                         1 if event.get("fake_prompt_tools") else 0,
                         event.get("execution_ms"),
                         event.get("retry_count") or 0,
@@ -449,13 +450,14 @@ def _record_tool_failure(
     retry_count: int = 0,
     provider: str | None = None,
 ) -> None:
+    safe_content = _sanitize_tool_failure_content(content)
     event = {
         "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
         "tool_name": tool_name,
         "call_id": call_id,
         "failure_type": failure_type,
         "arguments_keys": arguments_keys,
-        "content": content,
+        "content": safe_content,
         "fake_prompt_tools": fake_prompt_tools,
         "execution_ms": execution_ms,
         "retry_count": retry_count,
@@ -521,6 +523,20 @@ def _redact_payload(value: Any) -> Any:
     return _redact_sensitive_values(value)
 
 
+_TEXT_SECRET_PATTERNS = (
+    re.compile(r"(?i)([\"']?\bauthorization[\"']?\s*[:=]\s*[\"']?(?:bearer|basic)\s+)([^\s,;\"'}]+)"),
+    re.compile(r"(?i)([\"']?\b(?:x-api-key|api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|cookie)[\"']?\s*[:=]\s*[\"']?)([^\s,;\"'}]+)"),
+    re.compile(r"(?i)(\bbearer\s+)([A-Za-z0-9._~+/=-]{8,})"),
+)
+
+
+def _redact_log_text(value: Any) -> str:
+    text = "" if value is None else str(value)
+    for pattern in _TEXT_SECRET_PATTERNS:
+        text = pattern.sub(r"\1***", text)
+    return text
+
+
 def _max_log_payload_chars(cfg: Json) -> int:
     try:
         value = int(cfg.get("max_log_payload_chars") or 200000)
@@ -569,6 +585,16 @@ def _truncate_log_payload(value: Any, max_chars: int) -> Any:
     if _compact_json_len(minimal) <= max_chars:
         return minimal
     return {"gateway_truncated": True}
+
+
+def _sanitize_tool_failure_content(content: Any) -> str:
+    from .gateway_config import _gateway_config
+
+    redacted = _redact_log_text(content)
+    truncated = _truncate_log_payload(redacted, _max_log_payload_chars(_gateway_config()))
+    if isinstance(truncated, str):
+        return truncated
+    return json.dumps(truncated, ensure_ascii=False, separators=(",", ":"))
 
 
 def _write_request_log(path: str, body: Json, status: int, response: Json | None, downstream_key: str | None) -> None:
