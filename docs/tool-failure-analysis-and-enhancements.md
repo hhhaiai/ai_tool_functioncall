@@ -102,6 +102,6 @@ python3 -m unittest discover -s tests -v
 
 Latest result:
 
-- Unit tests: latest full suite `Ran 146 tests ... OK`.
+- Unit tests: latest full suite `Ran 148 tests ... OK`.
 - Smoke repeated twice: `ok=true`.
 - Smoke checks cover: project tree, glob, Python symbols, write/edit/read, Bash coding, code interpreter, web fetch, web search, image/vision metadata, intent detection, parallel tools, cleanup, SQLite-only logging.

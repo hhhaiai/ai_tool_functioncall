@@ -183,6 +183,7 @@ curl http://127.0.0.1:8885/healthz
 | `gateway.allow_write_tools` | false | 是否允许文件写入 |
 | `gateway.allow_shell_tools` | false | 是否允许 Shell 执行 |
 | `gateway.client_snippet_api_key` | - | 客户端连接 Gateway 的 API Key；保存配置时会自动同步为可认证的 downstream key |
+| `gateway.max_request_body_bytes` | 67108864 | HTTP POST 请求体读取前上限；超限返回 413，避免大请求先占用内存 |
 | `context.max_input_tokens` | 24000 | 超过此值触发上下文压缩 |
 
 ### 3.4 环境变量对照表
@@ -200,10 +201,13 @@ curl http://127.0.0.1:8885/healthz
 | `GATEWAY_PORT` | - | 监听端口（默认 8885） |
 | `GATEWAY_HOST` | - | 监听地址（默认 0.0.0.0） |
 | `GATEWAY_SQLITE_LOG_PATH` | gateway.sqlite_log_path | SQLite 请求/工具/记忆日志路径 |
+| `GATEWAY_MAX_REQUEST_BODY_BYTES` | gateway.max_request_body_bytes | POST 请求体读取前字节上限，默认 64MB，超限返回 413 |
 
 配置文件存在但 JSON 损坏或根节点不是对象时，Gateway 会 fail closed：Admin/API 请求返回结构化 500 `invalid gateway config`，不会静默回退到默认 `admin/admin` 或无下游鉴权。修复方式是恢复有效 `.gateway_service.json`，而不是依赖代码默认值。
 
 HTTP Action 执行遵循真实 executor 契约：`GET` / `DELETE` 使用 query，`POST` / `PUT` / `PATCH` 使用 JSON body，`headers` 可通过 `${ENV_NAME}` 注入环境变量，`max_bytes` 默认限制响应体为 1MB；HTTP/URL/响应超限错误会记录为 tool failure，且默认不重试以避免外部副作用重复执行。
+
+Gateway 会在读取前限制 HTTP POST 请求体大小：`gateway.max_request_body_bytes` / `GATEWAY_MAX_REQUEST_BODY_BYTES` 默认 64MB，超限返回结构化 413，避免 API 请求或 Admin form 在进入上下文压缩/业务校验前占用过多内存。
 
 请求/响应日志和 Admin 配置展示会递归遮盖常见敏感字段，包括 `Authorization`、`X-API-Key`、`Cookie`、token、secret、password、`key_hash` 等；`must_change_password` 等非敏感状态字段会保留原值。
 
@@ -296,7 +300,7 @@ curl http://127.0.0.1:8885/v1/models \
 ### 5.4 运行测试套件
 
 ```bash
-# 运行全部测试（当前 146 个）
+# 运行全部测试（当前 148 个）
 python3 -m unittest discover -s tests -v
 
 # 运行集成测试

@@ -441,16 +441,22 @@ class NativeGatewayTests(unittest.TestCase):
         self.assertEqual(template["gateway"]["workspace_root"], "./workspace")
         self.assertFalse(template["gateway"]["allow_write_tools"])
         self.assertFalse(template["gateway"]["allow_shell_tools"])
+        self.assertEqual(template["gateway"].get("max_request_body_bytes"), 64 * 1024 * 1024)
 
         yaml_text = (repo_root / "gateway.config.yaml").read_text(encoding="utf-8")
         self.assertIn("workspace_root: ./workspace", yaml_text)
         self.assertIn("allow_write_tools: false", yaml_text)
         self.assertIn("allow_shell_tools: false", yaml_text)
+        self.assertIn("max_request_body_bytes: 67108864", yaml_text)
 
+        env_example = (repo_root / ".env.example").read_text(encoding="utf-8")
         dockerfile = (repo_root / "Dockerfile").read_text(encoding="utf-8")
         compose = (repo_root / "docker-compose.yml").read_text(encoding="utf-8")
         prod_compose = (repo_root / "docker-compose.prod.yml").read_text(encoding="utf-8")
         self.assertNotIn("GATEWAY_ADMIN_PASSWORD=admin", dockerfile)
+        self.assertIn("GATEWAY_MAX_REQUEST_BODY_BYTES=67108864", env_example)
+        self.assertIn("GATEWAY_MAX_REQUEST_BODY_BYTES=${GATEWAY_MAX_REQUEST_BODY_BYTES:-67108864}", compose)
+        self.assertIn("GATEWAY_MAX_REQUEST_BODY_BYTES=${GATEWAY_MAX_REQUEST_BODY_BYTES:-67108864}", prod_compose)
         self.assertIn("GATEWAY_ADMIN_PASSWORD=${GATEWAY_ADMIN_PASSWORD:-}", compose)
         self.assertIn("GATEWAY_ADMIN_PASSWORD=${GATEWAY_ADMIN_PASSWORD:?set GATEWAY_ADMIN_PASSWORD}", prod_compose)
 
@@ -1309,6 +1315,77 @@ class NativeGatewayTests(unittest.TestCase):
                 saved = gateway.load_config()
                 self.assertEqual(saved["gateway"]["public_base_url"], "http://same-origin.local:8885")
                 self.assertEqual(saved["gateway"]["client_snippet_api_key"], "same-origin-key")
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+
+    def test_api_post_rejects_body_over_configured_limit(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                cfg = gateway._default_config()
+                cfg["gateway"]["max_request_body_bytes"] = 32
+                gateway.save_config(cfg)
+                body = json.dumps({"name": "calculator", "arguments": {"expression": "1+1"}, "padding": "x" * 128}).encode("utf-8")
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{httpd.server_address[1]}/v1/tools/call",
+                    data=body,
+                    headers={"content-type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as err:
+                    urllib.request.urlopen(req, timeout=5).read()
+                self.assertEqual(err.exception.code, 413)
+                payload = json.loads(err.exception.read().decode("utf-8"))
+                self.assertIn("request body too large", payload["error"]["message"])
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+
+    def test_admin_post_rejects_large_form_without_mutating_config(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                cfg = gateway._default_config()
+                cfg["gateway"]["max_request_body_bytes"] = 48
+                gateway.save_config(cfg)
+                token = base64.b64encode(b"admin:admin").decode("ascii")
+                form = urllib.parse.urlencode(
+                    {
+                        "public_base_url": "http://oversized.example",
+                        "client_snippet_api_key": "oversized-key",
+                        "padding": "x" * 256,
+                    }
+                ).encode("utf-8")
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{httpd.server_address[1]}/admin/client-config",
+                    data=form,
+                    headers={
+                        "authorization": f"Basic {token}",
+                        "content-type": "application/x-www-form-urlencoded",
+                    },
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as err:
+                    urllib.request.urlopen(req, timeout=5).read()
+                self.assertEqual(err.exception.code, 413)
+                payload = json.loads(err.exception.read().decode("utf-8"))
+                self.assertIn("request body too large", payload["error"]["message"])
+                saved = gateway.load_config()
+                self.assertNotEqual(saved["gateway"].get("public_base_url"), "http://oversized.example")
+                self.assertNotEqual(saved["gateway"].get("client_snippet_api_key"), "oversized-key")
             finally:
                 httpd.shutdown()
                 httpd.server_close()

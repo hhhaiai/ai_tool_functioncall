@@ -39,6 +39,10 @@ class GatewayBusyError(GatewayError):
     status = 429
 
 
+class RequestBodyTooLargeError(GatewayError):
+    status = 413
+
+
 class ConfigError(GatewayError):
     status = 500
 

@@ -33,7 +33,7 @@
 | 4 | `_get_long_context_upstream()` 直接改 `os.environ` 有竞态 | 当前工作区不成立 | 当前函数直接构造 `NativeProxyClient(base_url/api_key/model)`，没有修改 `os.environ`。 |
 | 5 | 流式文本 fallback 缺 `text_fallback` 标志 | 当前工作区已修 | `gateway_streaming.py` 识别文本工具调用后设置 `text_fallback=True`，并复用 runtime 的 `_append_text_tool_results()` / `_append_tool_results()` 回填路径；orchestrate-stream 调上游时强制非 stream。 |
 | 6 | `.bak` 文件残留 | 真实存在，已清理 | 删除 `src/gateway_tool_runtime.py.bak`。 |
-| 7 | 测试覆盖盲区 | 外部结论过时/夸大 | 当前有 146 个 unittest，覆盖协议转换、流式、工具编排、上下文 fan-out、SQLite 记忆、HTTP 路由、MCP、HTTP Action、鉴权、路径沙箱和 provider 失败语义等。仍可继续加强真实 provider 集成测试。 |
+| 7 | 测试覆盖盲区 | 外部结论过时/夸大 | 当前有 148 个 unittest，覆盖协议转换、流式、工具编排、上下文 fan-out、SQLite 记忆、HTTP 路由、MCP、HTTP Action、鉴权、路径沙箱和 provider 失败语义等。仍可继续加强真实 provider 集成测试。 |
 | 8 | `__getattr__` shim 每次 miss import，脆弱 | 当前工作区已修 | 已删除 `gateway_tool_runtime.py` 末尾动态 `__getattr__`；旧入口兼容由 `gateway_app.py` 的显式重导出和 module wrapper 承担。 |
 
 ## 3. 本轮实际发现并修复的当前回归
@@ -146,6 +146,10 @@
    - 问题：HTTP Action 文档承诺 `GET` / `DELETE` 使用 query、`headers` 支持 `${ENV}`、`max_bytes` 限制响应、HTTP/URL 错误记录为 tool failure；旧实现总是 JSON body、header 不展开、失败以成功 tool result 返回，且 POST action 默认重试会重复触发外部副作用。
    - 修复：HTTP Action 现在只允许绝对 `http(s)` URL；`GET` / `DELETE` 把 arguments 追加到 query；header 配置支持 `${ENV}` 展开，query 参数只做 JSON-safe 字符串化；成功和错误响应均执行 `max_bytes` 上限；HTTP 4xx/5xx、连接失败、非法 URL、响应超限都走 `ToolExecutionError` 并写入 `tool_failures`；HTTP Action 默认不重试，只有 action 显式 `max_retries` 才重试；新增 4 条回归测试。
 
+27. **HTTP POST 请求体缺少读取前上限**
+   - 问题：`_read_json()` / `_read_form()` 直接按 `Content-Length` 把请求体读入内存。即使后续上下文压缩能处理大 prompt，恶意或误配置的大请求也会在进入业务逻辑前消耗网关内存；Admin form 也可能在校验前读取超大 body。
+   - 修复：新增 `gateway.max_request_body_bytes` / `GATEWAY_MAX_REQUEST_BODY_BYTES`，默认 64MB；API JSON 与 Admin form 共用 `_read_limited_body()`，超限在读取前返回结构化 413 `request body too large`，并避免 Admin 配置被修改；新增 2 条回归测试。
+
 ## 4. 当前验证结果
 
 ```bash
@@ -156,7 +160,7 @@ bash -n scripts/mimo_gateway.sh scripts/deploy.sh scripts/generate-ssl.sh script
 # OK
 
 python3 -m unittest discover -s tests -v
-# Ran 146 tests ... OK
+# Ran 148 tests ... OK
 
 # HTTP/UI smoke
 # GET /, /healthz, /ui, /client-config.json, /client-config

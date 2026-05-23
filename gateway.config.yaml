@@ -66,6 +66,7 @@ gateway:
   max_tool_rounds: 10                # 最大工具调用轮数
   tool_execution_timeout_seconds: 60 # 单次工具执行超时
   max_concurrent_requests: 32        # 最大并发请求数
+  max_request_body_bytes: 67108864   # POST 请求体读取前上限（默认 64MB，超限返回 413）
 
   # 日志
   request_logging: true

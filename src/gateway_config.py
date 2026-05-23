@@ -133,6 +133,7 @@ def _default_config() -> Json:
             "logging_backend": os.environ.get("GATEWAY_LOGGING_BACKEND", "sqlite"),
             "sqlite_log_path": str(_sqlite_path()),
             "max_concurrent_requests": _env_int("GATEWAY_MAX_CONCURRENT_REQUESTS", 32),
+            "max_request_body_bytes": _env_int("GATEWAY_MAX_REQUEST_BODY_BYTES", 64 * 1024 * 1024),
             "concurrency_queue_timeout_seconds": _env_float("GATEWAY_CONCURRENCY_QUEUE_TIMEOUT", 5.0),
             "tool_execution_timeout_seconds": _env_float("GATEWAY_TOOL_EXECUTION_TIMEOUT", 60.0),
             "record_unsupported_tools": _env_bool("GATEWAY_RECORD_UNSUPPORTED_TOOLS", True),

@@ -37,6 +37,7 @@
     "max_tool_rounds": 10,
     "tool_execution_timeout_seconds": 60,
     "max_concurrent_requests": 32,
+    "max_request_body_bytes": 67108864,
     "request_logging": true,
     "logging_backend": "sqlite",
     "sqlite_log_path": "gateway_log.sqlite3",

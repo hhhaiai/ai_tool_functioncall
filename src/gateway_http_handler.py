@@ -53,11 +53,39 @@ def _text_response(handler: BaseHTTPRequestHandler, status: int, payload: str, c
     handler.wfile.write(body)
 
 
-def _read_json(handler: BaseHTTPRequestHandler) -> Json:
-    content_length = int(handler.headers.get("Content-Length", 0))
+def _request_body_limit() -> int:
+    from .gateway_config import _gateway_config
+    try:
+        value = int(_gateway_config().get("max_request_body_bytes") or 64 * 1024 * 1024)
+    except (TypeError, ValueError):
+        value = 64 * 1024 * 1024
+    return max(1, value)
+
+
+def _request_content_length(handler: BaseHTTPRequestHandler) -> int:
+    raw = handler.headers.get("Content-Length", "0")
+    try:
+        return max(0, int(raw or 0))
+    except (TypeError, ValueError) as exc:
+        from .gateway_errors import GatewayError
+        raise GatewayError("invalid Content-Length header") from exc
+
+
+def _read_limited_body(handler: BaseHTTPRequestHandler) -> bytes:
+    content_length = _request_content_length(handler)
     if content_length == 0:
+        return b""
+    limit = _request_body_limit()
+    if content_length > limit:
+        from .gateway_errors import RequestBodyTooLargeError
+        raise RequestBodyTooLargeError(f"request body too large: {content_length} bytes exceeds limit {limit}")
+    return handler.rfile.read(content_length)
+
+
+def _read_json(handler: BaseHTTPRequestHandler) -> Json:
+    raw = _read_limited_body(handler)
+    if not raw:
         return {}
-    raw = handler.rfile.read(content_length)
     try:
         return json.loads(raw.decode("utf-8"))
     except json.JSONDecodeError as e:
@@ -149,10 +177,10 @@ def _check_downstream_key(handler: BaseHTTPRequestHandler) -> str | None:
 
 
 def _read_form(handler: BaseHTTPRequestHandler) -> dict[str, str]:
-    content_length = int(handler.headers.get("Content-Length", 0))
-    if content_length == 0:
+    body = _read_limited_body(handler)
+    if not body:
         return {}
-    raw = handler.rfile.read(content_length).decode("utf-8")
+    raw = body.decode("utf-8")
     content_type = handler.headers.get("Content-Type", "")
     if "application/json" in content_type:
         try:
