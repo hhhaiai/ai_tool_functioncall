@@ -40,6 +40,7 @@
     "max_request_body_bytes": 67108864,
     "request_logging": true,
     "logging_backend": "sqlite",
+    "max_log_payload_chars": 200000,
     "sqlite_log_path": "gateway_log.sqlite3",
     "local_planner_enabled": true,
     "local_planner_max_files": 24,

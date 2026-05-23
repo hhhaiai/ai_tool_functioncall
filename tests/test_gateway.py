@@ -442,12 +442,14 @@ class NativeGatewayTests(unittest.TestCase):
         self.assertFalse(template["gateway"]["allow_write_tools"])
         self.assertFalse(template["gateway"]["allow_shell_tools"])
         self.assertEqual(template["gateway"].get("max_request_body_bytes"), 64 * 1024 * 1024)
+        self.assertEqual(template["gateway"].get("max_log_payload_chars"), 200000)
 
         yaml_text = (repo_root / "gateway.config.yaml").read_text(encoding="utf-8")
         self.assertIn("workspace_root: ./workspace", yaml_text)
         self.assertIn("allow_write_tools: false", yaml_text)
         self.assertIn("allow_shell_tools: false", yaml_text)
         self.assertIn("max_request_body_bytes: 67108864", yaml_text)
+        self.assertIn("max_log_payload_chars: 200000", yaml_text)
 
         env_example = (repo_root / ".env.example").read_text(encoding="utf-8")
         dockerfile = (repo_root / "Dockerfile").read_text(encoding="utf-8")
@@ -455,8 +457,11 @@ class NativeGatewayTests(unittest.TestCase):
         prod_compose = (repo_root / "docker-compose.prod.yml").read_text(encoding="utf-8")
         self.assertNotIn("GATEWAY_ADMIN_PASSWORD=admin", dockerfile)
         self.assertIn("GATEWAY_MAX_REQUEST_BODY_BYTES=67108864", env_example)
+        self.assertIn("GATEWAY_MAX_LOG_PAYLOAD_CHARS=200000", env_example)
         self.assertIn("GATEWAY_MAX_REQUEST_BODY_BYTES=${GATEWAY_MAX_REQUEST_BODY_BYTES:-67108864}", compose)
+        self.assertIn("GATEWAY_MAX_LOG_PAYLOAD_CHARS=${GATEWAY_MAX_LOG_PAYLOAD_CHARS:-200000}", compose)
         self.assertIn("GATEWAY_MAX_REQUEST_BODY_BYTES=${GATEWAY_MAX_REQUEST_BODY_BYTES:-67108864}", prod_compose)
+        self.assertIn("GATEWAY_MAX_LOG_PAYLOAD_CHARS=${GATEWAY_MAX_LOG_PAYLOAD_CHARS:-200000}", prod_compose)
         self.assertIn("GATEWAY_ADMIN_PASSWORD=${GATEWAY_ADMIN_PASSWORD:-}", compose)
         self.assertIn("GATEWAY_ADMIN_PASSWORD=${GATEWAY_ADMIN_PASSWORD:?set GATEWAY_ADMIN_PASSWORD}", prod_compose)
 
@@ -1596,6 +1601,51 @@ class NativeGatewayTests(unittest.TestCase):
                     os.environ.pop("GATEWAY_TOOL_FAILURE_LOG", None)
                 else:
                     os.environ["GATEWAY_TOOL_FAILURE_LOG"] = old_failure_env
+
+    def test_request_log_truncates_large_payloads(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_request_log = gateway.REQUEST_LOG_PATH
+            old_stats = gateway.STATS_PATH
+            old_ready = gateway.SQLITE_READY
+            old_sqlite_env = os.environ.get("GATEWAY_SQLITE_LOG_PATH")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            gateway.REQUEST_LOG_PATH = pathlib.Path(td) / "requests.jsonl"
+            gateway.STATS_PATH = pathlib.Path(td) / "stats.json"
+            os.environ["GATEWAY_SQLITE_LOG_PATH"] = str(pathlib.Path(td) / "gateway.sqlite3")
+            gateway.SQLITE_READY = False
+            try:
+                cfg = gateway._default_config()
+                cfg["gateway"]["logging_backend"] = "sqlite"
+                cfg["gateway"]["max_log_payload_chars"] = 120
+                gateway.save_config(cfg)
+                large_text = "x" * 1000
+                gateway._write_request_log(
+                    "/v1/messages",
+                    {"messages": [{"role": "user", "content": large_text}]},
+                    200,
+                    {"content": [{"type": "text", "text": large_text}]},
+                    "test-key",
+                )
+                row = gateway._tail_requests(1)[0]
+                self.assertTrue(row["request"].get("gateway_truncated"))
+                self.assertTrue(row["response"].get("gateway_truncated"))
+                request_json = json.dumps(row["request"], ensure_ascii=False)
+                response_json = json.dumps(row["response"], ensure_ascii=False)
+                self.assertLessEqual(len(request_json), 220)
+                self.assertLessEqual(len(response_json), 220)
+                self.assertIn("omitted", request_json)
+                self.assertNotIn(large_text, request_json)
+                self.assertNotIn(large_text, response_json)
+            finally:
+                gateway.CONFIG_PATH = old_config
+                gateway.REQUEST_LOG_PATH = old_request_log
+                gateway.STATS_PATH = old_stats
+                gateway.SQLITE_READY = old_ready
+                if old_sqlite_env is None:
+                    os.environ.pop("GATEWAY_SQLITE_LOG_PATH", None)
+                else:
+                    os.environ["GATEWAY_SQLITE_LOG_PATH"] = old_sqlite_env
 
     def test_request_log_redacts_common_secret_fields(self):
         redacted = gateway._redact_payload(

@@ -60,7 +60,7 @@
 
 ```bash
 python3 -m unittest discover -s tests -v
-# 148 tests OK
+# 149 tests OK
 ```
 
 ---
@@ -185,4 +185,5 @@ src/
 - 请求/响应日志和 Admin 配置展示会递归遮盖常见敏感字段（token、secret、password、cookie、API key、key hash 等），避免运维面泄漏凭据。
 - Admin 写操作会拒绝跨源浏览器 Origin/Referer 请求；无来源头的 CLI/脚本请求仍保持兼容。
 - HTTP POST 请求体有读取前上限，默认 64MB；可通过 `gateway.max_request_body_bytes` / `GATEWAY_MAX_REQUEST_BODY_BYTES` 调整，超限返回 413。
+- 请求/响应日志会先遮盖敏感字段，再按 `gateway.max_log_payload_chars` / `GATEWAY_MAX_LOG_PAYLOAD_CHARS` 截断，避免 SQLite/JSONL 膨胀。
 - `gateway_app.py` 当前保留旧单体兼容导出层，新增实现应优先放入对应 `gateway_*` 模块。

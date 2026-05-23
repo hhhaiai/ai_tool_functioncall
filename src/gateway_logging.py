@@ -521,19 +521,72 @@ def _redact_payload(value: Any) -> Any:
     return _redact_sensitive_values(value)
 
 
+def _max_log_payload_chars(cfg: Json) -> int:
+    try:
+        value = int(cfg.get("max_log_payload_chars") or 200000)
+    except (TypeError, ValueError):
+        value = 200000
+    return max(1, value)
+
+
+def _compact_json_len(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+
+
+def _truncate_log_payload(value: Any, max_chars: int) -> Any:
+    if value is None:
+        return None
+    rendered = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if len(rendered) <= max_chars:
+        return value
+    original_chars = len(rendered)
+
+    def summary(preview_chars: int) -> Json:
+        preview_chars = max(0, preview_chars)
+        return {
+            "gateway_truncated": True,
+            "original_chars": original_chars,
+            "max_chars": max_chars,
+            "omitted_chars": max(0, original_chars - preview_chars),
+            "preview": rendered[:preview_chars],
+        }
+
+    # Keep the stored truncation summary itself within the configured budget
+    # whenever possible. Very small budgets still keep a machine-readable marker.
+    preview_budget = max_chars
+    while preview_budget > 0:
+        candidate = summary(preview_budget)
+        if _compact_json_len(candidate) <= max_chars:
+            return candidate
+        preview_budget //= 2
+    minimal: Json = {
+        "gateway_truncated": True,
+        "original_chars": original_chars,
+        "max_chars": max_chars,
+        "omitted_chars": original_chars,
+        "preview": "",
+    }
+    if _compact_json_len(minimal) <= max_chars:
+        return minimal
+    return {"gateway_truncated": True}
+
+
 def _write_request_log(path: str, body: Json, status: int, response: Json | None, downstream_key: str | None) -> None:
     from .gateway_config import _gateway_config
     cfg = _gateway_config()
     if not cfg.get("request_logging", True):
         return
+    max_payload_chars = _max_log_payload_chars(cfg)
+    redacted_request = _redact_payload(body)
+    redacted_response = _redact_payload(response) if response else None
     event = {
         "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
         "request_id": f"req_{uuid.uuid4().hex}",
         "path": path,
         "status": status,
         "downstream_key": downstream_key,
-        "request": _redact_payload(body),
-        "response": _redact_payload(response) if response else None,
+        "request": _truncate_log_payload(redacted_request, max_payload_chars),
+        "response": _truncate_log_payload(redacted_response, max_payload_chars),
         "fake_prompt_tools": False,
     }
     if _logging_backend() == "sqlite":

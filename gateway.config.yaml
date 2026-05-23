@@ -71,6 +71,7 @@ gateway:
   # 日志
   request_logging: true
   logging_backend: sqlite            # sqlite | jsonl
+  max_log_payload_chars: 200000      # 单个 request/response 日志 payload 截断上限，防止 SQLite 膨胀
   sqlite_log_path: gateway_log.sqlite3
 
   # 本地规划器（自动分析代码上下文）

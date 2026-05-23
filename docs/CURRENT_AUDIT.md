@@ -33,7 +33,7 @@
 | 4 | `_get_long_context_upstream()` 直接改 `os.environ` 有竞态 | 当前工作区不成立 | 当前函数直接构造 `NativeProxyClient(base_url/api_key/model)`，没有修改 `os.environ`。 |
 | 5 | 流式文本 fallback 缺 `text_fallback` 标志 | 当前工作区已修 | `gateway_streaming.py` 识别文本工具调用后设置 `text_fallback=True`，并复用 runtime 的 `_append_text_tool_results()` / `_append_tool_results()` 回填路径；orchestrate-stream 调上游时强制非 stream。 |
 | 6 | `.bak` 文件残留 | 真实存在，已清理 | 删除 `src/gateway_tool_runtime.py.bak`。 |
-| 7 | 测试覆盖盲区 | 外部结论过时/夸大 | 当前有 148 个 unittest，覆盖协议转换、流式、工具编排、上下文 fan-out、SQLite 记忆、HTTP 路由、MCP、HTTP Action、鉴权、路径沙箱和 provider 失败语义等。仍可继续加强真实 provider 集成测试。 |
+| 7 | 测试覆盖盲区 | 外部结论过时/夸大 | 当前有 149 个 unittest，覆盖协议转换、流式、工具编排、上下文 fan-out、SQLite 记忆、HTTP 路由、MCP、HTTP Action、鉴权、路径沙箱和 provider 失败语义等。仍可继续加强真实 provider 集成测试。 |
 | 8 | `__getattr__` shim 每次 miss import，脆弱 | 当前工作区已修 | 已删除 `gateway_tool_runtime.py` 末尾动态 `__getattr__`；旧入口兼容由 `gateway_app.py` 的显式重导出和 module wrapper 承担。 |
 
 ## 3. 本轮实际发现并修复的当前回归
@@ -154,6 +154,10 @@
    - 问题：`/v1/*` 与 direct tool POST 路由先 `_read_json()` 再 `_check_downstream_key()`；当配置了下游 key 时，未授权请求仍会触发 JSON 解析、请求体大小检查和潜在 500/413，增加无效请求的资源消耗与错误面。
    - 修复：受保护 API POST 现在先校验 downstream key，再读取/解析 JSON body；未授权 malformed JSON 和 oversized body 都稳定返回 401，不再进入 body 解析路径；扩展下游鉴权回归测试覆盖该顺序。
 
+29. **请求/响应日志 payload 无截断上限**
+   - 问题：`_write_request_log()` 对 request/response 只做敏感字段遮盖，然后原样写入 SQLite/JSONL。长 prompt、fan-out 结果或大工具响应会让 `request_logs` 快速膨胀，也会让 Admin tail 查询变重。
+   - 修复：新增 `gateway.max_log_payload_chars` / `GATEWAY_MAX_LOG_PAYLOAD_CHARS`，默认 200000；日志先 redaction 后按方向截断，并保留 `gateway_truncated`、原始长度、截断预算和预览信息；公开模板/compose 同步暴露该配置；新增回归测试覆盖 SQLite tail 返回截断摘要而非原始大文本。
+
 ## 4. 当前验证结果
 
 ```bash
@@ -164,7 +168,7 @@ bash -n scripts/mimo_gateway.sh scripts/deploy.sh scripts/generate-ssl.sh script
 # OK
 
 python3 -m unittest discover -s tests -v
-# Ran 148 tests ... OK
+# Ran 149 tests ... OK
 
 # HTTP/UI smoke
 # GET /, /healthz, /ui, /client-config.json, /client-config

@@ -131,6 +131,7 @@ def _default_config() -> Json:
             "allow_shell_tools": os.environ.get("GATEWAY_ALLOW_SHELL_TOOLS", "0") in {"1", "true", "yes"},
             "request_logging": True,
             "logging_backend": os.environ.get("GATEWAY_LOGGING_BACKEND", "sqlite"),
+            "max_log_payload_chars": _env_int("GATEWAY_MAX_LOG_PAYLOAD_CHARS", 200000),
             "sqlite_log_path": str(_sqlite_path()),
             "max_concurrent_requests": _env_int("GATEWAY_MAX_CONCURRENT_REQUESTS", 32),
             "max_request_body_bytes": _env_int("GATEWAY_MAX_REQUEST_BODY_BYTES", 64 * 1024 * 1024),
