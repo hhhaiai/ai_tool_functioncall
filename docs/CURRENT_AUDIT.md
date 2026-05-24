@@ -2,6 +2,12 @@
 
 本文件记录本轮对 `ai_tool_functioncall` 当前工作区的结构审计、风险点核验和回归修复结果。
 
+补充运行验证：当前工作区支持 Claude Code / Anthropic SDK 常见的
+`ANTHROPIC_BASE_URL=http://127.0.0.1:8885/anthropic` 接入方式；
+`/anthropic/v1/messages` 与 `/anthropic/v1/messages/count_tokens` 会在 HTTP 入口规范化为
+`/v1/messages` 与 `/v1/messages/count_tokens`，下游 key 可通过
+`Authorization: Bearer <key>` 或 `x-api-key: <key>` 提交。
+
 ## 1. 总体判断
 
 当前工程定位与用户描述一致：它不是上游 API，也不是下游客户端，而是位于二者之间的 **Gateway 中游层**。
@@ -33,7 +39,7 @@
 | 4 | `_get_long_context_upstream()` 直接改 `os.environ` 有竞态 | 当前工作区不成立 | 当前函数直接构造 `NativeProxyClient(base_url/api_key/model)`，没有修改 `os.environ`。 |
 | 5 | 流式文本 fallback 缺 `text_fallback` 标志 | 当前工作区已修 | `gateway_streaming.py` 识别文本工具调用后设置 `text_fallback=True`，并复用 runtime 的 `_append_text_tool_results()` / `_append_tool_results()` 回填路径；orchestrate-stream 调上游时强制非 stream。 |
 | 6 | `.bak` 文件残留 | 真实存在，已清理 | 删除 `src/gateway_tool_runtime.py.bak`。 |
-| 7 | 测试覆盖盲区 | 外部结论过时/夸大 | 当前有 150 个 unittest，覆盖协议转换、流式、工具编排、上下文 fan-out、SQLite 记忆、HTTP 路由、MCP、HTTP Action、鉴权、路径沙箱和 provider 失败语义等。仍可继续加强真实 provider 集成测试。 |
+| 7 | 测试覆盖盲区 | 外部结论过时/夸大 | 当前有 167 个 pytest 回归测试，覆盖协议转换、流式、工具编排、上下文 fan-out、SQLite 记忆、HTTP 路由、MCP、HTTP Action、鉴权、路径沙箱和 provider 失败语义等。仍可继续加强真实 provider 集成测试。 |
 | 8 | `__getattr__` shim 每次 miss import，脆弱 | 当前工作区已修 | 已删除 `gateway_tool_runtime.py` 末尾动态 `__getattr__`；旧入口兼容由 `gateway_app.py` 的显式重导出和 module wrapper 承担。 |
 
 ## 3. 本轮实际发现并修复的当前回归
@@ -162,21 +168,81 @@
    - 问题：`tool_failures.content` 由各调用点手动截断，低层记录入口没有统一脱敏/封顶；HTTP Action、MCP 或工具异常详情可能把长响应、错误页面或文本 token 写入 SQLite/JSONL。
    - 修复：`_record_tool_failure()` 与 legacy failure import 现在统一先遮盖文本中的 Authorization/API key/token/secret/password/cookie，再复用 `gateway.max_log_payload_chars` 截断；调用点不再各自 `[:1000]`；新增回归测试覆盖失败内容不泄露 secret 且不落入原始大文本。
 
+31. **Admin 数字字段非法值会触发 500 或部分写入风险**
+   - 问题：`/admin/config`、`/admin/upstream-profile`、`/admin/client-config` 的数字字段原先分散使用 `int()` / `float()`；非法值可能冒泡到 500，且在保存前已经修改内存中的部分配置对象。
+   - 修复：新增统一 `_admin_form_int()` / `_admin_form_float()`；非法数字统一返回 400 `invalid numeric field: <field>`，并在 `save_config()` 前停止，保证配置文件不发生部分写入；新增回归测试覆盖 gateway/context/client/upstream/profile 数字字段。
+
+32. **Admin 部分表单提交会把已有数字配置重置为默认值**
+   - 问题：缺失数字字段曾 fallback 到硬编码默认值，而不是已有配置；脚本或旧客户端做部分 POST 时可能重置 `max_concurrent_requests`、context fanout 或 client token limit 等值。
+   - 修复：数字解析优先级改为“提交值 > 旧配置 > 默认值”；空字符串视为缺失；新增回归测试覆盖 `/admin/config` 与 `/admin/client-config` 缺字段保留旧值。
+
+33. **`gateway.max_tool_rounds` 保存后未被 runtime 使用**
+   - 问题：Admin UI/配置文件可保存 `gateway.max_tool_rounds`，但非流式和流式 runtime 只读 `GATEWAY_MAX_TOOL_ROUNDS` 环境变量，导致 UI 保存值不生效。
+   - 修复：新增 `_configured_max_tool_rounds()`，运行时优先级为环境变量 > `gateway.max_tool_rounds` > 默认 5；非流式和流式编排共用；新增 FakeClient 回归测试证明配置值会限制工具循环。
+
+34. **Claude Code `/anthropic` base URL 与严格 Anthropic response shape**
+   - 问题：Claude Code 使用 `ANTHROPIC_BASE_URL=http://127.0.0.1:8885/anthropic` 时会请求 `/anthropic/v1/messages`，旧路由只支持 `/v1/messages`；同时 OpenAI Chat 上游转换回 Anthropic Messages 时必须返回严格 `type=message`、`role=assistant`、`stop_reason=end_turn` 等字段。
+   - 修复：新增 `/anthropic` 兼容前缀规范化；下游鉴权支持 `x-api-key`；OpenAI Chat -> Anthropic Messages 响应统一补齐 strict shape；客户端配置片段生成 `claude_mnative()`；新增回归测试覆盖路由、token count、x-api-key 和 response shape。
+
+35. **Admin UI 缺少上游模型自动获取与 capability 可视化**
+   - 问题：上游模型需要手填，tools/vision/function-call 等能力配置不够直观，容易把不支持 native tools 的上游误配置成可发原生 schema。
+   - 修复：Admin UI 重做为卡片化深色界面，直接展示/保存 tools、function calls、parallel tools、vision、streaming、JSON schema 等能力；新增 `/admin/upstream-models.json` 从真实上游 `/v1/models` 拉取模型并填充 datalist；新增回归测试覆盖 UI 关键元素和模型接口鉴权/上游鉴权。
+
+36. **`tools_enabled=auto` 未结合上游 capability 做运行时降级**
+   - 问题：即使 profile 标记 `supports_tools=false` / `supports_function_calls=false`，`auto` 模式仍可能向上游发送原生 `tools` schema。
+   - 修复：`_merge_builtin_tools()` 现在读取 active upstream capabilities；`auto` + native tools/function calls 关闭时自动走本地真实工具文本适配；`native_only` + 能力关闭时 fail-fast；新增回归测试覆盖该路径。
+
+37. **弱上游文本工具适配遇到 Claude Code 大 harness 会触发 provider `too long`**
+   - 问题：Claude Code 请求可携带大 system、system-reminder、skills 上下文和几十个工具 schema；当上游不支持 native tools、Gateway 改用文本工具适配时，如果不先压缩，真实上游可能 200 返回 `Sorry, the text you sent is too long!`。
+   - 修复：新增 `gateway.text_tool_adapter_compact_token_limit` / `GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT`；阈值动态计算为 `max(8000, min(upstream.max_input_tokens * 0.45, config_cap))`，config_cap 默认 48000，设为 0 可关闭；文本工具适配前会去掉 native tools、压缩 system/reminder 大块，并注入 `[gateway context compacted]` 标记；新增回归测试证明发送给上游的 payload 低于预算且保留用户意图。
+
+38. **用户声明的 `calc` / `expr` 工具与内置 calculator 不兼容**
+   - 问题：用户按 Anthropic tools 示例声明 `name=calc`、参数 `expr`，而 Gateway 内置工具名是 `calculator`、参数是 `expression`；直接工具调用或模型返回 `calc` 时会落入 tool_not_found 或参数不匹配。
+   - 修复：`calculator` 新增 `calc` alias，参数归一化新增 `expr -> expression`；已用 `/v1/tools/call` 和 `/v1/functions/call` 真实 curl 复验 `calc` + `expr` 返回 4/42；新增 Claude Code/Messages 与 Codex/Responses 工具编排回归，证明模型返回 `calc`/`expr` 时会执行真实工具并回填结果。
+
+39. **Admin 模型拉取 GET query 可被误用为临时上游覆盖**
+   - 问题：GET `/admin/upstream-models.json?base_url=...` 如果接受 query 覆盖，浏览器 Basic Auth 场景下可能把保存的上游 Authorization header 发到非预期 URL。
+   - 修复：GET 只使用已保存 active profile；表单临时 `base_url` / `path_models` / `api_key` 覆盖仅允许 POST body，且 POST 先经过 Admin Origin/Referer 防护；新增回归测试验证 GET query 覆盖不会触达外部 sink。
+
+40. **Codex `/v1/responses` 返回缺少 strict Responses 顶层 shape**
+   - 问题：OpenAI Chat 上游转换到 Codex/Responses 下游时，可能只返回 `output`，缺少 `object=response`、`id`、`status`、`usage` 等 Codex/SDK 常用字段。
+   - 修复：新增 Responses shape 归一化；Chat->Responses 和 Responses-like passthrough 都补齐 `id/object/model/output/status/usage`；新增回归测试覆盖普通 Responses、Codex `calc`/`expr` 工具链和空 output strict shape。
+
+41. **Admin 暴露的 `max_concurrent_requests` 之前未在 HTTP 入口强制执行**
+   - 问题：UI/配置/docs 都提供 `gateway.max_concurrent_requests` 与 `concurrency_queue_timeout_seconds`，但实际 API 路由没有获取 `_acquire_request_slot()`，导致下游并发阀门只是配置项。
+   - 修复：HTTP `/v1/*`、direct tools、token count 和 `/v1/models` 入口统一包裹 `_request_slot_scope()`，超过上限返回结构化 429；新增回归测试直接占满槽位后请求 `/v1/tools/call`，确认不会绕过并发限制。
+
+42. **Claude Code 本地文件读取 smoke 中弱上游只输出“我要读取”但不发工具调用**
+   - 问题：当上游标记不支持 native tools、Gateway 走文本工具适配时，真实上游有时不会按 `<function=Read>` 发起工具调用，而是只回答“Let me read that file”，导致本地文件读取类 smoke exit 0 但没有读到文件内容。
+   - 修复：local planner 的路径识别从仅支持 `@path` 扩展到绝对路径、相对路径和常见源码/文本文件名；对“read/show/cat/open/查看/读取”等点名文件请求，弱上游文本工具模式下 Gateway 会对“输出 marker 后面的值”这类明确请求走窄口径本地直读，直接返回真实文件值。新增回归测试覆盖绝对路径文件读取；同时修正 workspace root 优先级为请求体显式 root > 非默认 `GATEWAY_WORKSPACE_ROOT` > 保存配置 `gateway.workspace_root` > 默认根，避免启动脚本默认 `$PWD` 压过 UI 配置，也不破坏显式 env root 的 direct tool 场景。真实 Claude Code 本地文件 smoke 复验通过。
+
 ## 4. 当前验证结果
 
 ```bash
-python3 -m py_compile $(find src tests -name '*.py' -type f | sort)
+python3 -m compileall -q src tests
 # OK
 
 bash -n scripts/mimo_gateway.sh scripts/deploy.sh scripts/generate-ssl.sh scripts/claude_m1.sh scripts/install_deps.sh
 # OK
 
-python3 -m unittest discover -s tests -v
-# Ran 150 tests ... OK
+python3 -m pytest -q
+# 167 passed
 
-# HTTP/UI smoke
-# GET /, /healthz, /ui, /client-config.json, /client-config
-# OK; /healthz builtin_tool_count=67
+GATEWAY_VERIFY_MODEL_REQUESTS=0 GATEWAY_VERIFY_DIRECT_REQUESTS=24 GATEWAY_VERIFY_WORKERS=8 ./scripts/mimo_gateway.sh verify
+# 167 unittest tests OK; tool acceptance OK; security/auth guardrails OK; 24-request concurrency/performance smoke OK
+
+# HTTP/UI/API smoke on local 127.0.0.1:8885
+# GET /healthz, /ui, /admin/upstream-models.json
+# POST /v1/chat/completions, /anthropic/v1/messages, /v1/tools/call, /v1/functions/call
+# Codex /v1/responses and Claude /v1/messages calc/expr tool-chain regressions
+# Codex /v1/responses strict object=response shape
+# OK
+# artifact: .gateway_runtime/final-smoke-20260524-074454-goal-audit/summary.json
+
+# Claude Code local-file smoke
+# ANTHROPIC_BASE_URL=http://127.0.0.1:8885/anthropic ANTHROPIC_AUTH_TOKEN=<gateway-key> claude -p "Read local file <probe> and answer with only the value after gateway-local-file-probe."
+# exit 0; stdout: 2+2=4; no too-long / malformed / empty response marker
+# artifact: .gateway_runtime/claude-local-file-probe-20260524-074546-goal-audit.summary.json
 ```
 
 ## 5. 仍建议后续处理

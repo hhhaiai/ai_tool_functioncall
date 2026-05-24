@@ -110,8 +110,18 @@ curl "$BASE_URL/v1/responses" \
 
 ## 3. Anthropic Messages：`POST /v1/messages`
 
+Claude Code / Anthropic SDK 如果配置：
+
+```bash
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8885/anthropic"
+```
+
+实际请求路径会是 `/anthropic/v1/messages`；Gateway 会兼容映射到内部
+`/v1/messages`。直接 curl 时两种路径都可用：`$BASE_URL/v1/messages` 或
+`$BASE_URL/anthropic/v1/messages`。
+
 特点：
-- Header 使用 `x-api-key` 和 `anthropic-version`。
+- Header 可使用 `x-api-key` 或 `Authorization: Bearer <key>`；Anthropic 客户端通常还会带 `anthropic-version`。
 - 输入是 `messages`，但 `system` 通常是顶层字段，不放在 messages role 里。
 - 工具定义常用 `{name, description, input_schema}`。
 - 工具结果通过后续 user 消息中的 `tool_result` content block 传回。
@@ -134,6 +144,36 @@ curl "$BASE_URL/v1/messages" \
 ```
 
 ### 3.2 原生 tools 请求
+
+下面这种 `calc` / `expr` 形式已在 Gateway 中兼容到内置 `calculator` / `expression`，可直接用用户原始 curl 形态测试。
+
+> `test-gateway-key` 是占位符，实际使用时替换为 `.gateway_service.json` 中的 `gateway.client_snippet_api_key` 或环境变量 `GATEWAY_DOWNSTREAM_KEY` 的值。
+
+```bash
+curl http://127.0.0.1:8885/anthropic/v1/messages \
+  -H "Authorization: Bearer <your-gateway-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mimo-v2.5-pro",
+    "messages": [
+      {"role": "user", "content": "What is 2+2?"}
+    ],
+    "tools": [
+      {
+        "name": "calc",
+        "description": "Evaluate math expression",
+        "input_schema": {
+          "type": "object",
+          "properties": {"expr": {"type": "string"}},
+          "required": ["expr"]
+        }
+      }
+    ],
+    "max_tokens": 100
+  }'
+```
+
+通用 Anthropic tools 示例：
 
 ```bash
 curl "$BASE_URL/v1/messages" \
@@ -181,3 +221,22 @@ curl "$BASE_URL/v1/messages" \
 ```
 
 因此，真正需要自己搭建的是 **工具编排层**，不是强依赖上游 API 原生 `tools` 字段。
+
+
+## Admin: 拉取上游模型列表
+
+Admin UI 的模型下拉按钮调用同一接口：
+
+```bash
+curl -fsS -u admin:admin "$BASE_URL/admin/upstream-models.json" | python3 -m json.tool
+```
+
+如果要按表单中的临时上游配置拉取，使用 POST body，避免把临时上游 `api_key` 放入 URL/query：
+
+```bash
+curl -fsS -u admin:admin "$BASE_URL/admin/upstream-models.json" \
+  -H "content-type: application/x-www-form-urlencoded" \
+  --data-urlencode "base_url=http://upstream.local:8885" \
+  --data-urlencode "protocol=openai_chat" \
+  --data-urlencode "path_models=/v1/models"
+```

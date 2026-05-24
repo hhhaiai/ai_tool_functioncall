@@ -131,6 +131,13 @@ class NativeGatewayTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(result.content, "7")
 
+    def test_calculator_accepts_user_calc_tool_alias_and_expr_argument(self):
+        result = _execute_tool_call(
+            ToolCall(call_id="call_1", name="calc", arguments={"expr": "2+2"}, raw={})
+        )
+        self.assertTrue(result.success)
+        self.assertEqual(result.content, "4")
+
     def test_read_glob_grep_tools_respect_workspace_root(self):
         with tempfile.TemporaryDirectory() as td:
             old = os.environ.get("GATEWAY_WORKSPACE_ROOT")
@@ -558,6 +565,40 @@ class NativeGatewayTests(unittest.TestCase):
                 else:
                     os.environ["GATEWAY_UPSTREAM_STREAM_AGGREGATE"] = old_force
 
+    def test_http_api_enforces_configured_concurrency_limit_before_work(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            slot = None
+            try:
+                cfg = gateway._default_config()
+                cfg["gateway"]["client_snippet_api_key"] = "slot-key"
+                cfg["gateway"]["max_concurrent_requests"] = 1
+                cfg["gateway"]["concurrency_queue_timeout_seconds"] = 0.01
+                gateway.save_config(cfg)
+                slot = gateway._acquire_request_slot()
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{httpd.server_address[1]}/v1/tools/call",
+                    data=json.dumps({"tool": "calculator", "arguments": {"expression": "2+2"}}).encode("utf-8"),
+                    headers={"authorization": "Bearer slot-key", "content-type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as err:
+                    urllib.request.urlopen(req, timeout=5).read()
+                self.assertEqual(err.exception.code, 429)
+                payload = json.loads(err.exception.read().decode("utf-8"))
+                self.assertIn("gateway concurrency limit reached (1)", payload["error"]["message"])
+            finally:
+                if slot is not None:
+                    slot.release()
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+
     def test_direct_tool_call_accepts_anthropic_tool_use_shape(self):
         with tempfile.TemporaryDirectory() as td:
             old = os.environ.get("GATEWAY_WORKSPACE_ROOT")
@@ -865,6 +906,163 @@ class NativeGatewayTests(unittest.TestCase):
         self.assertEqual(final["choices"][0]["message"]["content"], "result is 3")
         self.assertEqual(client.requests[1][1]["messages"][-1]["content"], "3")
 
+    def test_gateway_config_max_tool_rounds_limits_orchestration_loop(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_env = os.environ.get("GATEWAY_MAX_TOOL_ROUNDS")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                os.environ.pop("GATEWAY_MAX_TOOL_ROUNDS", None)
+                cfg = gateway._default_config()
+                cfg["gateway"]["max_tool_rounds"] = 1
+                gateway.save_config(cfg)
+                client = FakeClient(
+                    [
+                        {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": None,
+                                        "tool_calls": [
+                                            {
+                                                "id": "call_1",
+                                                "type": "function",
+                                                "function": {
+                                                    "name": "calculator",
+                                                    "arguments": "{\"expression\":\"9/3\"}",
+                                                },
+                                            }
+                                        ],
+                                    },
+                                    "finish_reason": "tool_calls",
+                                }
+                            ]
+                        }
+                    ]
+                )
+                with self.assertRaises(gateway.GatewayError) as cm:
+                    run_tool_orchestration(
+                        "/v1/chat/completions",
+                        {"model": "m", "messages": [{"role": "user", "content": "calc"}]},
+                        client,
+                    )
+                self.assertEqual(str(cm.exception), "max tool rounds exceeded")
+                self.assertEqual(cm.exception.detail["max_tool_rounds"], 1)
+                self.assertEqual(len(client.requests), 1)
+            finally:
+                gateway.CONFIG_PATH = old_config
+                if old_env is None:
+                    os.environ.pop("GATEWAY_MAX_TOOL_ROUNDS", None)
+                else:
+                    os.environ["GATEWAY_MAX_TOOL_ROUNDS"] = old_env
+
+    def test_configured_max_tool_rounds_resolves_env_over_config_over_default(self):
+        from src.gateway_config import _configured_max_tool_rounds
+
+        old_env = os.environ.get("GATEWAY_MAX_TOOL_ROUNDS")
+        try:
+            # env var takes highest priority
+            os.environ["GATEWAY_MAX_TOOL_ROUNDS"] = "3"
+            self.assertEqual(_configured_max_tool_rounds({"max_tool_rounds": 99}), 3)
+
+            # config value used when env var absent
+            os.environ.pop("GATEWAY_MAX_TOOL_ROUNDS", None)
+            self.assertEqual(_configured_max_tool_rounds({"max_tool_rounds": 7}), 7)
+
+            # default 5 when neither env nor config
+            self.assertEqual(_configured_max_tool_rounds({}), 5)
+            self.assertEqual(_configured_max_tool_rounds(None), 5)
+
+            # invalid env var falls back to default
+            os.environ["GATEWAY_MAX_TOOL_ROUNDS"] = "not-a-number"
+            self.assertEqual(_configured_max_tool_rounds({}), 5)
+
+            # invalid config value falls back to default
+            os.environ.pop("GATEWAY_MAX_TOOL_ROUNDS", None)
+            self.assertEqual(_configured_max_tool_rounds({"max_tool_rounds": "bad"}), 5)
+        finally:
+            if old_env is None:
+                os.environ.pop("GATEWAY_MAX_TOOL_ROUNDS", None)
+            else:
+                os.environ["GATEWAY_MAX_TOOL_ROUNDS"] = old_env
+
+    def test_admin_form_numeric_raw_rejects_empty_keys(self):
+        from src.gateway_config import _admin_form_numeric_raw
+
+        with self.assertRaises(ValueError):
+            _admin_form_numeric_raw({}, (), None, 0)
+
+    def test_resolved_text_tool_adapter_compact_token_limit_dynamic(self):
+        from src.gateway_config import (
+            _TEXT_TOOL_ADAPTER_COMPACT_DEFAULT_CAP,
+            _TEXT_TOOL_ADAPTER_COMPACT_FLOOR,
+            _TEXT_TOOL_ADAPTER_COMPACT_RATIO,
+            _resolved_text_tool_adapter_compact_token_limit,
+        )
+
+        old_env = os.environ.get("GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT")
+        try:
+            os.environ.pop("GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT", None)
+
+            # small upstream: hits floor
+            small = {"max_input_tokens": 4000}
+            result = _resolved_text_tool_adapter_compact_token_limit({}, small)
+            self.assertEqual(result, _TEXT_TOOL_ADAPTER_COMPACT_FLOOR)
+
+            # medium upstream: dynamic = 32000 * 0.45 = 14400, below cap
+            medium = {"max_input_tokens": 32000}
+            result = _resolved_text_tool_adapter_compact_token_limit({}, medium)
+            self.assertEqual(result, int(32000 * _TEXT_TOOL_ADAPTER_COMPACT_RATIO))
+
+            # large upstream: dynamic = 128000 * 0.45 = 57600, capped at 48000
+            large = {"max_input_tokens": 128000}
+            result = _resolved_text_tool_adapter_compact_token_limit({}, large)
+            self.assertEqual(result, _TEXT_TOOL_ADAPTER_COMPACT_DEFAULT_CAP)
+
+            # 1M upstream: dynamic huge, capped at 48000
+            huge = {"max_input_tokens": 1000000}
+            result = _resolved_text_tool_adapter_compact_token_limit({}, huge)
+            self.assertEqual(result, _TEXT_TOOL_ADAPTER_COMPACT_DEFAULT_CAP)
+
+            # custom config cap overrides default
+            result = _resolved_text_tool_adapter_compact_token_limit(
+                {"text_tool_adapter_compact_token_limit": 20000}, large
+            )
+            self.assertEqual(result, 20000)
+
+            # env var overrides config cap; dynamic = 128000 * 0.45 = 57600 < 100000
+            os.environ["GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT"] = "100000"
+            result = _resolved_text_tool_adapter_compact_token_limit({}, large)
+            self.assertEqual(result, int(128000 * _TEXT_TOOL_ADAPTER_COMPACT_RATIO))
+
+            # env var cap = 200000 with 1M upstream: dynamic = 450000, capped at 200000
+            os.environ["GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT"] = "200000"
+            result = _resolved_text_tool_adapter_compact_token_limit({}, huge)
+            self.assertEqual(result, 200000)
+
+            # config cap = 0 disables compaction
+            os.environ.pop("GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT", None)
+            result = _resolved_text_tool_adapter_compact_token_limit(
+                {"text_tool_adapter_compact_token_limit": 0}, large
+            )
+            self.assertEqual(result, 0)
+
+            # config cap = 0 via env var also disables
+            os.environ["GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT"] = "0"
+            result = _resolved_text_tool_adapter_compact_token_limit({}, large)
+            self.assertEqual(result, 0)
+
+            # missing upstream config defaults to 128000; dynamic = 57600, capped at default 48000
+            os.environ.pop("GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT", None)
+            result = _resolved_text_tool_adapter_compact_token_limit({}, {})
+            self.assertEqual(result, _TEXT_TOOL_ADAPTER_COMPACT_DEFAULT_CAP)
+        finally:
+            if old_env is None:
+                os.environ.pop("GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT", None)
+            else:
+                os.environ["GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT"] = old_env
+
     def test_inline_bash_function_markup_repairs_missing_spaces(self):
         text = """好的，我来系统地做这件事。
   <function=Bash>find /Users/sanbo/Desktop/ai_tool_functioncall -type f-name "*.py" | head-30
@@ -966,7 +1164,7 @@ class NativeGatewayTests(unittest.TestCase):
             os.environ["GATEWAY_WORKSPACE_ROOT"] = td
             try:
                 cfg = gateway._default_config()
-                cfg["upstream"]["tools_enabled"] = "off"
+                cfg["upstream"]["tools_enabled"] = "auto"
                 cfg["upstream"]["capabilities"]["supports_tools"] = False
                 cfg["upstream"]["capabilities"]["supports_function_calls"] = False
                 cfg["gateway"]["text_tool_call_fallback_enabled"] = True
@@ -1001,6 +1199,80 @@ class NativeGatewayTests(unittest.TestCase):
                 else:
                     os.environ["GATEWAY_WORKSPACE_ROOT"] = old_root
 
+    def test_text_tool_adapter_compacts_huge_claude_code_payload_before_upstream(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                cfg = gateway._default_config()
+                cfg["upstream"]["protocol"] = "openai_chat"
+                cfg["upstream"]["tools_enabled"] = "auto"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                cfg["gateway"]["text_tool_adapter_compact_token_limit"] = 1000
+                cfg["context"]["enabled"] = True
+                cfg["context"]["summary_max_chars"] = 1000
+                gateway.save_config(cfg)
+
+                huge_tool_schema = [
+                    {
+                        "name": "Bash",
+                        "description": "run shell " + ("x" * 12000),
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {
+                                "command": {"type": "string", "description": "command " + ("y" * 12000)}
+                            },
+                            "required": ["command"],
+                        },
+                    }
+                ]
+                huge_reminder = "<system-reminder>\n" + ("skill list\n" * 3000) + "</system-reminder>"
+                client = FakeClient(
+                    [
+                        {
+                            "id": "chatcmpl_compact",
+                            "object": "chat.completion",
+                            "model": "m",
+                            "choices": [
+                                {"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
+                            ],
+                        }
+                    ]
+                )
+                final = run_tool_orchestration(
+                    "/v1/messages",
+                    {
+                        "model": "m",
+                        "system": [{"type": "text", "text": "system " + ("z" * 20000)}],
+                        "tools": huge_tool_schema,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": huge_reminder},
+                                    {"type": "text", "text": "Reply with OK only."},
+                                ],
+                            }
+                        ],
+                        "max_tokens": 32,
+                    },
+                    client,
+                )
+                self.assertEqual(final["content"][0]["text"], "ok")
+                sent = client.requests[0][1]
+                serialized = json.dumps(sent, ensure_ascii=False)
+                self.assertLess(len(serialized), 30000)
+                self.assertLess(gateway._body_token_estimate(sent), 10000)
+                self.assertNotIn("x" * 2000, serialized)
+                self.assertNotIn("skill list\n" * 200, serialized)
+                self.assertIn("Tool Call Gateway", serialized)
+                self.assertIn("gateway context compacted", serialized)
+                self.assertNotIn("tools", sent)
+                self.assertNotIn("tool_choice", sent)
+            finally:
+                gateway.CONFIG_PATH = old_config
+
     def test_over_limit_claude_code_request_is_compacted_before_upstream(self):
         with tempfile.TemporaryDirectory() as td:
             old_config = gateway.CONFIG_PATH
@@ -1031,6 +1303,43 @@ class NativeGatewayTests(unittest.TestCase):
                 self.assertNotIn("HugeTool", json.dumps(sent, ensure_ascii=False))
                 self.assertIn("tool_use", json.dumps(sent, ensure_ascii=False))
                 self.assertIn("分析 @src/", json.dumps(sent, ensure_ascii=False))
+            finally:
+                gateway.CONFIG_PATH = old_config
+
+    def test_local_planner_reads_absolute_file_path_for_weak_upstream(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                workspace = pathlib.Path(td) / "workspace"
+                workspace.mkdir()
+                probe = workspace / "probe.txt"
+                probe.write_text("gateway-local-file-probe: 2+2=4\n", encoding="utf-8")
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = str(workspace)
+                cfg["gateway"]["local_planner_enabled"] = True
+                cfg["upstream"]["tools_enabled"] = "auto"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                gateway.save_config(cfg)
+                client = FakeClient([{"choices": [{"message": {"role": "assistant", "content": "2+2=4"}}]}])
+                final = run_tool_orchestration(
+                    "/v1/messages",
+                    {
+                        "model": "m",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": f"Read local file {probe} and answer only the value after gateway-local-file-probe.",
+                            }
+                        ],
+                        "max_tokens": 64,
+                    },
+                    client,
+                )
+                self.assertEqual(final["content"][0]["text"], "2+2=4")
+                self.assertEqual(final.get("gateway_context", {}).get("strategy"), "gateway_local_file_read")
+                self.assertEqual(client.requests, [])
             finally:
                 gateway.CONFIG_PATH = old_config
 
@@ -1115,6 +1424,7 @@ class NativeGatewayTests(unittest.TestCase):
                     "max_concurrent_requests": "48",
                     "concurrency_queue_timeout_seconds": "3",
                     "tool_execution_timeout_seconds": "90",
+                    "text_tool_adapter_compact_token_limit": "10000",
                     "workspace_root": td,
                     "allow_write_tools": "1",
                     "allow_shell_tools": "1",
@@ -1150,6 +1460,7 @@ class NativeGatewayTests(unittest.TestCase):
                 self.assertEqual(saved["upstream"]["paths"]["messages"], "/anthropic/messages")
                 self.assertEqual(saved["upstream"]["timeout_seconds"], 45.0)
                 self.assertEqual(saved["gateway"]["max_concurrent_requests"], 48)
+                self.assertEqual(saved["gateway"]["text_tool_adapter_compact_token_limit"], 10000)
                 self.assertTrue(saved["gateway"]["text_tool_call_fallback_enabled"])
                 self.assertEqual(saved["context"]["fanout_max_chunks"], 0)
                 self.assertEqual(saved["context"]["fanout_max_workers"], 6)
@@ -1191,8 +1502,360 @@ class NativeGatewayTests(unittest.TestCase):
                     ),
                     timeout=5,
                 ).read().decode("utf-8")
-                self.assertIn("添加/编辑上游 API 详情", page)
+                self.assertIn("Gateway Control Center", page)
+                self.assertIn("上游模型与 API 设置", page)
                 self.assertIn("chat-only", page)
+                self.assertIn("Fetch Models /v1/models", page)
+                self.assertIn("Capability Matrix / 能力矩阵", page)
+                self.assertIn('name="cap_supports_tools"', page)
+                self.assertIn('name="cap_supports_vision"', page)
+                self.assertIn('name="text_tool_adapter_compact_token_limit"', page)
+                self.assertIn("/admin/upstream-models.json", page)
+                self.assertIn("/anthropic", page)
+                self.assertIn("claude_mnative()", page)
+                self.assertIn("ANTHROPIC_AUTH_TOKEN", page)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+
+    def test_admin_upstream_models_endpoint_fetches_active_or_form_upstream(self):
+        class ModelsHandler(BaseHTTPRequestHandler):
+            seen: list[dict] = []
+
+            def do_GET(self):  # noqa: N802
+                ModelsHandler.seen.append(
+                    {
+                        "path": self.path,
+                        "authorization": self.headers.get("authorization"),
+                        "x_api_key": self.headers.get("x-api-key"),
+                    }
+                )
+                payload = json.dumps(
+                    {
+                        "object": "list",
+                        "data": [
+                            {"id": "mimo-v2.5-pro"},
+                            {"id": "mimo-v2.5"},
+                            {"id": "mimo-v2.5-pro"},
+                        ],
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, fmt, *args):  # noqa: N802
+                pass
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            upstream = ThreadingHTTPServer(("127.0.0.1", 0), ModelsHandler)
+            upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+            upstream_thread.start()
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                cfg = gateway._default_config()
+                cfg["upstream"]["base_url"] = f"http://127.0.0.1:{upstream.server_address[1]}"
+                cfg["upstream"]["api_key"] = "up-key"
+                cfg["upstream"]["model"] = "mimo-v2.5-pro"
+                cfg["upstream"]["protocol"] = "openai_chat"
+                cfg["upstream"]["paths"]["models"] = "/v1/models"
+                gateway.save_config(cfg)
+                token = base64.b64encode(b"admin:admin").decode("ascii")
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{httpd.server_address[1]}/admin/upstream-models.json",
+                    headers={"authorization": f"Basic {token}"},
+                )
+                response = json.loads(urllib.request.urlopen(req, timeout=5).read().decode("utf-8"))
+                self.assertTrue(response["ok"])
+                self.assertEqual(response["active_model"], "mimo-v2.5-pro")
+                self.assertEqual(response["models"], ["mimo-v2.5", "mimo-v2.5-pro"])
+                self.assertEqual(ModelsHandler.seen[-1]["path"], "/v1/models")
+                self.assertEqual(ModelsHandler.seen[-1]["authorization"], "Bearer up-key")
+
+                class QueryOverrideSink(BaseHTTPRequestHandler):
+                    seen: list[dict] = []
+
+                    def do_GET(self):  # noqa: N802
+                        QueryOverrideSink.seen.append({"authorization": self.headers.get("authorization")})
+                        payload = json.dumps({"data": [{"id": "evil"}]}).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("content-type", "application/json")
+                        self.send_header("content-length", str(len(payload)))
+                        self.end_headers()
+                        self.wfile.write(payload)
+
+                    def log_message(self, fmt, *args):  # noqa: N802
+                        pass
+
+                sink = ThreadingHTTPServer(("127.0.0.1", 0), QueryOverrideSink)
+                sink_thread = threading.Thread(target=sink.serve_forever, daemon=True)
+                sink_thread.start()
+                try:
+                    req = urllib.request.Request(
+                        f"http://127.0.0.1:{httpd.server_address[1]}/admin/upstream-models.json?"
+                        f"base_url=http://127.0.0.1:{sink.server_address[1]}&path_models=/v1/models",
+                        headers={"authorization": f"Basic {token}"},
+                    )
+                    response = json.loads(urllib.request.urlopen(req, timeout=5).read().decode("utf-8"))
+                    self.assertEqual(response["models"], ["mimo-v2.5", "mimo-v2.5-pro"])
+                    self.assertEqual(QueryOverrideSink.seen, [])
+                finally:
+                    sink.shutdown()
+                    sink.server_close()
+                    sink_thread.join(timeout=2)
+
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{httpd.server_address[1]}/admin/upstream-models.json",
+                    data=urllib.parse.urlencode(
+                        {
+                            "base_url": f"http://127.0.0.1:{upstream.server_address[1]}",
+                            "api_key": "anth-key",
+                            "protocol": "anthropic_messages",
+                            "path_models": "/v1/models",
+                        }
+                    ).encode("utf-8"),
+                    headers={"authorization": f"Basic {token}", "content-type": "application/x-www-form-urlencoded"},
+                    method="POST",
+                )
+                response = json.loads(urllib.request.urlopen(req, timeout=5).read().decode("utf-8"))
+                self.assertEqual(response["models"], ["mimo-v2.5", "mimo-v2.5-pro"])
+                self.assertEqual(ModelsHandler.seen[-1]["x_api_key"], "anth-key")
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
+                upstream.shutdown()
+                upstream.server_close()
+                upstream_thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+
+    def test_admin_numeric_form_errors_return_400_without_mutating_config(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                cfg = gateway._default_config()
+                cfg["gateway"]["public_base_url"] = "http://before.local:8885"
+                cfg["gateway"]["client_snippet_api_key"] = "before-key"
+                cfg["gateway"]["max_concurrent_requests"] = 32
+                cfg["context"]["max_input_tokens"] = 24000
+                gateway.save_config(cfg)
+                token = base64.b64encode(b"admin:admin").decode("ascii")
+                base = f"http://127.0.0.1:{httpd.server_address[1]}"
+
+                bad_config = urllib.parse.urlencode(
+                    {
+                        "base_url": "http://upstream.local",
+                        "model": "mimo-v2.5-pro",
+                        "protocol": "anthropic_messages",
+                        "upstream_timeout_seconds": "45",
+                        "upstream_max_input_tokens": "200000",
+                        "upstream_max_output_tokens": "16000",
+                        "upstream_max_concurrency": "64",
+                        "max_concurrent_requests": "not-a-number",
+                        "context_max_input_tokens": "8000",
+                    }
+                ).encode("utf-8")
+                req = urllib.request.Request(
+                    base + "/admin/config",
+                    data=bad_config,
+                    headers={"authorization": f"Basic {token}", "content-type": "application/x-www-form-urlencoded"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as config_error:
+                    urllib.request.urlopen(req, timeout=5).read()
+                self.assertEqual(config_error.exception.code, 400)
+                payload = json.loads(config_error.exception.read().decode("utf-8"))
+                self.assertIn("invalid numeric field: max_concurrent_requests", payload["error"]["message"])
+                saved = gateway.load_config()
+                self.assertEqual(saved["gateway"]["max_concurrent_requests"], 32)
+                self.assertEqual(saved["context"]["max_input_tokens"], 24000)
+                self.assertEqual(saved["gateway"]["public_base_url"], "http://before.local:8885")
+
+                bad_upstream = urllib.parse.urlencode(
+                    {
+                        "base_url": "http://upstream-mutated.local",
+                        "model": "mimo-v2.5-pro",
+                        "protocol": "anthropic_messages",
+                        "upstream_timeout_seconds": "45",
+                        "upstream_max_input_tokens": "bad-input-limit",
+                        "upstream_max_output_tokens": "16000",
+                        "upstream_max_concurrency": "64",
+                    }
+                ).encode("utf-8")
+                req = urllib.request.Request(
+                    base + "/admin/config",
+                    data=bad_upstream,
+                    headers={"authorization": f"Basic {token}", "content-type": "application/x-www-form-urlencoded"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as upstream_error:
+                    urllib.request.urlopen(req, timeout=5).read()
+                self.assertEqual(upstream_error.exception.code, 400)
+                payload = json.loads(upstream_error.exception.read().decode("utf-8"))
+                self.assertIn("invalid numeric field: upstream_max_input_tokens", payload["error"]["message"])
+                saved = gateway.load_config()
+                self.assertEqual(saved["upstream"].get("base_url"), cfg["upstream"].get("base_url"))
+                self.assertEqual(saved["gateway"]["max_concurrent_requests"], 32)
+                self.assertEqual(saved["context"]["max_input_tokens"], 24000)
+
+                bad_profile = urllib.parse.urlencode(
+                    {
+                        "action": "save",
+                        "name": "bad-profile",
+                        "base_url": "http://profile-mutated.local",
+                        "model": "profile-model",
+                        "protocol": "openai_chat",
+                        "upstream_timeout_seconds": "bad-timeout",
+                    }
+                ).encode("utf-8")
+                req = urllib.request.Request(
+                    base + "/admin/upstream-profile",
+                    data=bad_profile,
+                    headers={"authorization": f"Basic {token}", "content-type": "application/x-www-form-urlencoded"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as profile_error:
+                    urllib.request.urlopen(req, timeout=5).read()
+                self.assertEqual(profile_error.exception.code, 400)
+                payload = json.loads(profile_error.exception.read().decode("utf-8"))
+                self.assertIn("invalid numeric field: upstream_timeout_seconds", payload["error"]["message"])
+                saved = gateway.load_config()
+                self.assertFalse(any(p.get("name") == "bad-profile" for p in saved.get("upstream_profiles", [])))
+
+                bad_client = urllib.parse.urlencode(
+                    {
+                        "public_base_url": "http://mutated.local:8885",
+                        "client_snippet_api_key": "mutated-key",
+                        "client_context_window": "1000000",
+                        "client_auto_compact_token_limit": "bad-limit",
+                        "client_output_token_limit": "128000",
+                    }
+                ).encode("utf-8")
+                req = urllib.request.Request(
+                    base + "/admin/client-config",
+                    data=bad_client,
+                    headers={"authorization": f"Basic {token}", "content-type": "application/x-www-form-urlencoded"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as client_error:
+                    urllib.request.urlopen(req, timeout=5).read()
+                self.assertEqual(client_error.exception.code, 400)
+                payload = json.loads(client_error.exception.read().decode("utf-8"))
+                self.assertIn("invalid numeric field: client_auto_compact_token_limit", payload["error"]["message"])
+                saved = gateway.load_config()
+                self.assertEqual(saved["gateway"]["public_base_url"], "http://before.local:8885")
+                self.assertEqual(saved["gateway"]["client_snippet_api_key"], "before-key")
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+
+    def test_admin_numeric_form_preserves_existing_values_when_fields_are_omitted(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                cfg = gateway._default_config()
+                cfg["upstream"]["base_url"] = "http://before-upstream.local"
+                cfg["upstream"]["model"] = "before-model"
+                cfg["upstream"]["timeout_seconds"] = 12.5
+                cfg["upstream"]["max_input_tokens"] = 111111
+                cfg["upstream"]["max_output_tokens"] = 2222
+                cfg["upstream"]["max_concurrency"] = 7
+                cfg["gateway"]["max_tool_rounds"] = 9
+                cfg["gateway"]["max_concurrent_requests"] = 11
+                cfg["gateway"]["concurrency_queue_timeout_seconds"] = 2.5
+                cfg["gateway"]["tool_execution_timeout_seconds"] = 33.5
+                cfg["gateway"]["text_tool_adapter_compact_token_limit"] = 7777
+                cfg["gateway"]["public_base_url"] = "http://before.local:8885"
+                cfg["gateway"]["client_snippet_api_key"] = "before-key"
+                cfg["gateway"]["client_context_window"] = 123456
+                cfg["gateway"]["client_auto_compact_token_limit"] = 120000
+                cfg["gateway"]["client_output_token_limit"] = 4096
+                cfg["context"]["max_input_tokens"] = 34567
+                cfg["context"]["fanout_chunk_tokens"] = 4567
+                cfg["context"]["fanout_max_chunks"] = 3
+                cfg["context"]["fanout_max_workers"] = 2
+                gateway.save_config(cfg)
+                token = base64.b64encode(b"admin:admin").decode("ascii")
+                base = f"http://127.0.0.1:{httpd.server_address[1]}"
+
+                partial_config = urllib.parse.urlencode(
+                    {
+                        "base_url": "http://after-upstream.local",
+                        "model": "after-model",
+                        "protocol": "anthropic_messages",
+                        "tool_mode": "orchestrate",
+                    }
+                ).encode("utf-8")
+                req = urllib.request.Request(
+                    base + "/admin/config",
+                    data=partial_config,
+                    headers={"authorization": f"Basic {token}", "content-type": "application/x-www-form-urlencoded"},
+                    method="POST",
+                )
+                try:
+                    urllib.request.urlopen(req, timeout=5).read()
+                except Exception as exc:
+                    if getattr(exc, "code", None) != 303:
+                        raise
+                saved = gateway.load_config()
+                self.assertEqual(saved["upstream"]["base_url"], "http://after-upstream.local")
+                self.assertEqual(saved["upstream"]["timeout_seconds"], 12.5)
+                self.assertEqual(saved["upstream"]["max_input_tokens"], 111111)
+                self.assertEqual(saved["upstream"]["max_output_tokens"], 2222)
+                self.assertEqual(saved["upstream"]["max_concurrency"], 7)
+                self.assertEqual(saved["gateway"]["max_tool_rounds"], 9)
+                self.assertEqual(saved["gateway"]["max_concurrent_requests"], 11)
+                self.assertEqual(saved["gateway"]["concurrency_queue_timeout_seconds"], 2.5)
+                self.assertEqual(saved["gateway"]["tool_execution_timeout_seconds"], 33.5)
+                self.assertEqual(saved["gateway"]["text_tool_adapter_compact_token_limit"], 7777)
+                self.assertEqual(saved["context"]["max_input_tokens"], 34567)
+                self.assertEqual(saved["context"]["fanout_chunk_tokens"], 4567)
+                self.assertEqual(saved["context"]["fanout_max_chunks"], 3)
+                self.assertEqual(saved["context"]["fanout_max_workers"], 2)
+
+                partial_client = urllib.parse.urlencode(
+                    {
+                        "public_base_url": "http://after.local:8885",
+                        "client_snippet_api_key": "after-key",
+                        "downstream_model_alias": "after-model",
+                    }
+                ).encode("utf-8")
+                req = urllib.request.Request(
+                    base + "/admin/client-config",
+                    data=partial_client,
+                    headers={"authorization": f"Basic {token}", "content-type": "application/x-www-form-urlencoded"},
+                    method="POST",
+                )
+                try:
+                    urllib.request.urlopen(req, timeout=5).read()
+                except Exception as exc:
+                    if getattr(exc, "code", None) != 303:
+                        raise
+                saved = gateway.load_config()
+                self.assertEqual(saved["gateway"]["public_base_url"], "http://after.local:8885")
+                self.assertEqual(saved["gateway"]["client_snippet_api_key"], "after-key")
+                self.assertEqual(saved["gateway"]["client_context_window"], 123456)
+                self.assertEqual(saved["gateway"]["client_auto_compact_token_limit"], 120000)
+                self.assertEqual(saved["gateway"]["client_output_token_limit"], 4096)
             finally:
                 httpd.shutdown()
                 httpd.server_close()
@@ -1432,6 +2095,173 @@ class NativeGatewayTests(unittest.TestCase):
                 with self.assertRaises(gateway.DownstreamAuthError):
                     gateway._check_downstream_key(DummyHandler("/v1/tools/call", "chat-only-key"))
             finally:
+                gateway.CONFIG_PATH = old_config
+
+    def test_anthropic_base_url_prefix_routes_to_messages(self):
+        class ChatOnlyHandler(BaseHTTPRequestHandler):
+            seen: list[dict] = []
+
+            def do_POST(self):  # noqa: N802
+                body = json.loads(self.rfile.read(int(self.headers.get("content-length", "0"))).decode("utf-8"))
+                ChatOnlyHandler.seen.append({"path": self.path, "body": body})
+                payload = json.dumps(
+                    {
+                        "id": "chatcmpl_alias",
+                        "object": "chat.completion",
+                        "model": body.get("model") or "m",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, fmt, *args):  # noqa: N802
+                pass
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            upstream = ThreadingHTTPServer(("127.0.0.1", 0), ChatOnlyHandler)
+            upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+            upstream_thread.start()
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                cfg = gateway._default_config()
+                cfg["upstream"]["base_url"] = f"http://127.0.0.1:{upstream.server_address[1]}"
+                cfg["upstream"]["model"] = "mimo-v2.5-pro"
+                cfg["upstream"]["protocol"] = "openai_chat"
+                cfg["downstream_keys"] = [
+                    {
+                        "name": "claude",
+                        "key_hash": gateway._hash_secret("test-gateway-key"),
+                        "prefix": "test-gat",
+                        "enabled": True,
+                        "protocols": ["messages"],
+                    }
+                ]
+                gateway.save_config(cfg)
+                body = json.dumps(
+                    {
+                        "model": "mimo-v2.5-pro",
+                        "max_tokens": 100,
+                        "messages": [{"role": "user", "content": "hello"}],
+                    }
+                ).encode("utf-8")
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{httpd.server_address[1]}/anthropic/v1/messages",
+                    data=body,
+                    headers={"authorization": "Bearer test-gateway-key", "content-type": "application/json"},
+                    method="POST",
+                )
+                response = json.loads(urllib.request.urlopen(req, timeout=5).read().decode("utf-8"))
+                self.assertEqual(response["id"], "chatcmpl_alias")
+                self.assertEqual(response["type"], "message")
+                self.assertEqual(response["role"], "assistant")
+                self.assertEqual(response["model"], "mimo-v2.5-pro")
+                self.assertEqual(response["content"][0]["text"], "ok")
+                self.assertEqual(response["stop_reason"], "end_turn")
+                self.assertIsNone(response["stop_sequence"])
+                self.assertEqual(response["usage"]["input_tokens"], 0)
+                self.assertEqual(response["usage"]["output_tokens"], 0)
+                self.assertEqual(ChatOnlyHandler.seen[-1]["path"], "/v1/chat/completions")
+                self.assertEqual(ChatOnlyHandler.seen[-1]["body"]["messages"][-1]["content"], "hello")
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
+                upstream.shutdown()
+                upstream.server_close()
+                upstream_thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+
+    def test_anthropic_prefix_accepts_x_api_key_auth(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                cfg = gateway._default_config()
+                cfg["downstream_keys"] = [
+                    {
+                        "name": "anthropic-sdk",
+                        "key_hash": gateway._hash_secret("test-gateway-key"),
+                        "prefix": "test-gat",
+                        "enabled": True,
+                        "protocols": ["messages"],
+                    }
+                ]
+                gateway.save_config(cfg)
+                body = json.dumps(
+                    {
+                        "model": "mimo-v2.5-pro",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    }
+                ).encode("utf-8")
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{httpd.server_address[1]}/anthropic/v1/messages/count_tokens",
+                    data=body,
+                    headers={"x-api-key": "test-gateway-key", "content-type": "application/json"},
+                    method="POST",
+                )
+                response = json.loads(urllib.request.urlopen(req, timeout=5).read().decode("utf-8"))
+                self.assertGreater(response["input_tokens"], 0)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+
+    def test_anthropic_prefix_token_count_routes_to_canonical_messages_count(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                cfg = gateway._default_config()
+                cfg["downstream_keys"] = [
+                    {
+                        "name": "claude",
+                        "key_hash": gateway._hash_secret("test-gateway-key"),
+                        "prefix": "test-gat",
+                        "enabled": True,
+                        "protocols": ["messages"],
+                    }
+                ]
+                gateway.save_config(cfg)
+                body = json.dumps(
+                    {
+                        "model": "mimo-v2.5-pro",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    }
+                ).encode("utf-8")
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{httpd.server_address[1]}/anthropic/v1/messages/count_tokens",
+                    data=body,
+                    headers={"authorization": "Bearer test-gateway-key", "content-type": "application/json"},
+                    method="POST",
+                )
+                response = json.loads(urllib.request.urlopen(req, timeout=5).read().decode("utf-8"))
+                self.assertGreater(response["input_tokens"], 0)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
                 gateway.CONFIG_PATH = old_config
 
     def test_downstream_key_is_enforced_for_post_routes(self):
@@ -1771,6 +2601,10 @@ class NativeGatewayTests(unittest.TestCase):
             ]
         )
         final = run_tool_orchestration("/v1/responses", {"model": "m", "input": "calc"}, client)
+        self.assertEqual(final["object"], "response")
+        self.assertTrue(final["id"].startswith("resp_"))
+        self.assertEqual(final["status"], "completed")
+        self.assertIn("usage", final)
         self.assertEqual(final["output"][0]["type"], "message")
         # Upstream request is in OpenAI Chat format, tool result content is a string
         self.assertEqual(client.requests[1][1]["messages"][-1]["content"], "10")
@@ -1796,6 +2630,70 @@ class NativeGatewayTests(unittest.TestCase):
         self.assertEqual(updated["input"][-1]["type"], "custom_tool_call_output")
         self.assertEqual(updated["input"][-1]["call_id"], "call_custom_1")
         self.assertEqual(updated["input"][-1]["output"], "42")
+
+    def test_responses_like_empty_output_gets_strict_shape(self):
+        from src.gateway_protocol import _convert_response_to_downstream
+        payload = _convert_response_to_downstream("/v1/responses", {"object": "response", "output": []}, "openai_chat")
+        self.assertEqual(payload["object"], "response")
+        self.assertTrue(payload["id"].startswith("resp_"))
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["output"], [])
+        self.assertEqual(payload["usage"], {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+
+    def test_codex_responses_orchestrates_calc_alias_expr_until_final(self):
+        client = FakeClient(
+            [
+                {
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "call_id": "call_calc_alias",
+                            "name": "calc",
+                            "arguments": "{\"expr\":\"2+2\"}",
+                        }
+                    ]
+                },
+                {"output": [{"type": "message", "content": [{"type": "output_text", "text": "4"}]}]},
+            ]
+        )
+        final = run_tool_orchestration("/v1/responses", {"model": "m", "input": "What is 2+2?"}, client)
+        self.assertEqual(final["object"], "response")
+        self.assertEqual(final["status"], "completed")
+        self.assertEqual(final["output"][0]["content"][0]["text"], "4")
+        second_request = client.requests[1][1]
+        serialized = json.dumps(second_request, ensure_ascii=False)
+        self.assertIn('"role": "tool"', serialized)
+        self.assertIn('"tool_call_id": "call_calc_alias"', serialized)
+        self.assertIn('"content": "4"', serialized)
+        self.assertNotIn("tool_not_found", serialized)
+
+    def test_claude_messages_orchestrates_calc_alias_expr_until_final(self):
+        client = FakeClient(
+            [
+                {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_calc_alias",
+                            "name": "calc",
+                            "input": {"expr": "2+2"},
+                        }
+                    ],
+                    "stop_reason": "tool_use",
+                },
+                {"content": [{"type": "text", "text": "4"}], "stop_reason": "end_turn"},
+            ]
+        )
+        final = run_tool_orchestration(
+            "/v1/messages",
+            {"model": "m", "max_tokens": 100, "messages": [{"role": "user", "content": "What is 2+2?"}]},
+            client,
+        )
+        self.assertEqual(final["content"][0]["text"], "4")
+        second_request = client.requests[1][1]
+        serialized = json.dumps(second_request, ensure_ascii=False)
+        self.assertIn("4", serialized)
+        self.assertNotIn("tool_not_found", serialized)
 
     def test_orchestrates_messages_until_final(self):
         client = FakeClient(
@@ -2873,8 +3771,13 @@ while True:
                 self.assertIn('wire_api = "responses"', payload["codex_config_toml"])
                 self.assertIn('"OPENAI_API_KEY": "test-api-key"', payload["codex_auth_json"])
                 self.assertIn('"baseURL": "http://127.0.0.1:8885/v1"', payload["opencode_json"])
-                self.assertIn('ANTHROPIC_BASE_URL="http://127.0.0.1:8885"', payload["claude_bash_profile_function"])
+                self.assertIn("claude_mnative()", payload["claude_bash_profile_function"])
+                self.assertIn('ANTHROPIC_BASE_URL="http://127.0.0.1:8885/anthropic"', payload["claude_bash_profile_function"])
+                self.assertIn('ANTHROPIC_AUTH_TOKEN="test-api-key"', payload["claude_bash_profile_function"])
+                self.assertIn('ANTHROPIC_API_KEY=""', payload["claude_bash_profile_function"])
                 self.assertIn('"ANTHROPIC_AUTH_TOKEN": "test-api-key"', payload["vscode_claude_settings_json"])
+                self.assertEqual(payload["claude_code_env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8885/anthropic")
+                self.assertEqual(payload["claude_code_env"]["ANTHROPIC_API_KEY"], "")
 
                 form = urllib.parse.urlencode(
                     {

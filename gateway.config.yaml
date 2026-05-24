@@ -22,7 +22,7 @@ admin:
 # ----------------------------------------------------------------------------
 upstream:
   base_url: ""                       # 例: https://api.openai.com
-  api_key: ""                        # 例: sk-xxx
+  api_key: ""                        # 例: <YOUR_UPSTREAM_API_KEY>
   model: ""                          # 例: gpt-4o, mimo-v2.5-pro
   protocol: openai_chat              # openai_chat | anthropic_messages | openai_responses
   tools_enabled: auto                # auto | on | off

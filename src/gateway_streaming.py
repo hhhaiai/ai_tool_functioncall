@@ -293,7 +293,7 @@ def run_streaming_orchestration(
     handler: Any, path: str, body: dict
 ) -> None:
     """Streaming orchestration with tool call support."""
-    from .gateway_config import _config_env, _gateway_config, _upstream_protocol
+    from .gateway_config import _configured_max_tool_rounds, _gateway_config, _upstream_protocol
     from .gateway_context import (
         _context_config,
         _inject_recalled_memories,
@@ -321,7 +321,7 @@ def run_streaming_orchestration(
         _stream_upstream_passthrough(handler, path, body)
         return
 
-    max_rounds = int(_config_env("GATEWAY_MAX_TOOL_ROUNDS", "5"))
+    max_rounds = _configured_max_tool_rounds(gateway_cfg)
     upstream = NativeProxyClient()
     memory_body = _inject_recalled_memories(path, body)
     context_cfg = _context_config()
@@ -393,7 +393,65 @@ def _tools_enabled_for_upstream() -> str:
     """Check if tools should be enabled for the upstream API."""
     from .gateway_config import _upstream_config
     cfg = _upstream_config()
-    return cfg.get("tools_enabled", "auto")
+    return str(cfg.get("tools_enabled", "auto") or "auto").strip().lower()
+
+
+def _upstream_native_tools_capable() -> bool:
+    """Return whether the active upstream profile is configured as native-tool capable."""
+    from .gateway_config import _upstream_config
+    cfg = _upstream_config()
+    capabilities = cfg.get("capabilities") if isinstance(cfg.get("capabilities"), dict) else {}
+    return bool(capabilities.get("supports_tools", True)) and bool(capabilities.get("supports_function_calls", True))
+
+
+def _should_use_text_tool_adapter(tools_enabled: str, native_capable: bool) -> bool:
+    """Decide whether gateway tools must be exposed as text-call instructions.
+
+    ``auto`` is intentionally conservative: if the user marks the upstream as
+    not supporting native tools/function-calls, do not send native ``tools``
+    schemas upstream. Use the local gateway adapter instead so weak model APIs
+    do not reject the request or hallucinate unsupported protocol objects.
+    """
+    if tools_enabled in {"off", "disabled", "false", "0", "none", "text_only", "adapter"}:
+        return True
+    if tools_enabled == "auto" and not native_capable:
+        return True
+    return False
+
+
+def _maybe_compact_for_text_tool_adapter(path: str, body: dict) -> dict:
+    """Compact bulky Claude Code/Codex harness payloads before text-tool injection.
+
+    Weak upstreams that do not support native tools often have lower practical
+    request-size limits than their advertised context window.  A Claude Code
+    request can include a large system prompt, skill list, and tool schemas even
+    for a one-line user prompt.  When we must downgrade native tools to the
+    Gateway text adapter, compact that harness before adding our own adapter
+    instructions so the upstream does not answer with a provider-level
+    ``too long`` refusal.
+
+    The limit is dynamic: max(8000, min(upstream.max_input_tokens * 0.45, config_cap)).
+    Config cap defaults to 48000; set to 0 to disable.
+    """
+    try:
+        from .gateway_config import _resolved_text_tool_adapter_compact_token_limit
+        from .gateway_context import _body_token_estimate, _compact_request_for_upstream, _context_config
+        limit = _resolved_text_tool_adapter_compact_token_limit()
+        if limit <= 0 or _body_token_estimate(body) <= limit:
+            return body
+        context_cfg = dict(_context_config())
+        context_cfg["enabled"] = True
+        # Keep enough user intent while forcing large system-reminder blocks to
+        # shrink.  ``summary_max_chars`` is per content block, so cap it below
+        # the token budget rather than using the global context threshold.
+        try:
+            existing_summary = int(context_cfg.get("summary_max_chars") or 6000)
+        except (TypeError, ValueError):
+            existing_summary = 6000
+        context_cfg["summary_max_chars"] = max(1000, min(existing_summary, 6000))
+        return _compact_request_for_upstream(path, body, context_cfg, reason="weak_upstream_text_tools")
+    except Exception:
+        return body
 
 
 def _merge_builtin_tools(path: str, body: dict) -> dict:
@@ -408,20 +466,10 @@ def _merge_builtin_tools(path: str, body: dict) -> dict:
     body = copy.deepcopy(body)
 
     tools_enabled = _tools_enabled_for_upstream()
-    if tools_enabled == "off":
-        # Strip native tools and inject as text prompt
-        body.pop("tools", None)
-        body.pop("tool_choice", None)
-        # Collect all available tools for text injection
-        all_tools = []
-        for tool in BUILTIN_TOOLS.values():
-            all_tools.append({"name": tool.name, "description": tool.description, "parameters": tool.parameters})
-        mcp_schemas = _mcp_tool_schemas(path)
-        all_tools.extend(mcp_schemas)
-        action_schemas = _http_action_schemas(path)
-        all_tools.extend(action_schemas)
-        body = _inject_tools_as_text_prompt(body, all_tools)
-        return body
+    native_capable = _upstream_native_tools_capable()
+    if tools_enabled == "native_only" and not native_capable:
+        from .gateway_errors import GatewayError
+        raise GatewayError("upstream profile is configured as native_only but capabilities disable native tools/function calls")
 
     # Get existing tools
     tools = body.get("tools", [])
@@ -441,8 +489,11 @@ def _merge_builtin_tools(path: str, body: dict) -> dict:
     action_schemas = _http_action_schemas(path)
     tools.extend(action_schemas)
 
-    if tools_enabled == "text_only":
-        # Strip native tools and inject as text prompt
+    if _should_use_text_tool_adapter(tools_enabled, native_capable):
+        # Strip native tools and inject as compact text prompt.  Compact first so
+        # Claude Code/Codex harness metadata plus adapter instructions stay under
+        # weak upstream request-size limits.
+        body = _maybe_compact_for_text_tool_adapter(path, body)
         body.pop("tools", None)
         body.pop("tool_choice", None)
         body = _inject_tools_as_text_prompt(body, tools)

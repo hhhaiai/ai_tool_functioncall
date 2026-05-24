@@ -71,7 +71,7 @@ vi .gateway_service.json
 {
   "upstream": {
     "base_url": "https://api.openai.com",
-    "api_key": "sk-your-api-key",
+    "api_key": "<YOUR_UPSTREAM_API_KEY>",
     "model": "gpt-4o"
   },
   "gateway": {
@@ -126,21 +126,37 @@ curl http://127.0.0.1:8885/healthz
   },
   "upstream": {
     "base_url": "https://api.openai.com",
-    "api_key": "sk-xxx",
+    "api_key": "<YOUR_UPSTREAM_API_KEY>",
     "model": "gpt-4o",
     "protocol": "openai_chat",
     "tools_enabled": "auto",
     "timeout_seconds": 60,
     "max_input_tokens": 128000,
     "max_output_tokens": 8192,
-    "max_concurrency": 32
+    "max_concurrency": 32,
+    "paths": {
+      "models": "/v1/models",
+      "chat_completions": "/v1/chat/completions",
+      "responses": "/v1/responses",
+      "messages": "/v1/messages"
+    },
+    "capabilities": {
+      "supports_streaming": true,
+      "supports_tools": true,
+      "supports_function_calls": true,
+      "supports_parallel_tool_calls": true,
+      "supports_vision": false,
+      "supports_network": false,
+      "supports_web_search": false,
+      "supports_json_schema": true
+    }
   },
   "gateway": {
     "workspace_root": "./workspace",
     "tool_mode": "orchestrate",
     "allow_write_tools": false,
     "allow_shell_tools": false,
-    "max_tool_rounds": 10,
+    "max_tool_rounds": 5,
     "tool_execution_timeout_seconds": 60,
     "max_concurrent_requests": 32,
     "request_logging": true,
@@ -178,13 +194,25 @@ curl http://127.0.0.1:8885/healthz
 | `upstream.api_key` | - | 上游 API Key |
 | `upstream.model` | - | 默认模型名称 |
 | `upstream.protocol` | openai_chat | 上游协议类型 |
-| `gateway.workspace_root` | `./workspace`（模板）/ 当前目录（无配置时） | 工具读写的根目录 |
-| `gateway.tool_mode` | orchestrate | 工具模式：orchestrate / passthrough |
+| `upstream.tools_enabled` | auto | 工具模式：`auto` 按能力自动选择；`native` 发送原生 tools；`native_only` 能力不足即失败；`adapter`/`text_only`/`off` 走 Gateway 本地真实工具文本适配 |
+| `upstream.paths.models` | `/v1/models` | Admin UI 模型自动获取和 `/v1/models` 转发使用的上游路径 |
+| `upstream.capabilities.supports_tools` / `supports_function_calls` | true | 上游是否原生支持 tools/function calls；`auto` 模式会据此决定是否发送原生 tools |
+| `upstream.capabilities.supports_vision` | false | 上游是否支持图片/截图/识图输入；在 Admin UI 明确展示和保存 |
+| `upstream.capabilities.supports_network` | false | 上游模型是否具备联网能力；在 Admin UI 明确展示和保存 |
+| `upstream.capabilities.supports_web_search` | false | 上游模型是否支持 web search；在 Admin UI 明确展示和保存 |
+| `gateway.workspace_root` | `./workspace`（模板）/ 当前目录（无配置时） | 工具读写的根目录；请求体显式 root 优先，其次是非默认 `GATEWAY_WORKSPACE_ROOT`，再其次是保存配置，最后才是默认当前目录 |
+| `gateway.tool_mode` | orchestrate | 工具模式：`orchestrate` / `native_passthrough` / `proxy`；兼容旧值 `passthrough` |
 | `gateway.allow_write_tools` | false | 是否允许文件写入 |
 | `gateway.allow_shell_tools` | false | 是否允许 Shell 执行 |
 | `gateway.client_snippet_api_key` | - | 客户端连接 Gateway 的 API Key；保存配置时会自动同步为可认证的 downstream key |
+| `gateway.max_tool_rounds` | 5 | orchestrate 模式最大工具调用轮数；运行时优先使用 `GATEWAY_MAX_TOOL_ROUNDS` 环境变量，其次使用 Admin/配置文件保存值 |
+| `gateway.max_concurrent_requests` | 32 | Gateway 下游 API 请求并发上限；HTTP 入口会先获取并发槽位，超过上限按 `concurrency_queue_timeout_seconds` 等待后返回 429 |
+| `gateway.concurrency_queue_timeout_seconds` | 5.0 | 并发槽位排队等待时间；超时返回 429 |
+| `gateway.tool_execution_timeout_seconds` | 60.0 | 单次工具执行超时 |
 | `gateway.max_request_body_bytes` | 67108864 | HTTP POST 请求体读取前上限；超限返回 413，避免大请求先占用内存 |
 | `gateway.max_log_payload_chars` | 200000 | 单个 request/response 日志 payload 与 tool failure 内容截断上限；先遮盖敏感字段再截断 |
+| `gateway.text_tool_adapter_compact_token_limit` | 48000 | 弱上游文本工具适配前的压缩阈值上限；实际阈值动态计算为 `max(8000, min(upstream.max_input_tokens * 0.45, 此值))`；设为 0 可关闭 |
+| `gateway.local_planner_enabled` | true | 对分析/审查请求以及点名 `read/show/cat/open/查看/读取` 文件路径的请求，先用 Gateway 本地真实读文件/目录/符号工具注入证据；弱上游不发 tool call 时也能稳定完成本地文件读取 smoke |
 | `context.max_input_tokens` | 24000 | 超过此值触发上下文压缩 |
 
 ### 3.4 环境变量对照表
@@ -198,12 +226,14 @@ curl http://127.0.0.1:8885/healthz
 | `UPSTREAM_PROTOCOL` | upstream.protocol | 兼容旧环境变量，未设置 `GATEWAY_UPSTREAM_PROTOCOL` 时生效 |
 | `GATEWAY_DOWNSTREAM_KEY` | downstream key + gateway.client_snippet_api_key | 下游 API Key；环境变量会同时用于认证和客户端片段 |
 | `GATEWAY_ADMIN_PASSWORD` | admin.password | 管理员密码 |
-| `GATEWAY_WORKSPACE_ROOT` | gateway.workspace_root | 工作目录 |
+| `GATEWAY_WORKSPACE_ROOT` | gateway.workspace_root | 显式设置为非当前目录时优先于保存配置；启动脚本默认导出的 `$PWD` 只作为兜底，不会压过 UI/配置保存的 workspace_root |
 | `GATEWAY_PORT` | - | 监听端口（默认 8885） |
 | `GATEWAY_HOST` | - | 监听地址（默认 0.0.0.0） |
 | `GATEWAY_SQLITE_LOG_PATH` | gateway.sqlite_log_path | SQLite 请求/工具/记忆日志路径 |
+| `GATEWAY_MAX_TOOL_ROUNDS` | gateway.max_tool_rounds | 最大工具调用轮数；设置后优先于配置文件/Admin UI 保存值 |
 | `GATEWAY_MAX_REQUEST_BODY_BYTES` | gateway.max_request_body_bytes | POST 请求体读取前字节上限，默认 64MB，超限返回 413 |
 | `GATEWAY_MAX_LOG_PAYLOAD_CHARS` | gateway.max_log_payload_chars | 单个 request/response 日志 payload 与 tool failure 内容字符上限，默认 200000 |
+| `GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT` | gateway.text_tool_adapter_compact_token_limit | 文本工具适配前的压缩阈值上限，默认 48000；实际阈值动态计算；设为 0 可关闭 |
 
 配置文件存在但 JSON 损坏或根节点不是对象时，Gateway 会 fail closed：Admin/API 请求返回结构化 500 `invalid gateway config`，不会静默回退到默认 `admin/admin` 或无下游鉴权。修复方式是恢复有效 `.gateway_service.json`，而不是依赖代码默认值。
 
@@ -214,6 +244,10 @@ Gateway 会在读取前限制 HTTP POST 请求体大小：`gateway.max_request_b
 请求/响应日志、tool failure 内容和 Admin 配置展示会遮盖常见敏感字段，包括 `Authorization`、`X-API-Key`、`Cookie`、token、secret、password、`key_hash` 等；`must_change_password` 等非敏感状态字段会保留原值。请求/响应日志与 tool failure 内容在遮盖之后会按 `gateway.max_log_payload_chars` / `GATEWAY_MAX_LOG_PAYLOAD_CHARS` 截断，避免长 prompt、大响应或失败详情导致 SQLite/JSONL 日志膨胀。
 
 Admin 写操作会校验浏览器 `Origin` / `Referer`：跨源请求返回 403，畸形来源 fail closed；同源请求和无来源头的 CLI/脚本请求保持可用。反向代理部署时请正确传递 `Host` / `X-Forwarded-Host` / `X-Forwarded-Proto`，或配置 `gateway.public_base_url`。
+
+Admin 表单数字字段是 fail-closed 语义：`/admin/config`、`/admin/upstream-profile`、`/admin/client-config` 中的数字项如果提交非法值，会返回结构化 400 `invalid numeric field: <field>`，并且不会保存本次请求里的任何部分变更；字段缺失或空字符串时保留已有配置，已有配置不存在时才使用默认值。这覆盖上游 timeout/token/concurrency、gateway tool rounds/concurrency/timeout、context fanout 参数和 client snippet token limits。
+
+`gateway.text_tool_adapter_compact_token_limit` 是弱上游文本工具适配前的压缩阈值上限。实际阈值动态计算为 `max(8000, min(upstream.max_input_tokens * 0.45, config_cap))`：小上游保底 8000 tokens，中上游按 45% 比例缩放，大上游由 config_cap 封顶（默认 48000）。设为 0 可关闭该专项压缩。
 
 ---
 
@@ -245,7 +279,7 @@ GATEWAY_START_METHOD=launchd ./scripts/mimo_gateway.sh start
 ./scripts/mimo_gateway.sh stop
 
 # 重启服务
-./scripts/mimo_gateway.sh restart
+./scripts/mimo_gateway.sh start
 
 # 查看日志
 tail -f .gateway_runtime/gateway-8885.log
@@ -302,12 +336,71 @@ curl http://127.0.0.1:8885/v1/models \
 ### 5.4 运行测试套件
 
 ```bash
-# 运行全部测试（当前 150 个）
-python3 -m unittest discover -s tests -v
+# 运行全部测试（当前 167 个）
+python3 -m pytest -q
 
 # 运行集成测试
 python3 tests/integration/smoke_gateway_tools.py
 ```
+
+### 5.5 当前稳定性 smoke（临时端口）
+
+不想影响本机 8885 服务时，可用临时配置和端口启动真实进程：
+
+```bash
+TMPDIR=$(mktemp -d)
+GATEWAY_CONFIG_PATH="$TMPDIR/config.json" \
+GATEWAY_SQLITE_LOG_PATH="$TMPDIR/gateway_log.sqlite3" \
+GATEWAY_DOWNSTREAM_KEY=smoke-key \
+GATEWAY_ADMIN_PASSWORD=admin \
+python3 src/toolcall_gateway.py --host 127.0.0.1 --port 8899
+
+# 另一个终端验证
+curl -fsS http://127.0.0.1:8899/healthz
+curl -fsS -u admin:admin http://127.0.0.1:8899/ui >/dev/null
+curl -fsS -u admin:admin http://127.0.0.1:8899/client-config.json >/dev/null
+# /v1/models 需要 UPSTREAM_BASE_URL 指向可访问上游；未配置上游时应跳过该项或预期返回上游配置错误。
+curl -fsS -H 'authorization: Bearer smoke-key' http://127.0.0.1:8899/v1/models >/dev/null
+curl -fsS -H 'authorization: Bearer smoke-key' -H 'content-type: application/json' \
+  -d '{"tool":"calculator","arguments":{"expression":"6*7"}}' \
+  http://127.0.0.1:8899/v1/tools/call
+```
+
+本轮稳定性验证还覆盖了 Admin 数字字段错误请求：非法数字应返回 400，缺失字段应保留旧配置，`gateway.max_tool_rounds` 应实际限制非流式/流式工具循环。
+
+项目级验证脚本也已通过：
+
+```bash
+GATEWAY_VERIFY_MODEL_REQUESTS=0 GATEWAY_VERIFY_DIRECT_REQUESTS=24 GATEWAY_VERIFY_WORKERS=8 ./scripts/mimo_gateway.sh verify
+# 167 unittest tests OK
+# tool acceptance OK
+# security/auth guardrails OK
+# 24-request concurrency/performance smoke OK
+```
+
+### 5.6 当前 8885 + Claude Code 复验记录
+
+2026-05-24 在本机默认配置上已复验，最终 HTTP artifact 为 `.gateway_runtime/final-smoke-20260524-074454-goal-audit/summary.json`，Claude Code 本地文件 artifact 为 `.gateway_runtime/claude-local-file-probe-20260524-074546-goal-audit.summary.json`：
+
+```bash
+./scripts/mimo_gateway.sh start
+curl -fsS http://127.0.0.1:8885/healthz
+curl -fsS -u admin:admin http://127.0.0.1:8885/ui >/dev/null
+curl -fsS -u admin:admin http://127.0.0.1:8885/admin/upstream-models.json | python3 -m json.tool
+curl -fsS http://127.0.0.1:8885/v1/tools/call \
+  -H 'Authorization: Bearer <your-gateway-key>' \
+  -H 'Content-Type: application/json' \
+  -d '{"tool":"calc","arguments":{"expr":"2+2"}}'
+
+curl -fsS http://127.0.0.1:8885/anthropic/v1/messages \
+  -H 'Authorization: Bearer <your-gateway-key>' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"mimo-v2.5-pro","messages":[{"role":"user","content":"What is 2+2?"}],"tools":[{"name":"calc","description":"Evaluate math expression","input_schema":{"type":"object","properties":{"expr":{"type":"string"}},"required":["expr"]}}],"max_tokens":100}'
+```
+
+结果：健康检查、UI、`/v1/chat/completions`、`/anthropic/v1/messages`、`/v1/responses`、`/v1/tools/call`、`/v1/functions/call`、真实上游 `/v1/models` 拉取均通过；Claude Code `claude_mnative` 本地文件 smoke exit 0 且 stdout 精确为 `2+2=4`，且没有 `too long` / `malformed` / `empty response` 已知失败标记。上游模型可能自带 `<think>` 文本，这是上游输出风格，不是 Gateway 协议错误。并发阀门也已用 HTTP 入口回归验证：占满 `gateway.max_concurrent_requests` 后继续请求会返回结构化 429，而不是绕过 UI 中保存的限制。
+
+代码回归还覆盖了两条工具编排链：Claude Code/Anthropic Messages 路径返回 `tool_use name=calc input.expr` 时执行内置 `calculator` 并回填；Codex/OpenAI Responses 路径返回 `function_call name=calc arguments.expr` 时执行真实工具并把 `role=tool content=4` 传回上游继续生成。`/v1/responses` 返回会归一化为 strict Responses shape，至少包含 `id`、`object=response`、`output`、`status`、`usage`。
 
 ---
 
@@ -316,10 +409,28 @@ python3 tests/integration/smoke_gateway_tools.py
 ### 6.1 Claude Code
 
 ```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8885
-export ANTHROPIC_API_KEY=your-gateway-api-key
-claude
+claude_mnative() {
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:8885/anthropic"
+    export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+    export ANTHROPIC_AUTH_TOKEN="your-gateway-api-key"
+    export ANTHROPIC_API_KEY=""
+    export ANTHROPIC_DEFAULT_OPUS_MODEL="mimo-v2.5-pro"
+    export ANTHROPIC_DEFAULT_SONNET_MODEL="mimo-v2.5-pro"
+    export ANTHROPIC_DEFAULT_HAIKU_MODEL="mimo-v2.5-pro"
+    export ANTHROPIC_MODEL="mimo-v2.5-pro"
+    export ANTHROPIC_SMALL_FAST_MODEL="mimo-v2.5-pro"
+    export ENABLE_LSP_TOOL="1"
+    /opt/homebrew/bin/claude --dangerously-skip-permissions "$@"
+}
+
+# 非交互验活；期望返回 OK 或等价短答。
+claude_mnative -p "Reply with OK only."
 ```
+
+`ANTHROPIC_BASE_URL` 推荐带 `/anthropic` 前缀。Claude Code 会请求
+`/anthropic/v1/messages` / `/anthropic/v1/messages/count_tokens`，Gateway 在
+HTTP 入口规范化为内部 `/v1/messages` / `/v1/messages/count_tokens`。下游鉴权
+同时接受 `Authorization: Bearer <key>` 和 Anthropic SDK 常见的 `x-api-key: <key>`。
 
 ### 6.2 OpenCode
 
@@ -542,11 +653,20 @@ ai_tool_functioncall/
 |------|------|------|
 | `/healthz` | GET | 健康检查 |
 | `/ui` | GET | Admin UI |
+| `/client-config` | GET | 下游客户端配置片段 |
+| `/client-config.json` | GET | 下游客户端配置片段（JSON 格式） |
+| `/admin/upstream-models.json` | GET/POST | Admin 鉴权后拉取上游 `/v1/models`；GET 只用已保存 active profile，POST 可用表单临时配置 |
 | `/v1/models` | GET | 模型列表 |
 | `/v1/chat/completions` | POST | OpenAI Chat 接口 |
 | `/v1/responses` | POST | OpenAI Responses 接口 |
 | `/v1/messages` | POST | Anthropic Messages 接口 |
+| `/anthropic/v1/messages` | POST | Claude Code / Anthropic SDK base URL 兼容别名，内部映射到 `/v1/messages` |
+| `/v1/messages/count_tokens` | POST | Anthropic token count 兼容 |
+| `/anthropic/v1/messages/count_tokens` | POST | Anthropic token count 兼容别名 |
+| `/v1/chat/completions/count_tokens` | POST | Chat token count 兼容 |
 | `/v1/tools/call` | POST | 直接工具调用 |
+| `/v1/functions/call` | POST | 直接工具调用兼容路径 |
+| `/tools/call` | POST | 直接工具调用兼容路径（无 `/v1` 前缀） |
 
 ### C. 支持的工具
 
@@ -562,4 +682,4 @@ ai_tool_functioncall/
 
 ---
 
-**最后更新**: 2026-05-19
+**最后更新**: 2026-05-24

@@ -37,7 +37,7 @@ PY
 
 DOWNSTREAM_API_KEY="${DOWNSTREAM_API_KEY:-$(configured_value gateway.client_snippet_api_key '')}"
 # Also check GATEWAY_DOWNSTREAM_KEY for Phase 1 compatibility
-if [[ -z "$DOWNSTREAM_API_KEY" && -n "$GATEWAY_DOWNSTREAM_KEY" ]]; then
+if [[ -z "$DOWNSTREAM_API_KEY" && -n "${GATEWAY_DOWNSTREAM_KEY:-}" ]]; then
   DOWNSTREAM_API_KEY="$GATEWAY_DOWNSTREAM_KEY"
 fi
 PUBLIC_BASE_URL="${GATEWAY_PUBLIC_BASE_URL:-http://127.0.0.1:${PORT}}"

@@ -1482,9 +1482,9 @@ def _build_builtin_tools() -> dict[str, GatewayTool]:
         GatewayTool(
             "calculator",
             "Safely evaluate a basic arithmetic expression.",
-            _json_schema({"expression": {"type": "string"}}, ["expression"]),
+            _json_schema({"expression": {"type": "string"}, "expr": {"type": "string"}}, ["expression"]),
             _tool_calculator,
-            aliases=("gateway__calculator",),
+            aliases=("calc", "gateway__calculator"),
         ),
         GatewayTool(
             "get_current_time",

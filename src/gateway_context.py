@@ -51,6 +51,7 @@ def _body_token_estimate(body: Json) -> int:
 
 def _gateway_system_prompt(reason: str = "context_compaction") -> str:
     return (
+        "[gateway context compacted]\n"
         "[Gateway context management: This conversation has been compacted to fit within "
         "the context window. Recent messages have been preserved, and older messages have "
         "been summarized. Tool call results from earlier in the conversation may have been "
@@ -511,16 +512,34 @@ def _trim_content_for_context(content: Any, limit: int) -> Any:
     return content
 
 
+def _content_text_length(content: Any) -> int:
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        total = 0
+        for item in content:
+            if isinstance(item, dict) and item.get("type") in {"text", "input_text", "output_text"}:
+                total += len(str(item.get("text") or ""))
+            elif isinstance(item, str):
+                total += len(item)
+        return total
+    if isinstance(content, dict) and content.get("type") == "text":
+        return len(str(content.get("text") or ""))
+    return len(str(content)) if content is not None else 0
+
+
 def _compact_messages(messages: Any, *, keep_recent: int, text_limit: int) -> list[Json]:
     if not isinstance(messages, list):
         return messages
     result = []
+    huge_message_limit = max(text_limit * 2, text_limit)
     for i, msg in enumerate(messages):
         if not isinstance(msg, dict):
             result.append(msg)
             continue
-        if i < len(messages) - keep_recent:
-            content = msg.get("content")
+        content = msg.get("content")
+        should_trim = i < len(messages) - keep_recent or _content_text_length(content) > huge_message_limit
+        if should_trim:
             trimmed = _trim_content_for_context(content, text_limit)
             result.append({**msg, "content": trimmed})
         else:

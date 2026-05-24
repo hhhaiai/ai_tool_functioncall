@@ -135,6 +135,9 @@ class NativeProxyClient:
     def get(self, path: str) -> Json:
         return self._do_request("GET", path)
 
+    def get_upstream_path(self, path: str) -> Json:
+        return self._do_request("GET", path)
+
     def post(self, path: str, body: Json) -> Json:
         return self._do_request("POST", path, body)
 

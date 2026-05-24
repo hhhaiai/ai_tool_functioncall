@@ -31,6 +31,23 @@ SUPPORTED_PATHS = {
 MODEL_LIST_PATHS = {"/v1/models"}
 TOKEN_COUNT_PATHS = {"/v1/messages/count_tokens", "/v1/chat/completions/count_tokens"}
 DIRECT_TOOL_CALL_PATHS = {"/v1/tools/call", "/v1/functions/call", "/tools/call"}
+ANTHROPIC_COMPAT_PREFIX = "/anthropic"
+
+
+def _normalize_request_path(path: str) -> str:
+    """Map compatibility URL prefixes to the gateway's canonical API paths."""
+    if path == ANTHROPIC_COMPAT_PREFIX:
+        return "/"
+    if path.startswith(f"{ANTHROPIC_COMPAT_PREFIX}/"):
+        suffix = path[len(ANTHROPIC_COMPAT_PREFIX):]
+        return suffix or "/"
+    return path
+
+
+def _supported_public_paths() -> set[str]:
+    canonical = SUPPORTED_PATHS | DIRECT_TOOL_CALL_PATHS | MODEL_LIST_PATHS | TOKEN_COUNT_PATHS
+    anthropic_aliases = {f"{ANTHROPIC_COMPAT_PREFIX}{path}" for path in canonical if path.startswith("/v1/")}
+    return canonical | anthropic_aliases
 
 
 def _hash_secret(secret: str) -> str:
@@ -60,6 +77,51 @@ def _env_float(name: str, default: float) -> float:
 
 def _env_upstream_protocol(default: str = "openai_chat") -> str:
     return str(os.environ.get("GATEWAY_UPSTREAM_PROTOCOL") or os.environ.get("UPSTREAM_PROTOCOL") or default)
+
+
+def _admin_form_numeric_raw(
+    form: dict[str, str],
+    keys: tuple[str, ...],
+    existing_value: Any,
+    default: int | float,
+) -> str:
+    if not keys:
+        raise ValueError("admin numeric field requires at least one key")
+    for key in keys:
+        value = form.get(key)
+        if value is not None:
+            stripped = str(value).strip()
+            if stripped:
+                return stripped
+    if existing_value not in (None, ""):
+        return str(existing_value).strip()
+    return str(default)
+
+
+def _admin_form_int(
+    form: dict[str, str],
+    keys: tuple[str, ...],
+    existing_value: Any,
+    default: int,
+) -> int:
+    raw = _admin_form_numeric_raw(form, keys, existing_value, default)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid numeric field: {keys[0]}") from None
+
+
+def _admin_form_float(
+    form: dict[str, str],
+    keys: tuple[str, ...],
+    existing_value: Any,
+    default: float,
+) -> float:
+    raw = _admin_form_numeric_raw(form, keys, existing_value, default)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid numeric field: {keys[0]}") from None
 
 
 def _default_config() -> Json:
@@ -139,6 +201,7 @@ def _default_config() -> Json:
             "tool_execution_timeout_seconds": _env_float("GATEWAY_TOOL_EXECUTION_TIMEOUT", 60.0),
             "record_unsupported_tools": _env_bool("GATEWAY_RECORD_UNSUPPORTED_TOOLS", True),
             "text_tool_call_fallback_enabled": _env_bool("GATEWAY_TEXT_TOOL_CALL_FALLBACK", True),
+            "text_tool_adapter_compact_token_limit": _env_int("GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT", 12000),
             "local_planner_enabled": _env_bool("GATEWAY_LOCAL_PLANNER_ENABLED", True),
             "local_planner_max_files": _env_int("GATEWAY_LOCAL_PLANNER_MAX_FILES", 24),
             "local_planner_max_bytes_per_file": _env_int("GATEWAY_LOCAL_PLANNER_MAX_BYTES_PER_FILE", 24000),
@@ -383,31 +446,76 @@ def _profile_from_admin_form(form: dict[str, str], existing: Json | None = None)
     profile = copy.deepcopy(existing) if existing else {}
     profile["id"] = form.get("profile_id", form.get("id", "")).strip() or profile.get("id") or "default"
     profile["name"] = form.get("profile_name", form.get("name", "")).strip() or profile.get("name") or profile["id"]
-    profile["base_url"] = form.get("base_url", "").strip()
-    profile["api_key"] = form.get("api_key", "").strip()
-    profile["model"] = form.get("model", "").strip()
+    profile["base_url"] = form.get("base_url", "").strip() or profile.get("base_url", "")
+    api_key_value = form.get("api_key")
+    if api_key_value is not None and api_key_value.strip():
+        profile["api_key"] = api_key_value.strip()
+    else:
+        profile["api_key"] = profile.get("api_key", "")
+    profile["model"] = form.get("model", "").strip() or profile.get("model", "")
     profile["protocol"] = form.get("protocol", "openai_chat").strip()
     profile["tools_enabled"] = form.get("tools_enabled", form.get("tool_mode", "auto")).strip()
-    profile["timeout_seconds"] = float(form.get("upstream_timeout_seconds") or form.get("timeout_seconds") or form.get("timeout") or 60.0)
-    profile["max_input_tokens"] = int(form.get("upstream_max_input_tokens") or form.get("max_input_tokens") or 128000)
-    profile["max_output_tokens"] = int(form.get("upstream_max_output_tokens") or form.get("max_output_tokens") or 8192)
-    profile["max_concurrency"] = int(form.get("upstream_max_concurrency") or form.get("max_concurrency") or 32)
+    profile["timeout_seconds"] = _admin_form_float(
+        form,
+        ("upstream_timeout_seconds", "timeout_seconds", "timeout"),
+        profile.get("timeout_seconds"),
+        60.0,
+    )
+    profile["max_input_tokens"] = _admin_form_int(
+        form,
+        ("upstream_max_input_tokens", "max_input_tokens"),
+        profile.get("max_input_tokens"),
+        128000,
+    )
+    profile["max_output_tokens"] = _admin_form_int(
+        form,
+        ("upstream_max_output_tokens", "max_output_tokens"),
+        profile.get("max_output_tokens"),
+        8192,
+    )
+    profile["max_concurrency"] = _admin_form_int(
+        form,
+        ("upstream_max_concurrency", "max_concurrency"),
+        profile.get("max_concurrency"),
+        32,
+    )
+    existing_paths = profile.get("paths") if isinstance(profile.get("paths"), dict) else {}
     profile["paths"] = {
-        "models": form.get("path_models", "/v1/models").strip() or "/v1/models",
-        "chat_completions": form.get("path_chat_completions", "/v1/chat/completions").strip() or "/v1/chat/completions",
-        "responses": form.get("path_responses", "/v1/responses").strip() or "/v1/responses",
-        "messages": form.get("path_messages", "/v1/messages").strip() or "/v1/messages",
+        "models": form.get("path_models", "").strip() or existing_paths.get("models") or "/v1/models",
+        "chat_completions": form.get("path_chat_completions", "").strip() or existing_paths.get("chat_completions") or "/v1/chat/completions",
+        "responses": form.get("path_responses", "").strip() or existing_paths.get("responses") or "/v1/responses",
+        "messages": form.get("path_messages", "").strip() or existing_paths.get("messages") or "/v1/messages",
     }
-    profile["capabilities"] = {
-        "supports_streaming": form.get("cap_supports_streaming", "") != "",
-        "supports_tools": form.get("cap_supports_tools", "") != "",
-        "supports_function_calls": form.get("cap_supports_function_calls", "") != "",
-        "supports_parallel_tool_calls": form.get("cap_supports_parallel_tool_calls", "") != "",
-        "supports_vision": form.get("cap_supports_vision", "") != "",
-        "supports_network": form.get("cap_supports_network", "") != "",
-        "supports_web_search": form.get("cap_supports_web_search", "") != "",
-        "supports_json_schema": form.get("cap_supports_json_schema", "") != "",
+    profile["native_tools_verified"] = form.get("native_tools_verified", "") != "" if "native_tools_verified" in form else bool(profile.get("native_tools_verified", False))
+    profile["use_for_coding"] = form.get("use_for_coding", "") != "" if "use_for_coding" in form else bool(profile.get("use_for_coding", True))
+    cap_form_keys = {
+        "supports_streaming": "cap_supports_streaming",
+        "supports_tools": "cap_supports_tools",
+        "supports_function_calls": "cap_supports_function_calls",
+        "supports_parallel_tool_calls": "cap_supports_parallel_tool_calls",
+        "supports_vision": "cap_supports_vision",
+        "supports_network": "cap_supports_network",
+        "supports_web_search": "cap_supports_web_search",
+        "supports_json_schema": "cap_supports_json_schema",
     }
+    existing_caps = profile.get("capabilities") if isinstance(profile.get("capabilities"), dict) else {}
+    explicit_capability_form = form.get("capabilities_form", "") != "" or any(form_key in form for form_key in cap_form_keys.values())
+    if explicit_capability_form or not existing_caps:
+        profile["capabilities"] = {
+            cap_key: form.get(form_key, "") != ""
+            for cap_key, form_key in cap_form_keys.items()
+        }
+    else:
+        profile["capabilities"] = {
+            "supports_streaming": bool(existing_caps.get("supports_streaming", True)),
+            "supports_tools": bool(existing_caps.get("supports_tools", True)),
+            "supports_function_calls": bool(existing_caps.get("supports_function_calls", True)),
+            "supports_parallel_tool_calls": bool(existing_caps.get("supports_parallel_tool_calls", True)),
+            "supports_vision": bool(existing_caps.get("supports_vision", False)),
+            "supports_network": bool(existing_caps.get("supports_network", False)),
+            "supports_web_search": bool(existing_caps.get("supports_web_search", False)),
+            "supports_json_schema": bool(existing_caps.get("supports_json_schema", True)),
+        }
     return _normalize_upstream_profile(profile, fallback_name=profile["name"])
 
 
@@ -420,6 +528,55 @@ def _redacted_config(config: Json) -> Json:
 
 def _config_env(name: str, fallback: str = "") -> str:
     return os.environ.get(name) or fallback
+
+
+def _configured_max_tool_rounds(gateway_cfg: Json | None = None) -> int:
+    """Resolve tool loop budget with env override first, then persisted gateway config."""
+    if gateway_cfg is None:
+        gateway_cfg = _gateway_config()
+    try:
+        return int(os.environ.get("GATEWAY_MAX_TOOL_ROUNDS") or gateway_cfg.get("max_tool_rounds") or 5)
+    except (TypeError, ValueError):
+        return 5
+
+
+_TEXT_TOOL_ADAPTER_COMPACT_FLOOR = 8000
+_TEXT_TOOL_ADAPTER_COMPACT_RATIO = 0.45
+_TEXT_TOOL_ADAPTER_COMPACT_DEFAULT_CAP = 48000
+
+
+def _resolved_text_tool_adapter_compact_token_limit(
+    gateway_cfg: Json | None = None,
+    upstream_cfg: Json | None = None,
+) -> int:
+    """Dynamic compact threshold for weak-upstream text tool adapter.
+
+    Formula: max(floor, min(upstream.max_input_tokens * ratio, config_cap))
+    - floor: 8000 — minimum usable budget for basic harness
+    - ratio: 0.45 — leave room for tool instructions + response + user intent
+    - config_cap: gateway.text_tool_adapter_compact_token_limit (default 48000)
+    """
+    if gateway_cfg is None:
+        gateway_cfg = _gateway_config()
+    if upstream_cfg is None:
+        upstream_cfg = _upstream_config()
+    try:
+        raw = os.environ.get("GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT")
+        if raw is None:
+            raw = gateway_cfg.get("text_tool_adapter_compact_token_limit")
+        if raw is None:
+            raw = _TEXT_TOOL_ADAPTER_COMPACT_DEFAULT_CAP
+        config_cap = int(raw)
+    except (TypeError, ValueError):
+        config_cap = _TEXT_TOOL_ADAPTER_COMPACT_DEFAULT_CAP
+    if config_cap <= 0:
+        return 0  # disabled
+    try:
+        upstream_limit = int(upstream_cfg.get("max_input_tokens") or 128000)
+    except (TypeError, ValueError):
+        upstream_limit = 128000
+    dynamic = int(upstream_limit * _TEXT_TOOL_ADAPTER_COMPACT_RATIO)
+    return max(_TEXT_TOOL_ADAPTER_COMPACT_FLOOR, min(dynamic, config_cap))
 
 
 def _upstream_config() -> Json:

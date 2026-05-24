@@ -3,7 +3,7 @@
 **Project:** ai_tool_functioncall gateway
 **Last Updated:** 2026-05-23
 **Status:** Core conversions and runtime lifecycle verified in the split-module gateway
-**Test Suite:** 150 unittest cases passing
+**Test Suite:** 167 unittest cases passing
 
 ---
 
@@ -122,7 +122,7 @@ Result:   ✅ Model correctly invokes the tool
 Key observation: The model's `reasoning_content` shows it decided to use the tool:
 > "The user is asking a simple math question: what is 2+2? I can use the calculator tool to evaluate this expression."
 
-### 3.2 Provider: 47.85 (47.85.40.209:8885) — Tool Calls DO NOT Trigger
+### 3.2 Provider: provider-b (provider-b.example.local:8885) — Tool Calls DO NOT Trigger
 
 **Model:** `mimo-v2.5-pro` (same model!)
 **Protocol:** OpenAI Chat (`/v1/chat/completions`)
@@ -140,7 +140,7 @@ Key observation: The model's `<think>` shows it explicitly chose not to use the 
 
 **Same model, different behavior.** The difference is NOT in the model but in the **provider runtime**:
 
-| Factor | fufu | 47.85 |
+| Factor | fufu | provider-b |
 |---|---|---|
 | Model | mimo-v2.5-pro | mimo-v2.5-pro |
 | Tool schema sent | ✅ Identical | ✅ Identical |
@@ -166,68 +166,84 @@ This proves the audit report's core thesis: **protocol compatibility ≠ tool ru
 
 ## 4. Architecture Decisions
 
-### 4.1 Orchestrate vs Passthrough
+### 4.1 Two Independent Control Axes
 
-The gateway operates in two modes:
+The gateway uses two independent configuration axes:
 
-**Passthrough mode** (primary):
-- Client sends request → Gateway translates format → Upstream processes → Gateway translates response → Client receives
-- Used when upstream provider natively supports tool calls
-- Minimal latency overhead, preserves provider capabilities
+**`tool_mode`** — controls the Gateway's role:
 
-**Orchestrate mode** (fallback):
-- Gateway acts as tool runtime when upstream doesn't support native tools
-- Gateway strips tools from request, sends plain prompt to upstream
-- Parses tool calls from response text (`_parse_text_tool_calls`)
-- Executes tools, injects results, loops until final answer
-- Higher latency, but works with any upstream
+| Mode | Behavior |
+|------|----------|
+| `orchestrate` (default) | Gateway acts as tool runtime: parses tool calls from upstream, executes locally, injects results, loops until final answer |
+| `native_passthrough` / `proxy` | Gateway passes through: upstream handles tools natively, Gateway only translates protocol formats |
+| `passthrough` (legacy alias) | Same as `native_passthrough` |
 
-**Decision rationale:** Passthrough is preferred because:
-1. Preserves native provider tool runtime (streaming, parallel calls, etc.)
-2. Lower latency (no gateway-side execution loop)
-3. Provider may have optimizations (e.g., tool_choice forcing, structured output)
+**`tools_enabled`** — controls whether native tool schemas are sent to upstream:
 
-### 4.2 Gateway as Tool Runtime
+| Value | Behavior |
+|-------|----------|
+| `auto` (default) | Checks `supports_tools` + `supports_function_calls` capabilities; sends native tools if both true, otherwise falls back to text tool adapter |
+| `native` | Always sends native tool schemas |
+| `native_only` | Sends native tools only; fails fast if capabilities are insufficient |
+| `adapter` / `text_only` | Always uses Gateway's local real tool text adapter |
+| `off` | No tools, no adapter |
 
-When the gateway IS the tool runtime (orchestrate mode):
+### 4.2 Gateway as Tool Runtime (Orchestrate Mode)
+
+When `tool_mode=orchestrate`, the Gateway is the tool runtime:
 
 ```
 Client Request
   ↓
 Gateway: detect tools in request
   ↓
-Gateway: probe upstream capability
+Check tools_enabled + upstream capabilities
   ↓
-┌─ Native tools supported → Passthrough
-└─ No native tools → Orchestrate
+┌─ tools_enabled=auto AND supports_tools=true → send native tools to upstream
+├─ tools_enabled=auto AND supports_tools=false → text tool adapter (§4.4)
+├─ tools_enabled=native_only AND capabilities不足 → fail-fast
+└─ tools_enabled=off → no tools
      ↓
-   Strip tools from request
+Parse response for tool calls (structured or text fallback)
      ↓
-   Send modified prompt to upstream
+Execute tools locally (builtin / MCP / HTTP Action)
      ↓
-   Parse response for tool calls (structured or text)
+Inject results into conversation
      ↓
-   Execute tools (MCP / HTTP / builtin)
+Loop until no more tool calls (max rounds configurable)
      ↓
-   Inject results into conversation
-     ↓
-   Loop until no more tool calls
-     ↓
-   Return final answer to client
+Return final answer to client
 ```
 
 ### 4.3 Capability Probe Strategy
 
-Current probe sends a simple request with tools and checks if the response contains tool_calls. The audit report identifies this as insufficient:
+The probe uses forced `tool_choice` to verify upstream tool support:
 
-**Current approach:** `tool_choice: "auto"` → check for tool_calls in response
-**Problem:** Auto means the model decides; a simple query like "2+2" may not trigger tool use
-**Recommended:** Use forced `tool_choice: {type: "function", function: {name: "echo_probe"}}` to verify provider actually supports tool forcing
+**`_probe_body(path, model)`** sends a request with `echo_probe` tool and forced `tool_choice`:
+- Chat: `tool_choice: {type: "function", function: {name: "echo_probe"}}`
+- Responses: `tool_choice: {type: "function", name: "echo_probe"}`
+- Anthropic: `tool_choice: {type: "tool", name: "echo_probe"}`
 
-**Capability levels:**
-- `native_tools_full` — Forced tool_choice works, roundtrip works, streaming works
-- `native_tools_partial` — Auto works but forcing unreliable
-- `native_tools_none` — No structured tool support, need text parsing fallback
+This forces the upstream to either call the tool (proving support) or fail/ignore it (proving lack of support). Auto `tool_choice` is unreliable because the model may choose not to call tools for simple queries.
+
+### 4.4 Text Tool Adapter with Dynamic Compaction
+
+When the upstream doesn't support native tools, the Gateway injects text-based tool instructions and parses `<function=Tool>` / `<parameter=name>` responses.
+
+**Dynamic compaction** prevents provider-level `too long` refusals for large Claude Code/Codex harnesses:
+
+```
+limit = max(8000, min(upstream.max_input_tokens * 0.45, config_cap))
+```
+
+| Upstream max_input_tokens | Dynamic limit | Effect |
+|--------------------------|---------------|--------|
+| 4k (small) | 8000 (floor) | Aggressive compaction |
+| 32k | 14400 | Moderate compaction |
+| 128k | 48000 (default cap) | Only compact truly large harnesses |
+| 1M | 48000 (default cap) | Same; config_cap can be raised |
+
+Config cap defaults to 48000; set to 0 to disable. Env var `GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT` overrides config.
 
 ---
 
@@ -258,7 +274,7 @@ Current probe sends a simple request with tools and checks if the response conta
 ## 6. Test Coverage Summary
 
 ```
-Total tests:    150 unittest cases
+Total tests:    167 unittest cases
 Result:         OK
 Coverage focus: protocol conversion, streaming tool events, tool orchestration, context fan-out, SQLite memory/logging, HTTP routing/auth, MCP, HTTP Actions, workspace sandbox, provider failure semantics
 ```
@@ -279,6 +295,6 @@ Coverage focus: protocol conversion, streaming tool events, tool orchestration, 
 
 ## 7. Reference Data Sources
 
-- `case.txt` — Real curl commands and responses from fufu and 47.85 providers
+- `case.txt` — Real curl commands and responses from fufu and provider-b providers
 - `tool_gateway_audit_report.md` — Comprehensive audit of architecture and gaps
-- Test suite — 150 automated unittest cases covering protocol conversion, streaming, orchestration, auth, request-body limits, bounded request/failure logging, context, MCP, HTTP Actions, sandboxing, provider failure semantics, and tracing
+- Test suite — 167 automated unittest cases covering protocol conversion, streaming, orchestration, auth, request-body limits, bounded request/failure logging, context, MCP, HTTP Actions, sandboxing, provider failure semantics, and tracing

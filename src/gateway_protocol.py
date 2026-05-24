@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+import uuid
 from typing import Any
 
 Json = dict[str, Any]
@@ -259,12 +260,65 @@ def _openai_tool_calls_from_response(response: Json) -> list[dict]:
     return []
 
 
+def _anthropic_stop_reason(finish_reason: Any, *, has_tool_use: bool = False) -> str:
+    if has_tool_use or finish_reason == "tool_calls":
+        return "tool_use"
+    if finish_reason == "length":
+        return "max_tokens"
+    if finish_reason == "content_filter":
+        return "stop_sequence"
+    if finish_reason in {"end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn", "refusal"}:
+        return str(finish_reason)
+    return "end_turn"
+
+
+def _anthropic_usage_from_openai(response: Json) -> Json:
+    usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+    return {
+        "input_tokens": int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0),
+        "output_tokens": int(usage.get("output_tokens") or usage.get("completion_tokens") or 0),
+    }
+
+
+def _ensure_anthropic_message_response(response: Json, *, fallback_model: str = "") -> Json:
+    """Return an Anthropic Messages response shape strict clients accept."""
+    if not isinstance(response, dict):
+        response = {}
+    normalized = dict(response)
+    normalized.setdefault("id", f"msg_gateway_{uuid.uuid4().hex}")
+    normalized.setdefault("type", "message")
+    normalized.setdefault("role", "assistant")
+    normalized.setdefault("model", fallback_model or str(response.get("model") or ""))
+    normalized.setdefault("content", [])
+    if not isinstance(normalized.get("content"), list):
+        normalized["content"] = [{"type": "text", "text": str(normalized.get("content") or "")}]
+    has_tool_use = any(isinstance(block, dict) and block.get("type") == "tool_use" for block in normalized.get("content") or [])
+    normalized["stop_reason"] = _anthropic_stop_reason(normalized.get("stop_reason"), has_tool_use=has_tool_use)
+    normalized.setdefault("stop_sequence", None)
+    usage = normalized.get("usage")
+    if not isinstance(usage, dict):
+        normalized["usage"] = {"input_tokens": 0, "output_tokens": 0}
+    else:
+        normalized["usage"] = {
+            "input_tokens": int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or usage.get("completion_tokens") or 0),
+        }
+    return normalized
+
+
 def _from_openai_chat_response(path: str, response: Json) -> Json:
     if "/messages" not in path:
         return response
     choices = response.get("choices") or []
     if not choices:
-        return {"role": "assistant", "content": []}
+        return _ensure_anthropic_message_response(
+            {
+                "id": response.get("id") or f"msg_gateway_{uuid.uuid4().hex}",
+                "model": response.get("model") or "",
+                "content": [],
+                "usage": _anthropic_usage_from_openai(response),
+            }
+        )
     message = choices[0].get("message") or {}
     content_parts = []
     if message.get("reasoning"):
@@ -283,14 +337,18 @@ def _from_openai_chat_response(path: str, response: Json) -> Json:
             "name": func.get("name", ""),
             "input": args,
         })
+    has_tool_use = any(isinstance(block, dict) and block.get("type") == "tool_use" for block in content_parts)
     result: Json = {
+        "id": response.get("id") or f"msg_gateway_{uuid.uuid4().hex}",
+        "type": "message",
         "role": "assistant",
+        "model": response.get("model") or "",
         "content": content_parts,
+        "stop_reason": _anthropic_stop_reason(choices[0].get("finish_reason"), has_tool_use=has_tool_use),
+        "stop_sequence": None,
+        "usage": _anthropic_usage_from_openai(response),
     }
-    finish_reason = choices[0].get("finish_reason")
-    if finish_reason:
-        result["stop_reason"] = finish_reason
-    return result
+    return _ensure_anthropic_message_response(result, fallback_model=str(response.get("model") or ""))
 
 
 def _last_user_text(path: str, body: Json) -> str:
@@ -537,11 +595,48 @@ def _from_responses_response_to_openai(response: Json) -> Json:
     }
 
 
+def _responses_usage_from_openai(response: Json) -> Json:
+    usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+    return {
+        "input_tokens": int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0),
+        "output_tokens": int(usage.get("output_tokens") or usage.get("completion_tokens") or 0),
+        "total_tokens": int(
+            usage.get("total_tokens")
+            or (int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0) + int(usage.get("output_tokens") or usage.get("completion_tokens") or 0))
+        ),
+    }
+
+
+def _ensure_openai_responses_response(response: Json) -> Json:
+    """Normalize Responses-like payloads to a strict OpenAI Responses shape."""
+    normalized = copy.deepcopy(response) if isinstance(response, dict) else {}
+    output = normalized.get("output")
+    if not isinstance(output, list):
+        output = []
+    normalized["id"] = str(normalized.get("id") or f"resp_{uuid.uuid4().hex}")
+    normalized["object"] = "response"
+    normalized.setdefault("model", "")
+    normalized["output"] = output
+    normalized.setdefault("status", "completed")
+    usage = normalized.get("usage")
+    if not isinstance(usage, dict):
+        normalized["usage"] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    else:
+        input_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+        output_tokens = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
+        normalized["usage"] = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": int(usage.get("total_tokens") or input_tokens + output_tokens),
+        }
+    return normalized
+
+
 def _from_openai_chat_to_responses_response(response: Json) -> Json:
-    """Convert OpenAI Chat response to OpenAI Responses format."""
+    """Convert OpenAI Chat response to strict OpenAI Responses format."""
     choices = response.get("choices") or []
     if not choices:
-        return {"output": []}
+        return _ensure_openai_responses_response({"model": response.get("model", ""), "output": [], "usage": _responses_usage_from_openai(response)})
     message = choices[0].get("message") or {}
     output_items = []
     if message.get("content"):
@@ -557,7 +652,12 @@ def _from_openai_chat_to_responses_response(response: Json) -> Json:
             "name": func.get("name", ""),
             "arguments": func.get("arguments", "{}"),
         })
-    return {"output": output_items}
+    return _ensure_openai_responses_response({
+        "id": response.get("id"),
+        "model": response.get("model", ""),
+        "output": output_items,
+        "usage": _responses_usage_from_openai(response),
+    })
 
 
 # =============================================================================
@@ -613,6 +713,8 @@ def _is_openai_responses_response(response: Json) -> bool:
     if not isinstance(response, dict):
         return False
     output = response.get("output")
+    if response.get("object") == "response" and isinstance(output, list):
+        return True
     if isinstance(output, list) and output:
         first = output[0]
         if isinstance(first, dict) and first.get("type") in ("function_call", "message", "tool_call"):
@@ -629,9 +731,9 @@ def _convert_response_to_downstream(downstream_path: str, response: Json, upstre
     """
     # If response is already in the target downstream format, return as-is
     if "/messages" in downstream_path and _is_anthropic_response(response):
-        return response
+        return _ensure_anthropic_message_response(response)
     if "/responses" in downstream_path and _is_openai_responses_response(response):
-        return response
+        return _ensure_openai_responses_response(response)
     if "/chat/completions" in downstream_path and _is_openai_chat_response(response):
         return response
 
@@ -642,7 +744,7 @@ def _convert_response_to_downstream(downstream_path: str, response: Json, upstre
         return _from_anthropic_response_to_openai(response)
     if upstream_protocol == "openai_responses":
         if "/responses" in downstream_path:
-            return response
+            return _ensure_openai_responses_response(response)
         return _from_responses_response_to_openai(response)
     # upstream_protocol == "openai_chat"
     if "/messages" in downstream_path:
@@ -722,10 +824,62 @@ def _responses_to_chat_payload(body: Json) -> Json:
 
 _TOOL_FORMAT_TAG = "function"
 _PARAM_TAG = "parameter"
+_TEXT_TOOL_BLOCK_MAX_CHARS = 8000
+
+
+def _tool_schema_name(tool: Json) -> str:
+    if not isinstance(tool, dict):
+        return ""
+    func = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+    return str(func.get("name") or tool.get("name") or "").strip()
+
+
+def _tool_schema_parameters(tool: Json) -> Json:
+    if not isinstance(tool, dict):
+        return {}
+    func = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+    params = func.get("parameters") or func.get("input_schema") or tool.get("parameters") or tool.get("input_schema") or {}
+    return params if isinstance(params, dict) else {}
+
+
+def _compact_tool_schemas_for_text(tools: list[Json]) -> tuple[list[Json], int]:
+    """Deduplicate tool schemas and keep only text-adapter-safe metadata."""
+    compacted: list[Json] = []
+    seen: set[str] = set()
+    omitted = 0
+    for tool in tools:
+        if not isinstance(tool, dict):
+            omitted += 1
+            continue
+        name = _tool_schema_name(tool)
+        if not name:
+            omitted += 1
+            continue
+        lowered = name.lower()
+        if lowered in seen:
+            omitted += 1
+            continue
+        seen.add(lowered)
+        func = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        params = _tool_schema_parameters(tool)
+        props = params.get("properties") if isinstance(params.get("properties"), dict) else {}
+        required = [str(item) for item in (params.get("required") or []) if isinstance(item, str)]
+        compacted.append(
+            {
+                "name": name,
+                "description": re.sub(r"\s+", " ", str(func.get("description") or ""))[:180],
+                "parameters": {
+                    "properties": {str(key): value for key, value in list(props.items())[:8]},
+                    "required": required[:8],
+                },
+            }
+        )
+    return compacted, omitted
 
 
 def _build_tool_text_block(tools: list[Json]) -> str:
     """Build a text block describing available tools for injection into system prompt."""
+    compacted_tools, omitted = _compact_tool_schemas_for_text(tools)
     lines = [
         "Tool Call Gateway - 你正在通过 Tool Call Gateway 服务 Claude Code/Codex/OpenCode/DeepSeek-TUI。",
         "如果上游不能稳定返回原生工具调用，可以使用文本形式：<function=ToolName>\\n<parameter=name>value。",
@@ -740,26 +894,32 @@ def _build_tool_text_block(tools: list[Json]) -> str:
         "</" + _TOOL_FORMAT_TAG + ">",
         "",
     ]
-    for tool in tools:
-        if not isinstance(tool, dict):
-            continue
-        func = tool.get("function") or tool
-        name = func.get("name", "")
-        desc = func.get("description", "")
-        params = func.get("parameters") or func.get("input_schema") or {}
+    used = 0
+    for tool in compacted_tools:
+        name = tool.get("name", "")
+        desc = tool.get("description", "")
+        params = tool.get("parameters") or {}
         props = params.get("properties") or {}
         required = set(params.get("required") or [])
-        lines.append(f"Tool: {name}")
-        if desc:
-            lines.append(f"  Description: {desc}")
+        param_bits = []
         if props:
-            lines.append("  Parameters:")
             for pname, pinfo in props.items():
-                ptype = (pinfo or {}).get("type", "string")
-                pdesc = (pinfo or {}).get("description", "")
-                req_str = " (required)" if pname in required else ""
-                lines.append(f"    - {pname} ({ptype}){req_str}: {pdesc}")
+                ptype = (pinfo or {}).get("type", "string") if isinstance(pinfo, dict) else "string"
+                req_str = "*" if pname in required else ""
+                param_bits.append(f"{pname}{req_str}:{ptype}")
+        rendered = f"- {name}({', '.join(param_bits)})"
+        if desc:
+            rendered += f": {desc}"
+        candidate = "\n".join(lines + [rendered, ""])
+        if len(candidate) > _TEXT_TOOL_BLOCK_MAX_CHARS:
+            omitted += len(compacted_tools) - used
+            break
+        lines.append(rendered)
         lines.append("")
+        used += 1
+    if omitted:
+        lines.append(f"... {omitted} duplicate/oversized tools omitted from this compact adapter prompt.")
+        lines.append("If a needed tool is not listed, still use its exact provided name with the same <function=...> format.")
     lines.append("Output ONLY the tool call tags when you need to use a tool. Do not explain the format.")
     return "\n".join(lines)
 
