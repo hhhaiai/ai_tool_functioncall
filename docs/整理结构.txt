@@ -1,0 +1,14 @@
+整理结构
+
+上游:三方提供的 api, 包含几个类型  chat api（完全不支持 tool）/ sub api (部分支持 tool) / full api （完全支持 tool）
+
+中游： gateway（本套项目）
+
+下游： 各种工具调用（codex/claude code/deepseek-tui/opencode 等）
+
+
+本工程就是中游的 gateway,作用：
+1. 协议转换：  上游不管是openai chat /openai response /claude 格式的，下游都支持三种 ，支持编程
+2. 对于 部分支持 tool, 完全不支持 tool 的，通过被套项目支持，对于下游只要调用 gateway 出来的都是支持编程支持工具的
+3.  gateway 支持网页，支持配置，比如上游是否支持 tool  那个模型支持识图之类的，上下文多少等
+4. 本套工程要实现部分对话，抽象总结，实现通过 gateway 请求，支持类似无限上下文的效果
