@@ -3829,6 +3829,204 @@ while True:
 
 
 
+class ThinkTagExtractionTests(unittest.TestCase):
+    """Tests for <think> tag extraction and Anthropic thinking block conversion."""
+
+    def test_extract_think_blocks_single(self):
+        from src.gateway_protocol import _extract_think_blocks
+        text = "<think>reasoning here</think>\nhello"
+        think_texts, remaining = _extract_think_blocks(text)
+        self.assertEqual(think_texts, ["reasoning here"])
+        self.assertEqual(remaining, "hello")
+
+    def test_extract_think_blocks_multiple(self):
+        from src.gateway_protocol import _extract_think_blocks
+        text = "<think>first</think>\nmid\n<think>second</think>\nend"
+        think_texts, remaining = _extract_think_blocks(text)
+        self.assertEqual(think_texts, ["first", "second"])
+        self.assertEqual(remaining, "mid\n\nend")
+
+    def test_extract_think_blocks_none(self):
+        from src.gateway_protocol import _extract_think_blocks
+        text = "just a normal response"
+        think_texts, remaining = _extract_think_blocks(text)
+        self.assertEqual(think_texts, [])
+        self.assertEqual(remaining, "just a normal response")
+
+    def test_extract_think_blocks_multiline(self):
+        from src.gateway_protocol import _extract_think_blocks
+        text = "<think>\nline 1\nline 2\n</think>\nanswer"
+        think_texts, remaining = _extract_think_blocks(text)
+        self.assertEqual(think_texts, ["line 1\nline 2"])
+        self.assertEqual(remaining, "answer")
+
+    def test_openai_response_converts_think_to_thinking_blocks(self):
+        from src.gateway_protocol import _from_openai_chat_response
+        response = {
+            "id": "msg_test",
+            "model": "mimo-v2.5-pro",
+            "choices": [{
+                "message": {
+                    "content": "<think>user said hi, I should respond politely</think>\nhi! 有什么我可以帮你的吗？"
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20},
+        }
+        result = _from_openai_chat_response("/v1/messages", response)
+        content = result["content"]
+        self.assertEqual(len(content), 2)
+        self.assertEqual(content[0]["type"], "thinking")
+        self.assertEqual(content[0]["thinking"], "user said hi, I should respond politely")
+        self.assertEqual(content[1]["type"], "text")
+        self.assertEqual(content[1]["text"], "hi! 有什么我可以帮你的吗？")
+
+    def test_openai_response_no_think_tags(self):
+        from src.gateway_protocol import _from_openai_chat_response
+        response = {
+            "id": "msg_test",
+            "model": "mimo-v2.5-pro",
+            "choices": [{
+                "message": {"content": "plain response"},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+        result = _from_openai_chat_response("/v1/messages", response)
+        content = result["content"]
+        self.assertEqual(len(content), 1)
+        self.assertEqual(content[0]["type"], "text")
+        self.assertEqual(content[0]["text"], "plain response")
+
+    def test_openai_response_think_only_no_text(self):
+        from src.gateway_protocol import _from_openai_chat_response
+        response = {
+            "id": "msg_test",
+            "model": "mimo-v2.5-pro",
+            "choices": [{
+                "message": {"content": "<think>just thinking, no answer</think>"},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+        result = _from_openai_chat_response("/v1/messages", response)
+        content = result["content"]
+        self.assertEqual(len(content), 1)
+        self.assertEqual(content[0]["type"], "thinking")
+
+    def test_openai_response_reasoning_field_still_works(self):
+        from src.gateway_protocol import _from_openai_chat_response
+        response = {
+            "id": "msg_test",
+            "model": "mimo-v2.5-pro",
+            "choices": [{
+                "message": {"reasoning": "structured reasoning", "content": "answer"},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+        result = _from_openai_chat_response("/v1/messages", response)
+        content = result["content"]
+        self.assertEqual(len(content), 2)
+        self.assertEqual(content[0]["type"], "thinking")
+        self.assertEqual(content[0]["thinking"], "structured reasoning")
+        self.assertEqual(content[1]["type"], "text")
+
+
+class LocalPlannerTriggerTests(unittest.TestCase):
+    """Tests for local planner trigger keyword tightening."""
+
+    def test_common_greeting_does_not_trigger(self):
+        from src.gateway_tool_runtime import _should_build_local_planner_context
+        body = {"messages": [{"role": "user", "content": "你好"}]}
+        self.assertFalse(_should_build_local_planner_context("/v1/messages", body))
+
+    def test_simple_question_does_not_trigger(self):
+        from src.gateway_tool_runtime import _should_build_local_planner_context
+        body = {"messages": [{"role": "user", "content": "今天天气怎么样？"}]}
+        self.assertFalse(_should_build_local_planner_context("/v1/messages", body))
+
+    def test_code_word_alone_does_not_trigger(self):
+        from src.gateway_tool_runtime import _should_build_local_planner_context
+        body = {"messages": [{"role": "user", "content": "帮我写一段代码"}]}
+        self.assertFalse(_should_build_local_planner_context("/v1/messages", body))
+
+    def test_analyze_alone_does_not_trigger(self):
+        from src.gateway_tool_runtime import _should_build_local_planner_context
+        body = {"messages": [{"role": "user", "content": "分析一下这个问题"}]}
+        self.assertFalse(_should_build_local_planner_context("/v1/messages", body))
+
+    def test_at_sign_alone_does_not_trigger(self):
+        from src.gateway_tool_runtime import _should_build_local_planner_context
+        body = {"messages": [{"role": "user", "content": "email me@test.com"}]}
+        self.assertFalse(_should_build_local_planner_context("/v1/messages", body))
+
+    def test_analyze_code_with_path_triggers(self):
+        from src.gateway_tool_runtime import _should_build_local_planner_context
+        body = {"messages": [{"role": "user", "content": "分析代码 src/main.py"}]}
+        self.assertTrue(_should_build_local_planner_context("/v1/messages", body))
+
+    def test_read_file_triggers(self):
+        from src.gateway_tool_runtime import _should_build_local_planner_context
+        body = {"messages": [{"role": "user", "content": "读取 src/config.py"}]}
+        self.assertTrue(_should_build_local_planner_context("/v1/messages", body))
+
+
+class AnthropicSSEFormatTests(unittest.TestCase):
+    """Tests for complete Anthropic SSE format in streaming responses."""
+
+    def test_stream_final_response_has_message_start(self):
+        from src.gateway_streaming import _stream_final_response
+        events = []
+        class FakeHandler:
+            class wfile:
+                @staticmethod
+                def write(data):
+                    events.append(data.decode("utf-8") if isinstance(data, bytes) else data)
+                @staticmethod
+                def flush():
+                    pass
+        response = {
+            "id": "msg_test",
+            "model": "mimo-v2.5-pro",
+            "content": [{"type": "text", "text": "hello"}],
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+        }
+        _stream_final_response(FakeHandler(), "/v1/messages", response)
+        all_text = "".join(events)
+        self.assertIn('"message_start"', all_text)
+        self.assertIn('"message_delta"', all_text)
+        self.assertIn('"message_stop"', all_text)
+        self.assertIn('"stop_reason"', all_text)
+
+    def test_stream_final_response_emits_thinking_blocks(self):
+        from src.gateway_streaming import _stream_final_response
+        events = []
+        class FakeHandler:
+            class wfile:
+                @staticmethod
+                def write(data):
+                    events.append(data.decode("utf-8") if isinstance(data, bytes) else data)
+                @staticmethod
+                def flush():
+                    pass
+        response = {
+            "id": "msg_test",
+            "model": "mimo-v2.5-pro",
+            "content": [
+                {"type": "thinking", "thinking": "reasoning here"},
+                {"type": "text", "text": "answer"},
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 20},
+        }
+        _stream_final_response(FakeHandler(), "/v1/messages", response)
+        all_text = "".join(events)
+        self.assertIn('"thinking_delta"', all_text)
+        self.assertIn("reasoning here", all_text)
+        self.assertIn('"text_delta"', all_text)
+
+
 if __name__ == "__main__":
     unittest.main()
 

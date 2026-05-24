@@ -285,25 +285,105 @@ def _get_marketplace():
     return _get_marketplace._cache
 
 
+def _extract_client_project_dir(body: Json) -> pathlib.Path | None:
+    """Detect the downstream client's project directory from request metadata.
+
+    Claude Code injects session context into user messages as system-reminder
+    blocks.  Look for ``Worktree:``, ``Primary working directory:``, or
+    ``projectDir`` patterns to determine where the client is actually working.
+
+    Priority order (first match wins):
+    1. Worktree (explicit worktree path)
+    2. Primary working directory (Claude Code session metadata)
+    3. projectDir (JSON metadata)
+    4. Working directory (generic fallback)
+    5. CWD (last resort)
+    """
+    messages = body.get("messages") or []
+    # Ordered by specificity - more specific patterns first
+    patterns = [
+        # Claude Code worktree pattern (highest priority - explicit isolation)
+        re.compile(r"Worktree:\s*(/\S+)"),
+        # Claude Code primary working directory pattern
+        re.compile(r"Primary working directory:\s*(/\S+)"),
+        # JSON projectDir pattern (handles both "projectDir": "/path" and projectDir: /path)
+        # Also handles trailing quotes from JSON strings
+        re.compile(r"""projectDir["']?\s*[:=]\s*["']?(/\S+?)["']?(?:\s|,|$|})"""),
+        # Generic working directory pattern (lower priority)
+        re.compile(r"Working directory:\s*(/\S+)"),
+        # CWD pattern (last resort)
+        re.compile(r"(?:^|\s)CWD:\s*(/\S+)"),
+    ]
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        texts = []
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    texts.append(str(item.get("text") or ""))
+        for text in texts:
+            for pat in patterns:
+                match = pat.search(text)
+                if match:
+                    raw_path = match.group(1).rstrip("\"'.,;:")
+                    candidate = pathlib.Path(raw_path).expanduser().resolve()
+                    if candidate.is_dir():
+                        return candidate
+    return None
+
+
+def _log_workspace_resolution(source: str, path: pathlib.Path) -> None:
+    """Log workspace resolution decision for debugging."""
+    import logging
+    logger = logging.getLogger("gateway.workspace")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("workspace resolved via %s: %s", source, path)
+
+
 def _request_workspace_root(body: Json) -> pathlib.Path:
-    """Extract workspace root from request body or use default."""
+    """Extract workspace root from request body or use default.
+
+    Priority chain:
+    1. Explicit body field (workspace_root or gateway_workspace)
+    2. Auto-detected downstream project dir from session metadata
+    3. Explicit env var (GATEWAY_WORKSPACE_ROOT) if not cwd
+    4. Config file setting
+    5. Default workspace root
+    """
     custom_root = body.get("workspace_root") or body.get("gateway_workspace")
     if custom_root:
-        return pathlib.Path(custom_root)
+        path = pathlib.Path(custom_root).expanduser().resolve()
+        _log_workspace_resolution("explicit_body", path)
+        return path
+    # Auto-detect from Claude Code session metadata (Worktree / Primary working directory)
+    detected = _extract_client_project_dir(body)
+    if detected is not None:
+        _log_workspace_resolution("session_metadata", detected)
+        return detected
     env_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
     # ``scripts/mimo_gateway.sh`` exports GATEWAY_WORKSPACE_ROOT=$PWD as a
     # service default.  Treat that cwd default as lower priority than a saved UI
     # config, while still honoring truly explicit env overrides used by tests or
     # operators that point somewhere else.
     if env_root and pathlib.Path(env_root).expanduser().resolve() != pathlib.Path(os.getcwd()).resolve():
-        return pathlib.Path(env_root)
+        path = pathlib.Path(env_root).expanduser().resolve()
+        _log_workspace_resolution("env_var", path)
+        return path
     try:
         configured_root = _gateway_config().get("workspace_root")
         if configured_root:
-            return pathlib.Path(str(configured_root))
+            path = pathlib.Path(str(configured_root)).expanduser().resolve()
+            _log_workspace_resolution("config", path)
+            return path
     except Exception:
         pass
-    return _workspace_root()
+    default = _workspace_root()
+    _log_workspace_resolution("default", default)
+    return default
 
 
 @contextmanager
@@ -672,6 +752,137 @@ def _extract_text_tool_calls(path: str, response: Json) -> list[ToolCall]:
     return _parse_text_tool_calls(_response_text(path, response))
 
 
+def _detect_intent_tool_calls(path: str, response: Json, body: Json) -> list[ToolCall]:
+    """Detect tool usage intent from model response text for weak models.
+
+    When a model can't generate proper tool calls but expresses intent to use
+    tools (e.g., "I'll read the file", "Let me check the directory"), this
+    function detects that intent and returns appropriate tool calls.
+
+    This is a fallback for models that can't follow text-based tool call
+    instructions.
+    """
+    # Check if intent detection is enabled
+    from .gateway_config import _gateway_config, _upstream_config
+    gateway_cfg = _gateway_config()
+    if not gateway_cfg.get("intent_detection_enabled", True):
+        return []
+
+    # Only enable for weak upstream models that can't generate tool calls
+    upstream_cfg = _upstream_config()
+    if upstream_cfg.get("supports_tools", True):
+        return []  # Native tools supported, no need for intent detection
+
+    text = _response_text(path, response)
+    if not text or len(text) < 20:
+        return []
+
+    # Extract the last user message to understand context
+    messages = body.get("messages") or []
+    last_user_text = ""
+    for msg in reversed(messages):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            content = msg.get("content")
+            if isinstance(content, str):
+                last_user_text = content[:2000]
+            elif isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        last_user_text = str(item.get("text") or "")[:2000]
+                        break
+            break
+
+    calls: list[ToolCall] = []
+    text_lower = text.lower()
+
+    # Pattern 1: Model says it will read a file but doesn't output tool tags
+    # Look for file paths mentioned in the response
+    file_path_patterns = [
+        # "read the file src/main.py" or "read src/main.py"
+        r"(?:read|check|examine|look at|open|view)\s+(?:the\s+)?(?:file\s+)?(?:`([^`]+)`|(\S+\.\w+))",
+        # "file at src/main.py" or "file: src/main.py"
+        r"file\s+(?:at|:)\s*(?:`([^`]+)`|(\S+\.\w+))",
+        # Backtick-quoted paths
+        r"`([^`]+\.\w+)`",
+    ]
+
+    for pattern in file_path_patterns:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            file_path = match.group(1) or match.group(2) or match.group(3)
+            if file_path and not file_path.startswith(("http://", "https://", "ftp://")):
+                # Avoid duplicates
+                if not any(c.arguments.get("path") == file_path for c in calls):
+                    calls.append(ToolCall(
+                        call_id=f"intent_{uuid.uuid4().hex}",
+                        name="Read",
+                        arguments={"path": file_path},
+                        raw={"gateway_intent_detection": True, "text": text[:500]},
+                    ))
+                    break  # Only one Read per response
+        if calls:
+            break
+
+    # Pattern 2: Model says it will list/check directory
+    if not calls:
+        dir_patterns = [
+            r"(?:list|check|examine|look at|explore)\s+(?:the\s+)?(?:directory|folder|contents)\s+(?:of\s+)?(?:`([^`]+)`|(\S+))",
+            r"(?:ls|dir)\s+(?:`([^`]+)`|(\S+))",
+        ]
+        for pattern in dir_patterns:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                dir_path = match.group(1) or match.group(2) or match.group(3) or "."
+                calls.append(ToolCall(
+                    call_id=f"intent_{uuid.uuid4().hex}",
+                    name="LS",
+                    arguments={"path": dir_path},
+                    raw={"gateway_intent_detection": True, "text": text[:500]},
+                ))
+                break
+            if calls:
+                break
+
+    # Pattern 3: Model says it will run a command
+    if not calls:
+        cmd_patterns = [
+            r"(?:run|execute|use)\s+(?:the\s+)?(?:command|shell)\s*:?\s*`([^`]+)`",
+            r"(?:run|execute)\s*:?\s*`([^`]+)`",
+        ]
+        for pattern in cmd_patterns:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                cmd = match.group(1)
+                if cmd:
+                    calls.append(ToolCall(
+                        call_id=f"intent_{uuid.uuid4().hex}",
+                        name="Bash",
+                        arguments={"command": cmd},
+                        raw={"gateway_intent_detection": True, "text": text[:500]},
+                    ))
+                    break
+            if calls:
+                break
+
+    # Pattern 4: Model says it will search/glob for files
+    if not calls:
+        glob_patterns = [
+            r"(?:search|find|look for|glob)\s+(?:for\s+)?(?:files?\s+)?(?:matching\s+)?(?:`([^`]+)`|(\S+\.\w+))",
+        ]
+        for pattern in glob_patterns:
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                glob_pattern = match.group(1) or match.group(2)
+                if glob_pattern:
+                    calls.append(ToolCall(
+                        call_id=f"intent_{uuid.uuid4().hex}",
+                        name="Glob",
+                        arguments={"pattern": glob_pattern},
+                        raw={"gateway_intent_detection": True, "text": text[:500]},
+                    ))
+                    break
+            if calls:
+                break
+
+    return calls
+
+
 def _assistant_message_from_chat_response(response: Json) -> Json:
     choices = response.get("choices") or []
     if choices and isinstance(choices[0], dict) and isinstance(choices[0].get("message"), dict):
@@ -766,8 +977,9 @@ def _append_text_tool_results(path: str, body: Json, response: Json, calls: list
         ],
     }
     report_text = (
-        "Gateway 已识别并执行上游文本形式的工具调用。请基于这些真实工具结果继续分析；"
-        "如果还需要工具，请优先返回原生 tool_calls/tool_use，不能支持时才继续使用 <function=...> 形式。\n\n"
+        "Gateway executed your text-based tool calls locally. Real results below.\n"
+        "Continue your analysis. If you need MORE tools, output them as:\n"
+        "<function=ToolName><parameter=param>value</parameter></function>\n\n"
         + json.dumps(tool_report, ensure_ascii=False, indent=2)
     )
     if path == "/v1/chat/completions":
@@ -827,13 +1039,12 @@ def _should_build_local_planner_context(path: str, body: Json) -> bool:
     if not text:
         return False
     lowered = text.lower()
-    analyze_intent = any(token in lowered for token in ("分析", "analyze", "review", "理解", "梳理"))
-    code_scope = any(token in lowered for token in ("代码", "code", "项目", "project", "src", ".py", "class", "类", "@"))
     read_intent = any(token in lowered for token in ("read", "show", "cat", "open", "查看", "读取", "读", "打开"))
     has_path = bool(_extract_mentioned_paths(text))
     if read_intent and has_path:
         return True
-    return analyze_intent and code_scope
+    analyze_intent = any(token in lowered for token in ("分析代码", "分析项目", "analyze code", "analyze project", "code review", "代码审查", "代码分析", "项目分析", "梳理代码", "梳理架构"))
+    return analyze_intent and has_path
 
 
 def _extract_value_after_marker_request(text: str) -> str:
@@ -1313,6 +1524,10 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
         text_fallback = False
         if not calls:
             calls = _extract_text_tool_calls(path, downstream_response)
+            text_fallback = bool(calls)
+        # Intent detection fallback for weak models that can't generate tool calls
+        if not calls and _round == 0:
+            calls = _detect_intent_tool_calls(path, downstream_response, body)
             text_fallback = bool(calls)
         if not calls:
             _remember_conversation_turn(path, body, downstream_response)

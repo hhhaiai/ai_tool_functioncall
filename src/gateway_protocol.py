@@ -306,6 +306,17 @@ def _ensure_anthropic_message_response(response: Json, *, fallback_model: str = 
     return normalized
 
 
+def _extract_think_blocks(text: str) -> tuple[list[str], str]:
+    """Extract <think>...</think> blocks from text. Returns (think_texts, remaining_text)."""
+    think_texts: list[str] = []
+    remaining = text
+    pattern = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+    for match in pattern.finditer(text):
+        think_texts.append(match.group(1).strip())
+    remaining = pattern.sub("", text).strip()
+    return think_texts, remaining
+
+
 def _from_openai_chat_response(path: str, response: Json) -> Json:
     if "/messages" not in path:
         return response
@@ -324,7 +335,12 @@ def _from_openai_chat_response(path: str, response: Json) -> Json:
     if message.get("reasoning"):
         content_parts.append({"type": "thinking", "thinking": message["reasoning"]})
     if message.get("content"):
-        content_parts.append({"type": "text", "text": message["content"]})
+        raw_text = message["content"]
+        think_texts, remaining = _extract_think_blocks(raw_text)
+        for think_text in think_texts:
+            content_parts.append({"type": "thinking", "thinking": think_text})
+        if remaining:
+            content_parts.append({"type": "text", "text": remaining})
     for tc in message.get("tool_calls") or []:
         func = tc.get("function") or {}
         try:
@@ -355,7 +371,15 @@ def _last_user_text(path: str, body: Json) -> str:
     messages = body.get("messages") or []
     for msg in reversed(messages):
         if isinstance(msg, dict) and msg.get("role") == "user":
-            return _text_from_content(msg.get("content"))
+            content = msg.get("content")
+            if isinstance(content, list):
+                for item in reversed(content):
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        text = str(item.get("text") or "").strip()
+                        if text and not text.startswith("<system-reminder>"):
+                            return text
+                return _text_from_content(content)
+            return _text_from_content(content)
     return ""
 
 
@@ -880,18 +904,50 @@ def _compact_tool_schemas_for_text(tools: list[Json]) -> tuple[list[Json], int]:
 def _build_tool_text_block(tools: list[Json]) -> str:
     """Build a text block describing available tools for injection into system prompt."""
     compacted_tools, omitted = _compact_tool_schemas_for_text(tools)
+    ft = _TOOL_FORMAT_TAG
+    pt = _PARAM_TAG
     lines = [
-        "Tool Call Gateway - 你正在通过 Tool Call Gateway 服务 Claude Code/Codex/OpenCode/DeepSeek-TUI。",
-        "如果上游不能稳定返回原生工具调用，可以使用文本形式：<function=ToolName>\\n<parameter=name>value。",
-        "Gateway 会在本地执行真实工具并把结果回填。",
+        "=== TOOL CALL INSTRUCTIONS (CRITICAL - YOU MUST FOLLOW THIS) ===",
+        "",
+        "You are running inside a Tool Call Gateway. You CANNOT use native tool/function calls.",
+        "You MUST use the text-based tool call format below to access ANY tool.",
+        "",
+        "CRITICAL RULES:",
+        "1. DO NOT just describe what you would do \u2014 ACTUALLY OUTPUT the tool call tags.",
+        "2. The Gateway will execute the tool locally and return the REAL results to you.",
+        "3. You MUST output tool call tags to use tools. Do NOT just describe actions.",
+        "4. If you need to read a file, output the Read tool call tags IMMEDIATELY.",
+        "5. If you need to run a command, output the Bash tool call tags IMMEDIATELY.",
+        "",
+        "FORMAT (you MUST output this EXACTLY when you need a tool):",
+        "",
+        "<" + ft + "=TOOL_NAME>",
+        "<" + pt + "=param1>value1</" + pt + ">",
+        "</" + ft + ">",
+        "",
+        "EXAMPLES:",
+        "",
+        "To read a file:",
+        "<" + ft + "=Read>",
+        "<" + pt + "=path>src/main.py</" + pt + ">",
+        "</" + ft + ">",
+        "",
+        "To search for files:",
+        "<" + ft + "=Glob>",
+        "<" + pt + "=pattern>**/*.py</" + pt + ">",
+        "</" + ft + ">",
+        "",
+        "To run a shell command:",
+        "<" + ft + "=Bash>",
+        "<" + pt + "=command>ls -la</" + pt + ">",
+        "</" + ft + ">",
+        "",
+        "To list directory contents:",
+        "<" + ft + "=LS>",
+        "<" + pt + "=path>.</" + pt + ">",
+        "</" + ft + ">",
         "",
         "[Available Tools]",
-        "You have access to the following tools. To call a tool, output exactly this format:",
-        "",
-        "<" + _TOOL_FORMAT_TAG + "=TOOL_NAME>",
-        "  <" + _PARAM_TAG + "=param1>value1</" + _PARAM_TAG + ">",
-        "  <" + _PARAM_TAG + "=param2>value2</" + _PARAM_TAG + ">",
-        "</" + _TOOL_FORMAT_TAG + ">",
         "",
     ]
     used = 0
@@ -920,19 +976,39 @@ def _build_tool_text_block(tools: list[Json]) -> str:
     if omitted:
         lines.append(f"... {omitted} duplicate/oversized tools omitted from this compact adapter prompt.")
         lines.append("If a needed tool is not listed, still use its exact provided name with the same <function=...> format.")
-    lines.append("Output ONLY the tool call tags when you need to use a tool. Do not explain the format.")
+    lines.append("You MUST output tool call tags to use tools. Do NOT just describe actions.")
     return "\n".join(lines)
+
+def _build_tool_reminder() -> str:
+    """Build a short reminder injected near the last user message."""
+    ft = _TOOL_FORMAT_TAG
+    pt = _PARAM_TAG
+    return (
+        "\n\n[CRITICAL REMINDER: You MUST use tool call tags to access tools. "
+        "DO NOT just describe what you would do - ACTUALLY OUTPUT the tool call tags. "
+        "Format: <" + ft + "=ToolName><" + pt + "=param>value</" + pt + "></" + ft + ">. "
+        "If you need to read a file, output the Read tool call tags NOW. "
+        "If you need to run a command, output the Bash tool call tags NOW. "
+        "The Gateway will execute the tool and return real results to you.]"
+    )
 
 
 def _inject_tools_as_text_prompt(body: Json, tools: list[Json]) -> Json:
-    """Inject tool definitions and format instructions into the system/user prompt."""
+    """Inject tool definitions and format instructions into the system/user prompt.
+
+    Strategy: prepend the full tool block to the system message AND append a
+    short reminder to the last user message so the model sees tool instructions
+    right before it needs to generate.
+    """
     body = copy.deepcopy(body)
     if not tools:
         return body
     tool_text = _build_tool_text_block(tools)
+    reminder = _build_tool_reminder()
     messages = body.get("messages") or []
     if not messages:
         return body
+    # Inject full tool text into system message (or first message)
     first = messages[0]
     if isinstance(first, dict):
         if first.get("role") == "system":
@@ -943,5 +1019,14 @@ def _inject_tools_as_text_prompt(body: Json, tools: list[Json]) -> Json:
                 first["content"] = tool_text + "\n\n" + content
             elif isinstance(content, list):
                 first["content"] = [{"type": "text", "text": tool_text}] + list(content)
+    # Inject reminder into last user message so model sees it right before generating
+    for msg in reversed(messages):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            content = msg.get("content")
+            if isinstance(content, str):
+                msg["content"] = content + reminder
+            elif isinstance(content, list):
+                msg["content"] = list(content) + [{"type": "text", "text": reminder}]
+            break
     body["messages"] = messages
     return body

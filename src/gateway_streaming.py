@@ -548,23 +548,76 @@ def _stream_final_response(handler: Any, path: str, response: dict) -> None:
             "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
         })
     elif "/messages" in path:
+        msg_id = response.get("id", f"msg_{uuid.uuid4().hex}")
+        model = response.get("model", "")
+        usage = response.get("usage") or {}
+        _write_sse(handler, {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "usage": {"input_tokens": usage.get("input_tokens", 0), "output_tokens": 0},
+            },
+        })
         content = response.get("content", [])
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
+        for idx, item in enumerate(content):
+            if not isinstance(item, dict):
+                continue
+            block_type = item.get("type")
+            if block_type == "thinking":
                 _write_sse(handler, {
                     "type": "content_block_start",
-                    "index": 0,
+                    "index": idx,
+                    "content_block": {"type": "thinking", "thinking": ""},
+                })
+                _write_sse(handler, {
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": {"type": "thinking_delta", "thinking": item.get("thinking", "")},
+                })
+                _write_sse(handler, {
+                    "type": "content_block_stop",
+                    "index": idx,
+                })
+            elif block_type == "text":
+                _write_sse(handler, {
+                    "type": "content_block_start",
+                    "index": idx,
                     "content_block": {"type": "text", "text": ""},
                 })
                 _write_sse(handler, {
                     "type": "content_block_delta",
-                    "index": 0,
+                    "index": idx,
                     "delta": {"type": "text_delta", "text": item["text"]},
                 })
                 _write_sse(handler, {
                     "type": "content_block_stop",
-                    "index": 0,
+                    "index": idx,
                 })
+            elif block_type == "tool_use":
+                _write_sse(handler, {
+                    "type": "content_block_start",
+                    "index": idx,
+                    "content_block": {"type": "tool_use", "id": item.get("id", ""), "name": item.get("name", ""), "input": {}},
+                })
+                _write_sse(handler, {
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": {"type": "input_json_delta", "partial_json": json.dumps(item.get("input", {}), ensure_ascii=False)},
+                })
+                _write_sse(handler, {
+                    "type": "content_block_stop",
+                    "index": idx,
+                })
+        stop_reason = response.get("stop_reason", "end_turn")
+        _write_sse(handler, {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+            "usage": {"output_tokens": usage.get("output_tokens", 0)},
+        })
         _write_sse(handler, {"type": "message_stop"})
     elif "/responses" in path:
         output = response.get("output", [])

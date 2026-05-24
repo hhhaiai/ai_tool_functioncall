@@ -202,6 +202,7 @@ def _default_config() -> Json:
             "record_unsupported_tools": _env_bool("GATEWAY_RECORD_UNSUPPORTED_TOOLS", True),
             "text_tool_call_fallback_enabled": _env_bool("GATEWAY_TEXT_TOOL_CALL_FALLBACK", True),
             "text_tool_adapter_compact_token_limit": _env_int("GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT", 12000),
+            "intent_detection_enabled": _env_bool("GATEWAY_INTENT_DETECTION_ENABLED", True),
             "local_planner_enabled": _env_bool("GATEWAY_LOCAL_PLANNER_ENABLED", True),
             "local_planner_max_files": _env_int("GATEWAY_LOCAL_PLANNER_MAX_FILES", 24),
             "local_planner_max_bytes_per_file": _env_int("GATEWAY_LOCAL_PLANNER_MAX_BYTES_PER_FILE", 24000),
