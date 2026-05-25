@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import socket
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,15 @@ from typing import Any
 import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+
+def free_port() -> int:
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    try:
+        return int(sock.getsockname()[1])
+    finally:
+        sock.close()
 
 
 def run(cmd: list[str], *, env: dict[str, str] | None = None) -> Any:
@@ -152,7 +162,7 @@ def main() -> int:
                 "GATEWAY_CONTEXT_FANOUT_ENABLED": "0",
                 "GATEWAY_UPSTREAM_STREAM_AGGREGATE": "0",
             }
-            port = "8897"
+            port = str(free_port())
             env["GATEWAY_PORT"] = port
             env["GATEWAY_START_METHOD"] = "nohup"
             subprocess.run([str(ROOT / "scripts/mimo_gateway.sh"), "stop"], cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)

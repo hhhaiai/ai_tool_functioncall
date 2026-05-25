@@ -569,7 +569,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     for field, default, parser in [
                         ("max_tool_rounds", 5, _admin_form_int),
                         ("max_concurrent_requests", 32, _admin_form_int),
-                        ("text_tool_adapter_compact_token_limit", 12000, _admin_form_int),
+                        ("text_tool_adapter_compact_token_limit", 48000, _admin_form_int),
                         ("concurrency_queue_timeout_seconds", 5.0, _admin_form_float),
                         ("tool_execution_timeout_seconds", 60.0, _admin_form_float),
                     ]:
@@ -594,8 +594,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     context_cfg["quality_review_enabled"] = form.get("context_quality_review_enabled", "") != ""
                     invalid_field = None
                     for json_key, form_key, default in [
-                        ("max_input_tokens", "context_max_input_tokens", 24000),
-                        ("fanout_chunk_tokens", "context_fanout_chunk_tokens", 12000),
+                        ("max_input_tokens", "context_max_input_tokens", 1048576),
+                        ("fanout_chunk_tokens", "context_fanout_chunk_tokens", 120000),
                         ("fanout_max_chunks", "context_fanout_max_chunks", 0),
                         ("fanout_max_workers", "context_fanout_max_workers", 4),
                     ]:
@@ -619,9 +619,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     gateway_cfg["codex_reasoning_effort"] = form.get("codex_reasoning_effort", "xhigh").strip() or "xhigh"
                     invalid_field = None
                     for field, default in [
-                        ("client_context_window", 1000000),
-                        ("client_auto_compact_token_limit", 900000),
-                        ("client_output_token_limit", 128000),
+                        ("client_context_window", 1048576),
+                        ("client_auto_compact_token_limit", 943718),
+                        ("client_output_token_limit", 131072),
                     ]:
                         if invalid_field is not None:
                             break

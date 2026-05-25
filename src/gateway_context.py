@@ -143,12 +143,29 @@ def _memory_session_key(body: Json) -> str:
     return f"session_{uuid.uuid4().hex[:8]}"
 
 
+def _memory_workspace_root() -> str:
+    try:
+        from .gateway_builtin_tools import _workspace_root
+        workspace = str(_workspace_root())
+    except Exception:
+        from .gateway_config import _gateway_config
+        workspace = str(_gateway_config().get("workspace_root", ""))
+    return workspace or "default"
+
+
+def _memory_workspace_legacy_hash(workspace: str) -> str:
+    return __import__("hashlib").sha256(workspace.encode()).hexdigest()[:16]
+
+
 def _memory_workspace_key() -> str:
-    from .gateway_config import _gateway_config
-    workspace = _gateway_config().get("workspace_root", "")
-    if workspace:
-        return __import__("hashlib").sha256(workspace.encode()).hexdigest()[:16]
-    return "default"
+    # Store the resolved downstream project root, not a service-root hash, so
+    # Memory/RecallMemory evidence remains auditable and project-scoped.
+    return _memory_workspace_root()
+
+
+def _memory_workspace_lookup_keys(workspace: str) -> list[str]:
+    legacy = _memory_workspace_legacy_hash(workspace)
+    return [workspace] if legacy == workspace else [workspace, legacy]
 
 
 def _memory_extract_keywords(text: str, *, limit: int = 40) -> list[str]:
@@ -263,15 +280,17 @@ def _sqlite_recall_memories(session_key: str, workspace_root: str, query_keyword
     _sqlite_init()
     conn = _sqlite_connect()
     try:
+        workspace_keys = _memory_workspace_lookup_keys(workspace_root)
+        placeholders = ",".join("?" for _ in workspace_keys)
         rows = conn.execute(
-            """
+            f"""
             SELECT id, ts, kind, summary, keywords_json, importance, last_used_at
             FROM conversation_memories
-            WHERE session_key = ? AND workspace_root = ?
+            WHERE session_key = ? AND workspace_root IN ({placeholders})
             ORDER BY importance DESC, ts DESC
             LIMIT ?
             """,
-            (session_key, workspace_root, limit * 2),
+            (session_key, *workspace_keys, limit * 2),
         ).fetchall()
         scored = []
         for row in rows:
@@ -376,15 +395,23 @@ def _inject_recalled_memories(path: str, body: Json) -> Json:
     return body
 
 
-def _sqlite_tail_memories(limit: int = 50) -> list[Json]:
+def _sqlite_tail_memories(limit: int = 50, workspace_root: str | None = None) -> list[Json]:
     from .gateway_logging import _sqlite_init, _sqlite_connect
     _sqlite_init()
     conn = _sqlite_connect()
     try:
-        rows = conn.execute(
-            "SELECT id, ts, session_key, workspace_root, kind, summary, keywords_json, source_request_id, importance, last_used_at FROM conversation_memories ORDER BY id DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
+        if workspace_root:
+            workspace_keys = _memory_workspace_lookup_keys(workspace_root)
+            placeholders = ",".join("?" for _ in workspace_keys)
+            rows = conn.execute(
+                f"SELECT id, ts, session_key, workspace_root, kind, summary, keywords_json, source_request_id, importance, last_used_at FROM conversation_memories WHERE workspace_root IN ({placeholders}) ORDER BY id DESC LIMIT ?",
+                (*workspace_keys, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, ts, session_key, workspace_root, kind, summary, keywords_json, source_request_id, importance, last_used_at FROM conversation_memories ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
         return [
             {
                 "id": row[0],
@@ -451,8 +478,20 @@ def _summarize_via_llm(messages: list[Json], *, max_summary_tokens: int = 800) -
             }
         from .gateway_proxy import NativeProxyClient
         client = NativeProxyClient()
+        # Context summarization is optional best-effort work.  Do not use the
+        # normal proxy retry loop here: local/dev configs can temporarily point
+        # at an unavailable upstream (or even the Gateway itself), and a summary
+        # fallback must return promptly instead of blocking tests/requests for
+        # the proxy's long transient-error retry window.
+        try:
+            client.timeout = min(float(client.timeout or 60.0), 3.0)
+        except (TypeError, ValueError):
+            client.timeout = 3.0
+        def post_once(request_path: str, request_body: Json) -> Json:
+            data = json.dumps(request_body, ensure_ascii=False).encode("utf-8")
+            return client._do_request_once("POST", client._url(request_path), client._headers(), data)
         if protocol == "anthropic_messages":
-            response = client.post("/v1/messages", payload)
+            response = post_once("/v1/messages", payload)
             content = response.get("content") or []
             for item in content:
                 if isinstance(item, dict) and item.get("type") == "text":
@@ -460,7 +499,7 @@ def _summarize_via_llm(messages: list[Json], *, max_summary_tokens: int = 800) -
                     _SUMMARY_CACHE[content_hash] = summary
                     return summary
         else:
-            response = client.post("/v1/chat/completions", payload)
+            response = post_once("/v1/chat/completions", payload)
             choices = response.get("choices") or []
             if choices:
                 summary = choices[0].get("message", {}).get("content")
@@ -851,16 +890,20 @@ def _smart_memory_search(session_key: str, workspace_root: str, query: str, limi
     _sqlite_init()
     conn = _sqlite_connect()
     try:
-        # Get all memories for this session
+        # Get all memories for this session. Include legacy hashed workspace
+        # keys so pre-upgrade compact memories remain available without
+        # widening recall across projects.
+        workspace_keys = _memory_workspace_lookup_keys(workspace_root)
+        placeholders = ",".join("?" for _ in workspace_keys)
         rows = conn.execute(
-            """
+            f"""
             SELECT id, ts, kind, summary, keywords_json, importance, last_used_at
             FROM conversation_memories
-            WHERE session_key = ? AND workspace_root = ?
+            WHERE session_key = ? AND workspace_root IN ({placeholders})
             ORDER BY ts DESC
             LIMIT 100
             """,
-            (session_key, workspace_root),
+            (session_key, *workspace_keys),
         ).fetchall()
 
         if not rows:

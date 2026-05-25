@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import uuid
 from typing import TYPE_CHECKING, Any
 
@@ -306,9 +307,15 @@ def run_streaming_orchestration(
         _append_text_tool_results,
         _append_tool_results,
         _convert_response_to_path,
+        _detect_intent_tool_calls,
+        _direct_local_bash_response,
+        _direct_local_file_read_response,
         _execute_tool_call,
         _extract_text_tool_calls,
         _extract_tool_calls,
+        _request_workspace_root,
+        _weak_upstream_text_tools_active,
+        _workspace_scope,
     )
 
     _send_sse_headers(handler)
@@ -321,10 +328,65 @@ def run_streaming_orchestration(
         _stream_upstream_passthrough(handler, path, body)
         return
 
-    max_rounds = _configured_max_tool_rounds(gateway_cfg)
-    upstream = NativeProxyClient()
+    with _workspace_scope(_request_workspace_root(body)):
+        _run_streaming_orchestration_scoped(
+            handler,
+            path,
+            body,
+            mode=mode,
+            upstream_protocol=upstream_protocol,
+            gateway_cfg=gateway_cfg,
+            max_rounds=_configured_max_tool_rounds(gateway_cfg),
+            upstream=NativeProxyClient(),
+            context_cfg=_context_config(),
+        )
+
+
+def _run_streaming_orchestration_scoped(
+    handler: Any,
+    path: str,
+    body: dict,
+    *,
+    mode: str,
+    upstream_protocol: str,
+    gateway_cfg: dict,
+    max_rounds: int,
+    upstream: Any,
+    context_cfg: dict,
+) -> None:
+    """Run streaming orchestration after workspace root has been resolved."""
+    from .gateway_context import (
+        _inject_recalled_memories,
+        _maybe_compact_request_for_upstream,
+        _remember_conversation_turn,
+    )
+    from .gateway_protocol import _convert_request_to_upstream, _convert_response_to_downstream
+    from .gateway_tool_runtime import (
+        _append_text_tool_results,
+        _append_tool_results,
+        _convert_response_to_path,
+        _detect_intent_tool_calls,
+        _direct_local_bash_response,
+        _direct_local_file_read_response,
+        _direct_local_skill_response,
+        _execute_tool_call,
+        _extract_text_tool_calls,
+        _extract_tool_calls,
+        _weak_upstream_text_tools_active,
+    )
+
     memory_body = _inject_recalled_memories(path, body)
-    context_cfg = _context_config()
+    if _weak_upstream_text_tools_active(mode):
+        direct_response = _direct_local_file_read_response(path, memory_body)
+        if direct_response is None:
+            direct_response = _direct_local_skill_response(path, memory_body)
+        if direct_response is None:
+            direct_response = _direct_local_bash_response(path, memory_body)
+        if direct_response is not None:
+            _stream_final_response(handler, path, direct_response)
+            _remember_conversation_turn(path, body, direct_response)
+            return
+
     request_body = _merge_builtin_tools(path, _maybe_compact_request_for_upstream(path, memory_body, context_cfg))
 
     upstream_path, request_body = _convert_request_to_upstream(path, request_body, upstream_protocol)
@@ -355,6 +417,9 @@ def run_streaming_orchestration(
         text_fallback = False
         if not calls:
             calls = _extract_text_tool_calls(path, downstream_response)
+            text_fallback = bool(calls)
+        if not calls and _round == 0:
+            calls = _detect_intent_tool_calls(path, downstream_response, body)
             text_fallback = bool(calls)
 
         if not calls:
@@ -506,24 +571,119 @@ def _merge_builtin_tools(path: str, body: dict) -> dict:
 def _stream_upstream_passthrough(handler: Any, path: str, body: dict) -> None:
     """Stream response directly from upstream."""
     from .gateway_proxy import NativeProxyClient
+    from .gateway_protocol import _convert_request_to_upstream
     import urllib.request
     import json
 
     client = NativeProxyClient()
-    url = client._url(path)
+    upstream_path, upstream_body = _convert_request_to_upstream(path, body, client.protocol)
+    url = client._url(upstream_path)
     headers = client._headers()
-    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    data = json.dumps(upstream_body, ensure_ascii=False).encode("utf-8")
 
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=client.timeout) as resp:
-            for line in resp:
-                handler.wfile.write(line)
-                handler.wfile.flush()
+            if "/messages" in path:
+                for block in _iter_normalized_anthropic_sse_blocks(resp):
+                    handler.wfile.write(block)
+                    handler.wfile.flush()
+            else:
+                for line in resp:
+                    handler.wfile.write(line)
+                    handler.wfile.flush()
     except Exception as exc:
         _write_sse(handler, {"error": str(exc)}, event="error")
     finally:
         _write_sse(handler, "[DONE]", event="done")
+
+
+def _format_sse_block(event: str | None, payload: dict) -> bytes:
+    """Format one SSE event block with JSON data."""
+    lines = []
+    if event:
+        lines.append(f"event: {event}")
+    lines.append(f"data: {json.dumps(payload, ensure_ascii=False)}")
+    return ("\n".join(lines) + "\n\n").encode("utf-8")
+
+
+def _normalize_anthropic_sse_block(block: bytes) -> list[bytes]:
+    """Normalize Anthropic tool_use start blocks for Claude Code clients.
+
+    Some OpenAI-compatible Anthropic adapters emit a complete ``tool_use.input``
+    object inside ``content_block_start`` and never send a following
+    ``input_json_delta``. Claude Code 2.1.x treats the start block as metadata
+    and builds the executable tool input from ``input_json_delta`` events, so
+    those streams arrive at the local tool runner as ``input: {}`` and fail with
+    missing ``command``/``file_path``.
+
+    Rewriting
+    ``content_block_start(content_block.input={...})`` into a start block with
+    empty input plus an immediate ``content_block_delta(input_json_delta)``
+    preserves the Anthropic streaming contract shape Claude Code expects while
+    keeping the original call id, name, and block index.
+    """
+    if not block:
+        return []
+    text = block.decode("utf-8", errors="replace")
+    event_name: str | None = None
+    data_lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip("\r")
+        if line.startswith("event:"):
+            event_name = line[6:].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[5:].lstrip())
+    if not data_lines:
+        return [block]
+    data_text = "\n".join(data_lines)
+    try:
+        payload = json.loads(data_text)
+    except json.JSONDecodeError:
+        return [block]
+    payload_type = payload.get("type") if isinstance(payload, dict) else None
+    if event_name not in {None, "", "content_block_start"} and payload_type != "content_block_start":
+        return [block]
+    if not isinstance(payload, dict) or payload_type != "content_block_start":
+        return [block]
+    content_block = payload.get("content_block")
+    if not isinstance(content_block, dict) or content_block.get("type") != "tool_use":
+        return [block]
+    tool_input = content_block.get("input")
+    if not isinstance(tool_input, dict) or not tool_input:
+        return [block]
+
+    start_payload = dict(payload)
+    start_content_block = dict(content_block)
+    start_content_block["input"] = {}
+    start_payload["content_block"] = start_content_block
+    index = start_payload.get("index", 0)
+    delta_payload = {
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {
+            "type": "input_json_delta",
+            "partial_json": json.dumps(tool_input, ensure_ascii=False),
+        },
+    }
+    return [
+        _format_sse_block("content_block_start", start_payload),
+        _format_sse_block("content_block_delta", delta_payload),
+    ]
+
+
+def _iter_normalized_anthropic_sse_blocks(resp: Any):
+    """Yield upstream SSE bytes, normalizing complete tool_use start blocks."""
+    block = bytearray()
+    for line in resp:
+        block.extend(line)
+        if line in {b"\n", b"\r\n"}:
+            for normalized in _normalize_anthropic_sse_block(bytes(block)):
+                yield normalized
+            block.clear()
+    if block:
+        for normalized in _normalize_anthropic_sse_block(bytes(block)):
+            yield normalized
 
 
 def _stream_final_response(handler: Any, path: str, response: dict) -> None:
@@ -550,7 +710,13 @@ def _stream_final_response(handler: Any, path: str, response: dict) -> None:
     elif "/messages" in path:
         msg_id = response.get("id", f"msg_{uuid.uuid4().hex}")
         model = response.get("model", "")
-        usage = response.get("usage") or {}
+        usage = dict(response.get("usage") or {})
+        if "total_tokens" not in usage:
+            input_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+            output_tokens = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
+            usage["input_tokens"] = input_tokens
+            usage["output_tokens"] = output_tokens
+            usage["total_tokens"] = input_tokens + output_tokens
         _write_sse(handler, {
             "type": "message_start",
             "message": {
@@ -620,17 +786,138 @@ def _stream_final_response(handler: Any, path: str, response: dict) -> None:
         })
         _write_sse(handler, {"type": "message_stop"})
     elif "/responses" in path:
+        response_id = response.get("id") or f"resp_gateway_{uuid.uuid4().hex}"
+        model = response.get("model", "")
+        usage = response.get("usage") or {}
+        response_base = {
+            "id": response_id,
+            "object": "response",
+            "created_at": response.get("created_at") or int(time.time()),
+            "status": "in_progress",
+            "model": model,
+            "output": [],
+            "usage": usage,
+        }
+        _write_sse(handler, {
+            "type": "response.created",
+            "response": response_base,
+        }, event="response.created")
+        _write_sse(handler, {
+            "type": "response.in_progress",
+            "response": response_base,
+        }, event="response.in_progress")
         output = response.get("output", [])
+        completed_output = []
+        output_index = 0
         for item in output:
             if isinstance(item, dict) and item.get("type") == "message":
+                item_id = str(item.get("id") or f"msg_{uuid.uuid4().hex}")
+                role = str(item.get("role") or "assistant")
+                started_item = {
+                    "id": item_id,
+                    "type": "message",
+                    "status": "in_progress",
+                    "role": role,
+                    "content": [],
+                }
+                _write_sse(handler, {
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": started_item,
+                }, event="response.output_item.added")
                 content_parts = item.get("content", [])
-                for part in content_parts:
+                completed_content = []
+                for part_index, part in enumerate(content_parts):
                     if isinstance(part, dict) and part.get("type") == "output_text":
+                        text = str(part.get("text", ""))
+                        started_part = {
+                            "type": "output_text",
+                            "text": "",
+                            "annotations": part.get("annotations") or [],
+                        }
                         _write_sse(handler, {
-                            "type": "response.output_text.delta",
-                            "delta": part.get("text", ""),
-                        })
-        _write_sse(handler, {"type": "response.completed"})
+                            "type": "response.content_part.added",
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "content_index": part_index,
+                            "part": started_part,
+                        }, event="response.content_part.added")
+                        if text:
+                            _write_sse(handler, {
+                                "type": "response.output_text.delta",
+                                "item_id": item_id,
+                                "output_index": output_index,
+                                "content_index": part_index,
+                                "delta": text,
+                            }, event="response.output_text.delta")
+                        completed_part = dict(started_part)
+                        completed_part["text"] = text
+                        _write_sse(handler, {
+                            "type": "response.output_text.done",
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "content_index": part_index,
+                            "text": text,
+                        }, event="response.output_text.done")
+                        _write_sse(handler, {
+                            "type": "response.content_part.done",
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "content_index": part_index,
+                            "part": completed_part,
+                        }, event="response.content_part.done")
+                        completed_content.append(completed_part)
+                completed_item = {
+                    "id": item_id,
+                    "type": "message",
+                    "status": "completed",
+                    "role": role,
+                    "content": completed_content,
+                }
+                _write_sse(handler, {
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": completed_item,
+                }, event="response.output_item.done")
+                completed_output.append(completed_item)
+                output_index += 1
+            elif isinstance(item, dict) and item.get("type") == "function_call":
+                item_id = str(item.get("id") or f"fc_{uuid.uuid4().hex}")
+                call_item = {
+                    "id": item_id,
+                    "type": "function_call",
+                    "call_id": item.get("call_id") or f"call_{uuid.uuid4().hex}",
+                    "name": item.get("name") or "",
+                    "arguments": item.get("arguments") or "",
+                    "status": item.get("status") or "completed",
+                }
+                _write_sse(handler, {
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": {**call_item, "arguments": ""},
+                }, event="response.output_item.added")
+                if call_item["arguments"]:
+                    _write_sse(handler, {
+                        "type": "response.function_call_arguments.done",
+                        "output_index": output_index,
+                        "item": call_item,
+                    }, event="response.function_call_arguments.done")
+                _write_sse(handler, {
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": call_item,
+                }, event="response.output_item.done")
+                completed_output.append(call_item)
+                output_index += 1
+        completed_response = dict(response_base)
+        completed_response.update({
+            "status": response.get("status") or "completed",
+            "output": completed_output,
+        })
+        _write_sse(handler, {
+            "type": "response.completed",
+            "response": completed_response,
+        }, event="response.completed")
 
     _write_sse(handler, "[DONE]", event="done")
 

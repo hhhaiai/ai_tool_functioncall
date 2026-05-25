@@ -124,6 +124,36 @@ class NativeGatewayTests(unittest.TestCase):
         ]:
             self.assertIn(name, BUILTIN_TOOLS)
 
+    def test_anthropic_stream_tool_use_start_input_is_replayed_as_delta(self):
+        from src.gateway_streaming import _normalize_anthropic_sse_block
+
+        raw = (
+            b"event: content_block_start\n"
+            b'data: {"type":"content_block_start","index":1,'
+            b'"content_block":{"type":"tool_use","id":"call_1","name":"Bash",'
+            b'"input":{"command":"printf ok"}}}\n\n'
+        )
+
+        blocks = _normalize_anthropic_sse_block(raw)
+
+        self.assertEqual(len(blocks), 2)
+        self.assertIn(b"event: content_block_start", blocks[0])
+        self.assertIn(b'"input": {}', blocks[0])
+        self.assertIn(b"event: content_block_delta", blocks[1])
+        self.assertIn(b'"type": "input_json_delta"', blocks[1])
+        self.assertIn(b'\\"command\\": \\"printf ok\\"', blocks[1])
+
+    def test_anthropic_stream_text_blocks_are_not_rewritten(self):
+        from src.gateway_streaming import _normalize_anthropic_sse_block
+
+        raw = (
+            b"event: content_block_start\n"
+            b'data: {"type":"content_block_start","index":0,'
+            b'"content_block":{"type":"text","text":""}}\n\n'
+        )
+
+        self.assertEqual(_normalize_anthropic_sse_block(raw), [raw])
+
     def test_calculator_tool_executes(self):
         result = _execute_tool_call(
             ToolCall(call_id="call_1", name="calculator", arguments={"expression": "1+2*3"}, raw={})
@@ -508,6 +538,121 @@ class NativeGatewayTests(unittest.TestCase):
         self.assertEqual(result["content"], "42")
         self.assertEqual(result["openai_chat"]["tool_call_id"], "call_tool_alias")
 
+    def test_gateway_internal_workspace_fields_are_not_forwarded_upstream(self):
+        from src.gateway_protocol import _convert_request_to_upstream
+
+        body = {
+            "model": "m",
+            "workspace_root": "/tmp/secret-project",
+            "gateway_workspace": "/tmp/secret-project",
+            "projectDir": "/tmp/secret-project",
+            "cwd": "/tmp/secret-project",
+            "metadata": {
+                "session_id": "s1",
+                "workspace_root": "/tmp/secret-project",
+                "gateway_workspace": "/tmp/secret-project",
+                "projectDir": "/tmp/secret-project",
+                "user_id": json.dumps({"session_id": "s1", "cwd": "/tmp/secret-project"}),
+            },
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        _, converted = _convert_request_to_upstream("/v1/chat/completions", body, "openai_chat")
+
+        serialized = json.dumps(converted, ensure_ascii=False)
+        self.assertNotIn("/tmp/secret-project", serialized)
+        self.assertNotIn("workspace_root", converted)
+        self.assertNotIn("gateway_workspace", converted)
+        self.assertEqual(converted["metadata"]["session_id"], "s1")
+        self.assertEqual(json.loads(converted["metadata"]["user_id"]), {"session_id": "s1"})
+
+        _, converted_string_metadata = _convert_request_to_upstream(
+            "/v1/chat/completions",
+            {
+                "model": "m",
+                "metadata": json.dumps({"session_id": "s2", "workspace_root": "/tmp/secret-project"}),
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            "openai_chat",
+        )
+        self.assertEqual(converted_string_metadata["metadata"], {"session_id": "s2"})
+
+    def test_streaming_passthrough_strips_internal_workspace_fields(self):
+        from src.gateway_streaming import _stream_upstream_passthrough
+
+        class StreamingUpstreamHandler(BaseHTTPRequestHandler):
+            seen_body = None
+
+            def log_message(self, fmt, *args):  # noqa: N802
+                return
+
+            def do_POST(self):  # noqa: N802
+                length = int(self.headers.get("content-length") or "0")
+                StreamingUpstreamHandler.seen_body = json.loads(self.rfile.read(length).decode("utf-8"))
+                payload = b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'
+                self.send_response(200)
+                self.send_header("content-type", "text/event-stream")
+                self.send_header("content-length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        class DummyHandler:
+            def __init__(self):
+                self.headers = []
+                self.wfile = self
+                self.data = bytearray()
+
+            def send_response(self, code):
+                self.code = code
+
+            def send_header(self, name, value):
+                self.headers.append((name, value))
+
+            def end_headers(self):
+                pass
+
+            def write(self, data):
+                self.data.extend(data)
+
+            def flush(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            upstream = ThreadingHTTPServer(("127.0.0.1", 0), StreamingUpstreamHandler)
+            thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+            thread.start()
+            try:
+                cfg = gateway._default_config()
+                cfg["upstream"]["base_url"] = f"http://127.0.0.1:{upstream.server_address[1]}"
+                cfg["upstream"]["model"] = "m"
+                cfg["upstream"]["protocol"] = "openai_chat"
+                gateway.save_config(cfg)
+                handler = DummyHandler()
+                _stream_upstream_passthrough(
+                    handler,
+                    "/v1/chat/completions",
+                    {
+                        "model": "m",
+                        "stream": True,
+                        "workspace_root": "/tmp/secret-project",
+                        "gateway_workspace": "/tmp/secret-project",
+                        "metadata": {"session_id": "s1", "workspace_root": "/tmp/secret-project", "user_id": json.dumps({"session_id": "s1", "cwd": "/tmp/secret-project"})},
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+                serialized = json.dumps(StreamingUpstreamHandler.seen_body, ensure_ascii=False)
+                self.assertNotIn("/tmp/secret-project", serialized)
+                self.assertEqual(StreamingUpstreamHandler.seen_body["metadata"]["session_id"], "s1")
+                self.assertEqual(json.loads(StreamingUpstreamHandler.seen_body["metadata"]["user_id"]), {"session_id": "s1"})
+                self.assertIn(b"data: [DONE]", bytes(handler.data))
+            finally:
+                upstream.shutdown()
+                upstream.server_close()
+                thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+
     def test_direct_tool_call_can_scope_workspace_per_request(self):
         with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as other:
             old_config = gateway.CONFIG_PATH
@@ -693,6 +838,408 @@ class NativeGatewayTests(unittest.TestCase):
                     os.environ.pop("GATEWAY_TOOL_FAILURE_LOG", None)
                 else:
                     os.environ["GATEWAY_TOOL_FAILURE_LOG"] = old_failure_log
+
+    def test_skill_tool_discovers_project_scoped_codex_claude_opencode_plugin_and_env_dirs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            old_cwd = pathlib.Path.cwd()
+            old_extra = os.environ.get("GATEWAY_SKILLS_DIRS")
+            old_workspace_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            try:
+                for rel, marker in [
+                    ("workspace/.codex/skills/codex-skill/SKILL.md", "from-codex"),
+                    ("workspace/.agents/skills/agents-skill/SKILL.md", "from-agents"),
+                    ("workspace/.claude/skills/claude-skill/SKILL.md", "from-claude"),
+                    ("workspace/.opencode/skills/opencode-skill/SKILL.md", "from-opencode"),
+                    ("workspace/skills/workspace-skill/SKILL.md", "from-workspace-skills"),
+                    ("extra-skills/env-skill/SKILL.md", "from-env-skills"),
+                    (".claude/skills/service-cwd-skill/SKILL.md", "from-service-cwd"),
+                ]:
+                    path = root / rel
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(f"# {path.parent.name}\n\n{marker}\n", encoding="utf-8")
+                plugin_manifest = workspace / ".codex/plugins/demo/.codex-plugin/plugin.json"
+                plugin_manifest.parent.mkdir(parents=True, exist_ok=True)
+                plugin_manifest.write_text(json.dumps({"name": "demo", "skills": "./skills"}), encoding="utf-8")
+                plugin_skill = workspace / ".codex/plugins/demo/skills/plugin-skill/SKILL.md"
+                plugin_skill.parent.mkdir(parents=True, exist_ok=True)
+                plugin_skill.write_text("# plugin-skill\n\nfrom-project-plugin\n", encoding="utf-8")
+                os.environ["GATEWAY_SKILLS_DIRS"] = str(root / "extra-skills")
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = str(workspace)
+                os.chdir(root)
+
+                listed = _execute_tool_call(ToolCall("skills", "list_skills", {}, {}))
+                self.assertTrue(listed.success)
+                payload = json.loads(listed.content)
+                names = {item["name"] for item in payload["skills"]}
+                self.assertIn("codex-skill", names)
+                self.assertIn("agents-skill", names)
+                self.assertIn("claude-skill", names)
+                self.assertIn("opencode-skill", names)
+                self.assertIn("workspace-skill", names)
+                self.assertIn("plugin-skill", names)
+                self.assertIn("env-skill", names)
+                self.assertNotIn("service-cwd-skill", names)
+
+                read = _execute_tool_call(ToolCall("read-skill", "read_skill", {"name": "claude-skill"}, {}))
+                self.assertTrue(read.success)
+                self.assertIn("from-claude", read.content)
+                plugin_read = _execute_tool_call(ToolCall("read-plugin-skill", "read_skill", {"name": "plugin-skill"}, {}))
+                self.assertTrue(plugin_read.success)
+                self.assertIn("from-project-plugin", plugin_read.content)
+            finally:
+                os.chdir(old_cwd)
+                if old_extra is None:
+                    os.environ.pop("GATEWAY_SKILLS_DIRS", None)
+                else:
+                    os.environ["GATEWAY_SKILLS_DIRS"] = old_extra
+                if old_workspace_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_workspace_root
+
+    def test_claude_project_dir_prefers_live_primary_directory_over_stale_worktree(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_cwd = pathlib.Path.cwd()
+            old_workspace_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                service_root = pathlib.Path(td) / "gateway-service"
+                project_root = pathlib.Path(td) / "PersonalAIBrain"
+                service_root.mkdir()
+                project_root.mkdir()
+                service_skill = service_root / ".claude/skills/service-only/SKILL.md"
+                service_skill.parent.mkdir(parents=True, exist_ok=True)
+                service_skill.write_text("# service-only\n\nSERVICE-SHOULD-NOT-LEAK\n", encoding="utf-8")
+                project_skill = project_root / ".claude/skills/project-skill/SKILL.md"
+                project_skill.parent.mkdir(parents=True, exist_ok=True)
+                project_skill.write_text("# project-skill\n\nPROJECT-SKILL-OK\n", encoding="utf-8")
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                os.chdir(service_root)
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = str(service_root)
+                cfg["gateway"]["tool_mode"] = "orchestrate"
+                cfg["upstream"]["tools_enabled"] = "adapter"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                gateway.save_config(cfg)
+
+                text = (
+                    "<system-reminder>\n"
+                    f"Previous summary says stale **Worktree:** {service_root}\n"
+                    "</system-reminder>\n"
+                    "# Environment\n"
+                    "You have been invoked in the following environment:\n"
+                    f" - Primary working directory: {project_root}\n"
+                    " - Is a git repository: true\n\n"
+                    "Read skill project-skill and return its content."
+                )
+                client = FakeClient([])
+                result = run_tool_orchestration(
+                    "/v1/messages",
+                    {"model": "m", "messages": [{"role": "user", "content": [{"type": "text", "text": text}]}], "max_tokens": 128},
+                    client,
+                )
+                serialized = json.dumps(result, ensure_ascii=False)
+                self.assertIn("PROJECT-SKILL-OK", serialized)
+                self.assertNotIn("SERVICE-SHOULD-NOT-LEAK", serialized)
+                self.assertEqual(result.get("gateway_context", {}).get("strategy"), "gateway_local_skill_read")
+                self.assertEqual(client.requests, [])
+            finally:
+                gateway.CONFIG_PATH = old_config
+                os.chdir(old_cwd)
+                if old_workspace_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_workspace_root
+
+    def test_codex_responses_project_dir_uses_environment_context_cwd_for_skills(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_workspace_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                service_root = pathlib.Path(td) / "gateway-service"
+                project_root = pathlib.Path(td) / "codex-project"
+                service_root.mkdir()
+                project_root.mkdir()
+                skill_file = project_root / ".codex/skills/codex-project-skill/SKILL.md"
+                skill_file.parent.mkdir(parents=True, exist_ok=True)
+                skill_file.write_text("# codex-project-skill\n\nCODEX-PROJECT-SKILL-OK\n", encoding="utf-8")
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = str(service_root)
+                cfg["gateway"]["tool_mode"] = "orchestrate"
+                cfg["upstream"]["tools_enabled"] = "adapter"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                gateway.save_config(cfg)
+
+                body = {
+                    "model": "m",
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": f"<environment_context>\n  <cwd>{project_root}</cwd>\n  <shell>bash</shell>\n</environment_context>",
+                                }
+                            ],
+                        },
+                        {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "Read skill codex-project-skill and return its content."}],
+                        },
+                    ],
+                    "max_output_tokens": 128,
+                }
+                client = FakeClient([])
+                result = run_tool_orchestration("/v1/responses", body, client)
+                serialized = json.dumps(result, ensure_ascii=False)
+                self.assertIn("CODEX-PROJECT-SKILL-OK", serialized)
+                self.assertEqual(result.get("gateway_context", {}).get("strategy"), "gateway_local_skill_read")
+                self.assertEqual(client.requests, [])
+            finally:
+                gateway.CONFIG_PATH = old_config
+                if old_workspace_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_workspace_root
+
+    def test_project_trace_paths_use_downstream_project_root_not_gateway_service_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_cwd = pathlib.Path.cwd()
+            old_workspace_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                service_root = pathlib.Path(td) / "gateway-service"
+                project_root = pathlib.Path(td) / "PersonalAIBrain"
+                service_root.mkdir()
+                project_root.mkdir()
+                service_trace = service_root / ".traces/2026-05-24/trace.txt"
+                service_trace.parent.mkdir(parents=True, exist_ok=True)
+                service_trace.write_text("project-trace-marker: WRONG-SERVICE\n", encoding="utf-8")
+                project_trace = project_root / ".traces/2026-05-24/trace.txt"
+                project_trace.parent.mkdir(parents=True, exist_ok=True)
+                project_trace.write_text("project-trace-marker: PERSONAL-BRAIN-TRACE-OK\n", encoding="utf-8")
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                os.chdir(service_root)
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = str(service_root)
+                cfg["gateway"]["tool_mode"] = "orchestrate"
+                cfg["upstream"]["tools_enabled"] = "adapter"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                gateway.save_config(cfg)
+
+                text = (
+                    "<system-reminder>\n"
+                    f"Previous summary has stale **Worktree:** {service_root}\n"
+                    "</system-reminder>\n"
+                    "# Environment\n"
+                    "You have been invoked in the following environment:\n"
+                    f" - Primary working directory: {project_root}\n"
+                    " - Is a git repository: true\n\n"
+                    f"Read local file {project_trace} and answer only the value after project-trace-marker."
+                )
+                client = FakeClient([])
+                result = run_tool_orchestration(
+                    "/v1/messages",
+                    {"model": "m", "messages": [{"role": "user", "content": [{"type": "text", "text": text}]}], "max_tokens": 64},
+                    client,
+                )
+                serialized = json.dumps(result, ensure_ascii=False)
+                self.assertIn("PERSONAL-BRAIN-TRACE-OK", serialized)
+                self.assertNotIn("WRONG-SERVICE", serialized)
+                self.assertEqual(result.get("gateway_context", {}).get("strategy"), "gateway_local_file_read")
+                self.assertEqual(client.requests, [])
+            finally:
+                gateway.CONFIG_PATH = old_config
+                os.chdir(old_cwd)
+                if old_workspace_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_workspace_root
+
+    def test_workspace_scope_is_thread_local_for_parallel_downstream_projects(self):
+        from src.gateway_builtin_tools import _workspace_root
+        from src.gateway_tool_runtime import _workspace_scope
+
+        with tempfile.TemporaryDirectory() as td:
+            project_a = pathlib.Path(td) / "project-a"
+            project_b = pathlib.Path(td) / "project-b"
+            project_a.mkdir()
+            project_b.mkdir()
+            barrier = threading.Barrier(2)
+            results: dict[str, str] = {}
+
+            def worker(name, root):
+                with _workspace_scope(root):
+                    barrier.wait(timeout=5)
+                    results[name] = str(_workspace_root())
+
+            t1 = threading.Thread(target=worker, args=("a", project_a))
+            t2 = threading.Thread(target=worker, args=("b", project_b))
+            t1.start()
+            t2.start()
+            t1.join(timeout=5)
+            t2.join(timeout=5)
+            self.assertEqual(results, {"a": str(project_a.resolve()), "b": str(project_b.resolve())})
+
+    def test_parallel_tool_use_inherits_active_downstream_project_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_workspace_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                service_root = pathlib.Path(td) / "gateway-service"
+                project_root = pathlib.Path(td) / "parallel-project"
+                service_root.mkdir()
+                project_root.mkdir()
+                (project_root / "target.txt").write_text("PARALLEL-PROJECT-OK\n", encoding="utf-8")
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = str(service_root)
+                gateway.save_config(cfg)
+
+                result = execute_direct_tool_call(
+                    {
+                        "workspace_root": str(project_root),
+                        "tool": "multi_tool_use.parallel",
+                        "arguments": {
+                            "tool_uses": [
+                                {"recipient_name": "Read", "parameters": {"file_path": "target.txt"}},
+                                {"recipient_name": "Tree", "parameters": {"path": ".", "max_depth": 1}},
+                            ]
+                        },
+                    }
+                )
+                serialized = json.dumps(result, ensure_ascii=False)
+                self.assertTrue(result["success"])
+                self.assertIn("PARALLEL-PROJECT-OK", serialized)
+                self.assertIn("target.txt", serialized)
+            finally:
+                gateway.CONFIG_PATH = old_config
+                if old_workspace_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_workspace_root
+
+    def test_memory_tool_lists_only_active_downstream_project_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_ready = gateway.SQLITE_READY
+            old_sqlite = os.environ.get("GATEWAY_SQLITE_LOG_PATH")
+            old_workspace_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_SQLITE_LOG_PATH"] = str(pathlib.Path(td) / "gateway.sqlite3")
+            gateway.SQLITE_READY = False
+            try:
+                service_root = pathlib.Path(td) / "gateway-service"
+                project_root = pathlib.Path(td) / "PersonalAIBrain"
+                service_root.mkdir()
+                project_root.mkdir()
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = str(service_root)
+                gateway.save_config(cfg)
+
+                service_memory = execute_direct_tool_call(
+                    {
+                        "workspace_root": str(service_root),
+                        "tool": "SaveMemory",
+                        "arguments": {"action": "write", "summary": "SERVICE-MEMORY-WRONG", "keywords": ["service-memory"]},
+                    }
+                )
+                self.assertTrue(service_memory["success"])
+                project_memory = execute_direct_tool_call(
+                    {
+                        "workspace_root": str(project_root),
+                        "tool": "SaveMemory",
+                        "arguments": {"action": "write", "summary": "PROJECT-MEMORY-OK", "keywords": ["project-memory"]},
+                    }
+                )
+                self.assertTrue(project_memory["success"])
+                self.assertIn(str(project_root), project_memory["content"])
+
+                recalled = execute_direct_tool_call(
+                    {"workspace_root": str(project_root), "tool": "RecallMemory", "arguments": {"action": "list", "limit": 10}}
+                )
+                self.assertTrue(recalled["success"])
+                self.assertIn("PROJECT-MEMORY-OK", recalled["content"])
+                self.assertIn(str(project_root), recalled["content"])
+                self.assertNotIn("SERVICE-MEMORY-WRONG", recalled["content"])
+                self.assertNotIn(str(service_root), recalled["content"])
+            finally:
+                gateway.CONFIG_PATH = old_config
+                gateway.SQLITE_READY = old_ready
+                if old_sqlite is None:
+                    os.environ.pop("GATEWAY_SQLITE_LOG_PATH", None)
+                else:
+                    os.environ["GATEWAY_SQLITE_LOG_PATH"] = old_sqlite
+                if old_workspace_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_workspace_root
+
+    def test_weak_upstream_direct_skill_requests_execute_locally_for_messages_and_responses(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_workspace_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                workspace = pathlib.Path(td) / "workspace"
+                skill_file = workspace / ".claude/skills/reason-boost/SKILL.md"
+                skill_file.parent.mkdir(parents=True, exist_ok=True)
+                skill_file.write_text("# reason-boost\n\nUse first principles. marker: SKILL-BOOST-OK\n", encoding="utf-8")
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = str(workspace)
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = str(workspace)
+                cfg["gateway"]["tool_mode"] = "orchestrate"
+                cfg["upstream"]["tools_enabled"] = "adapter"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                gateway.save_config(cfg)
+
+                messages_client = FakeClient([])
+                messages_result = run_tool_orchestration(
+                    "/v1/messages",
+                    {
+                        "model": "m",
+                        "messages": [{"role": "user", "content": "Read skill reason-boost and return its content."}],
+                        "max_tokens": 128,
+                    },
+                    messages_client,
+                )
+                self.assertIn("SKILL-BOOST-OK", messages_result["content"][0]["text"])
+                self.assertEqual(messages_result.get("gateway_context", {}).get("strategy"), "gateway_local_skill_read")
+                self.assertEqual(messages_client.requests, [])
+
+                responses_client = FakeClient([])
+                responses_result = run_tool_orchestration(
+                    "/v1/responses",
+                    {
+                        "model": "m",
+                        "input": "List skills available in this workspace.",
+                        "max_output_tokens": 256,
+                    },
+                    responses_client,
+                )
+                serialized = json.dumps(responses_result, ensure_ascii=False)
+                self.assertIn("reason-boost", serialized)
+                self.assertEqual(responses_result.get("gateway_context", {}).get("strategy"), "gateway_local_skill_list")
+                self.assertEqual(responses_client.requests, [])
+            finally:
+                gateway.CONFIG_PATH = old_config
+                if old_workspace_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_workspace_root
 
     def test_core_coding_tools_write_edit_shell_and_web_are_real(self):
         class SearchHandler(BaseHTTPRequestHandler):
@@ -3767,14 +4314,20 @@ while True:
                 req = urllib.request.Request(base + "/client-config.json", headers={"authorization": f"Basic {token}"})
                 with urllib.request.urlopen(req, timeout=5) as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
-                self.assertIn('model_provider = "Gateway"', payload["codex_config_toml"])
+                self.assertIn('model_provider = "gateway"', payload["codex_config_toml"])
+                self.assertIn("[model_providers.gateway]", payload["codex_config_toml"])
+                self.assertIn('base_url = "http://127.0.0.1:8885/v1"', payload["codex_config_toml"])
+                self.assertIn('env_key = "OPENAI_API_KEY"', payload["codex_config_toml"])
                 self.assertIn('wire_api = "responses"', payload["codex_config_toml"])
+                self.assertIn("model_context_window = 1048576", payload["codex_config_toml"])
+                self.assertIn("model_max_output_tokens = 131072", payload["codex_config_toml"])
                 self.assertIn('"OPENAI_API_KEY": "test-api-key"', payload["codex_auth_json"])
                 self.assertIn('"baseURL": "http://127.0.0.1:8885/v1"', payload["opencode_json"])
                 self.assertIn("claude_mnative()", payload["claude_bash_profile_function"])
                 self.assertIn('ANTHROPIC_BASE_URL="http://127.0.0.1:8885/anthropic"', payload["claude_bash_profile_function"])
                 self.assertIn('ANTHROPIC_AUTH_TOKEN="test-api-key"', payload["claude_bash_profile_function"])
                 self.assertIn('ANTHROPIC_API_KEY=""', payload["claude_bash_profile_function"])
+                self.assertIn('command -v claude', payload["claude_bash_profile_function"])
                 self.assertIn('"ANTHROPIC_AUTH_TOKEN": "test-api-key"', payload["vscode_claude_settings_json"])
                 self.assertEqual(payload["claude_code_env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8885/anthropic")
                 self.assertEqual(payload["claude_code_env"]["ANTHROPIC_API_KEY"], "")
@@ -3999,6 +4552,213 @@ class AnthropicSSEFormatTests(unittest.TestCase):
         self.assertIn('"message_stop"', all_text)
         self.assertIn('"stop_reason"', all_text)
 
+
+    def test_streaming_adapter_direct_file_read_uses_local_runtime_without_upstream(self):
+        from src.gateway_streaming import run_streaming_orchestration
+
+        events = []
+
+        class FakeHandler:
+            class wfile:
+                @staticmethod
+                def write(data):
+                    events.append(data.decode("utf-8") if isinstance(data, bytes) else data)
+
+                @staticmethod
+                def flush():
+                    pass
+
+            def send_response(self, status):
+                events.append(f"STATUS:{status}\n")
+
+            def send_header(self, key, value):
+                events.append(f"HEADER:{key}:{value}\n")
+
+            def end_headers(self):
+                events.append("END_HEADERS\n")
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_mode = os.environ.get("GATEWAY_TOOL_MODE")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                workspace = pathlib.Path(td) / "workspace"
+                workspace.mkdir()
+                probe = workspace / "probe.txt"
+                probe.write_text("gateway-local-file-probe: 2+2=4\n", encoding="utf-8")
+                os.environ.pop("GATEWAY_TOOL_MODE", None)
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = str(workspace)
+                cfg["gateway"]["tool_mode"] = "orchestrate"
+                cfg["upstream"]["tools_enabled"] = "auto"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                gateway.save_config(cfg)
+
+                run_streaming_orchestration(
+                    FakeHandler(),
+                    "/v1/messages",
+                    {
+                        "model": "m",
+                        "stream": True,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": f"Read local file {probe} and answer only the value after gateway-local-file-probe.",
+                            }
+                        ],
+                        "max_tokens": 64,
+                    },
+                )
+
+                text = "".join(events)
+                self.assertIn("text/event-stream", text)
+                self.assertIn("2+2=4", text)
+                self.assertNotIn("event: error", text)
+                self.assertIn("message_stop", text)
+            finally:
+                gateway.CONFIG_PATH = old_config
+                if old_mode is None:
+                    os.environ.pop("GATEWAY_TOOL_MODE", None)
+                else:
+                    os.environ["GATEWAY_TOOL_MODE"] = old_mode
+
+    def test_streaming_adapter_explicit_bash_request_uses_local_runtime(self):
+        from src.gateway_streaming import run_streaming_orchestration
+
+        events = []
+
+        class FakeHandler:
+            class wfile:
+                @staticmethod
+                def write(data):
+                    events.append(data.decode("utf-8") if isinstance(data, bytes) else data)
+
+                @staticmethod
+                def flush():
+                    pass
+
+            def send_response(self, status):
+                events.append(f"STATUS:{status}\n")
+
+            def send_header(self, key, value):
+                events.append(f"HEADER:{key}:{value}\n")
+
+            def end_headers(self):
+                events.append("END_HEADERS\n")
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_mode = os.environ.get("GATEWAY_TOOL_MODE")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                os.environ.pop("GATEWAY_TOOL_MODE", None)
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = td
+                cfg["gateway"]["tool_mode"] = "orchestrate"
+                cfg["gateway"]["allow_shell_tools"] = True
+                cfg["upstream"]["tools_enabled"] = "adapter"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                gateway.save_config(cfg)
+
+                run_streaming_orchestration(
+                    FakeHandler(),
+                    "/v1/messages",
+                    {
+                        "model": "m",
+                        "stream": True,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": "Run bash command `printf STREAM-BASH-OK` and reply only with stdout.",
+                            }
+                        ],
+                        "max_tokens": 64,
+                    },
+                )
+
+                text = "".join(events)
+                self.assertIn("STREAM-BASH-OK", text)
+                self.assertNotIn("event: error", text)
+                self.assertIn("message_stop", text)
+            finally:
+                gateway.CONFIG_PATH = old_config
+                if old_mode is None:
+                    os.environ.pop("GATEWAY_TOOL_MODE", None)
+                else:
+                    os.environ["GATEWAY_TOOL_MODE"] = old_mode
+
+    def test_streaming_adapter_explicit_skill_read_uses_local_runtime(self):
+        from src.gateway_streaming import run_streaming_orchestration
+
+        events = []
+
+        class FakeHandler:
+            class wfile:
+                @staticmethod
+                def write(data):
+                    events.append(data.decode("utf-8") if isinstance(data, bytes) else data)
+
+                @staticmethod
+                def flush():
+                    pass
+
+            def send_response(self, status):
+                events.append(f"STATUS:{status}\n")
+
+            def send_header(self, key, value):
+                events.append(f"HEADER:{key}:{value}\n")
+
+            def end_headers(self):
+                events.append("END_HEADERS\n")
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_mode = os.environ.get("GATEWAY_TOOL_MODE")
+            old_workspace_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                workspace = pathlib.Path(td) / "workspace"
+                skill_file = workspace / ".codex/skills/deep-think/SKILL.md"
+                skill_file.parent.mkdir(parents=True, exist_ok=True)
+                skill_file.write_text("# deep-think\n\nmarker: STREAM-SKILL-OK\n", encoding="utf-8")
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = str(workspace)
+                os.environ.pop("GATEWAY_TOOL_MODE", None)
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = str(workspace)
+                cfg["gateway"]["tool_mode"] = "orchestrate"
+                cfg["upstream"]["tools_enabled"] = "adapter"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                gateway.save_config(cfg)
+
+                run_streaming_orchestration(
+                    FakeHandler(),
+                    "/v1/messages",
+                    {
+                        "model": "m",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "Read skill deep-think and return its content."}],
+                        "max_tokens": 128,
+                    },
+                )
+
+                text = "".join(events)
+                self.assertIn("STREAM-SKILL-OK", text)
+                self.assertNotIn("event: error", text)
+                self.assertIn("message_stop", text)
+            finally:
+                gateway.CONFIG_PATH = old_config
+                if old_mode is None:
+                    os.environ.pop("GATEWAY_TOOL_MODE", None)
+                else:
+                    os.environ["GATEWAY_TOOL_MODE"] = old_mode
+                if old_workspace_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_workspace_root
+
     def test_stream_final_response_emits_thinking_blocks(self):
         from src.gateway_streaming import _stream_final_response
         events = []
@@ -4025,6 +4785,46 @@ class AnthropicSSEFormatTests(unittest.TestCase):
         self.assertIn('"thinking_delta"', all_text)
         self.assertIn("reasoning here", all_text)
         self.assertIn('"text_delta"', all_text)
+
+    def test_stream_final_response_responses_has_item_before_text_delta(self):
+        from src.gateway_streaming import _stream_final_response
+        events = []
+
+        class FakeHandler:
+            class wfile:
+                @staticmethod
+                def write(data):
+                    events.append(data.decode("utf-8") if isinstance(data, bytes) else data)
+
+                @staticmethod
+                def flush():
+                    pass
+
+        response = {
+            "id": "resp_test",
+            "object": "response",
+            "model": "mimo-v2.5-pro",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "CODEX-STREAM-OK"}],
+                }
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        }
+
+        _stream_final_response(FakeHandler(), "/v1/responses", response)
+        all_text = "".join(events)
+
+        self.assertIn("event: response.output_item.added", all_text)
+        self.assertIn("event: response.content_part.added", all_text)
+        self.assertIn("event: response.output_text.delta", all_text)
+        self.assertIn("event: response.output_text.done", all_text)
+        self.assertIn("event: response.completed", all_text)
+        self.assertLess(all_text.index("response.output_item.added"), all_text.index("response.output_text.delta"))
+        self.assertIn("CODEX-STREAM-OK", all_text)
 
 
 if __name__ == "__main__":

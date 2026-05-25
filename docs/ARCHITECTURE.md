@@ -1,5 +1,7 @@
 # Gateway 架构文档
 
+> 真实测试上游 / Mimo 作为上游时默认按 **Gateway adapter** 处理：`tools_enabled=adapter`，`supports_tools=false`，`supports_function_calls=false`。真实地址只放本地 `.gateway_service.json`、`.env` 或运行时环境变量，不写入提交代码。当前探针显示 `/v1/messages` 在 forced tool_choice 下可返回 Anthropic `tool_use`，但上游直连没有 `/anthropic` 别名、没有 `/v1/tools/call` / `/v1/functions/call`，且 `/v1/responses` forced tool probe 未返回 Codex 需要的 `function_call`。因此 Claude Code/Codex 不直连该上游执行工具，而是连接 Gateway，由 Gateway 本地 runtime/MCP/HTTP Actions 执行真实工具，再把结果回填给上游模型继续生成。Mimo 上下文按 `1048576` tokens（1M）配置。
+
 ## 1. 系统定位
 
 ```
@@ -76,6 +78,10 @@ Anthropic Messages   →  gateway_protocol  →  任意下游格式
 
 **核心模块**: `gateway_tool_runtime.py`, `gateway_builtin_tools.py`
 
+Gateway 是中游服务，不把自身启动目录当作用户项目目录。每个请求会先解析当前下游项目根：请求体 `workspace_root` / `gateway_workspace` 最优先，其次是 Claude Code 的 `Primary working directory` / `Worktree`、Codex Responses 的 `<environment_context><cwd>`、metadata 中的 `projectDir` / `cwd`，最后才回退到 env/config/default。工具读写、项目级 `.traces`、SQLite 记忆隔离、`Skill` 工具和项目插件都使用该请求级项目根。
+
+`Skill` / `list_skills` / `read_skill` / `run_skill` 是真实 Gateway 工具。项目内 `.codex/skills`、`.claude/skills`、`.opencode/skills`、`.agents/skills`、`skills/` 优先；项目内 `.codex/plugins` / `.claude/plugins` / `.opencode/plugins` / `plugins` 的 manifest 可声明 skills，但声明路径必须仍在项目根内；用户全局 skills 与 `GATEWAY_SKILLS_DIRS` 在项目目录之后加载。
+
 ### 3.3 上下文管理（无限上下文）
 
 ```
@@ -150,6 +156,11 @@ src/
 └───────────────────┘
         │
         ▼
+┌─────────────────────┐
+│ request workspace    │  ← 解析下游项目根，隔离工具/Skills/.traces/记忆
+└─────────────────────┘
+        │
+        ▼
 ┌───────────────────┐
 │ gateway_protocol  │  ← 转换为上游格式
 └───────────────────┘
@@ -211,8 +222,8 @@ Token 估算 (body_token_estimate)
   "upstream": {
     "capabilities": {
       "supports_streaming": true,
-      "supports_tools": true,
-      "supports_function_calls": true,
+      "supports_tools": false,
+      "supports_function_calls": false,
       "supports_vision": false,
       "supports_network": false
     }
@@ -226,11 +237,11 @@ Token 估算 (body_token_estimate)
 {
   "context": {
     "enabled": true,
-    "max_input_tokens": 24000,
+    "max_input_tokens": 1048576,
     "keep_recent_messages": 12,
     "summary_max_chars": 6000,
     "fanout_enabled": true,
-    "fanout_chunk_tokens": 12000,
+    "fanout_chunk_tokens": 120000,
     "memory_enabled": true
   }
 }
@@ -246,4 +257,4 @@ Token 估算 (body_token_estimate)
 | OpenCode | OpenAI Chat | `OPENAI_BASE_URL` |
 | Python SDK | OpenAI Chat/Responses | `base_url + api_key` |
 
-所有下游通过 Gateway 后，都获得一致的 Tool Call 使用入口；真实执行能力来自 Gateway 内置工具、MCP、HTTP Action、provider-native tools 或其它明确配置的 executor。
+所有下游通过 Gateway 后，都获得一致的 Tool Call 使用入口；真实执行能力来自 Gateway 内置工具、MCP、HTTP Action、provider-native tools 或其它明确配置的 executor。Claude Code / Codex 的工具、Skills 和项目级路径按“当前下游项目根”隔离，内部 `workspace_root` / `gateway_workspace` / `projectDir` / `cwd` 等路由字段只在 Gateway 内使用，不作为上游模型语义透传；普通转发与 streaming passthrough 都会在上游请求前清理这些字段及 metadata JSON 里的同类嵌套字段。

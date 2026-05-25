@@ -204,7 +204,8 @@ def _extract_openai_tool_calls_for_stream(response: Json) -> list[dict]:
 def _fallback_response(path: str, text: str, *, status_note: str = "gateway_fallback") -> Json:
     """Generate a fallback response when upstream is unavailable."""
     model = _config_env("UPSTREAM_MODEL", "")
-    usage = {"input_tokens": 0, "output_tokens": _approx_token_count(text)}
+    output_tokens = _approx_token_count(text)
+    usage = {"input_tokens": 0, "output_tokens": output_tokens, "total_tokens": output_tokens}
     if path == "/v1/messages":
         return {
             "id": f"msg_gateway_{uuid.uuid4().hex}",
@@ -288,51 +289,147 @@ def _get_marketplace():
 def _extract_client_project_dir(body: Json) -> pathlib.Path | None:
     """Detect the downstream client's project directory from request metadata.
 
-    Claude Code injects session context into user messages as system-reminder
-    blocks.  Look for ``Worktree:``, ``Primary working directory:``, or
-    ``projectDir`` patterns to determine where the client is actually working.
-
-    Priority order (first match wins):
-    1. Worktree (explicit worktree path)
-    2. Primary working directory (Claude Code session metadata)
-    3. projectDir (JSON metadata)
-    4. Working directory (generic fallback)
-    5. CWD (last resort)
+    Claude Code injects session context into user/system blocks; Codex sends
+    ``<environment_context><cwd>`` through Responses input.  Explicit metadata
+    fields win first.  For natural-language/system-reminder text, prefer the
+    latest matching path in the request because compacted summaries can contain
+    stale ``Worktree:`` values from an older Gateway/service repo.
     """
+    candidates: list[str] = []
+    metadata = body.get("metadata")
+    if isinstance(metadata, dict):
+        for key in (
+            "gateway_workspace",
+            "workspace_root",
+            "project_dir",
+            "projectDir",
+            "cwd",
+            "working_directory",
+            "primary_working_directory",
+            "worktree",
+        ):
+            value = metadata.get(key)
+            if isinstance(value, str):
+                candidates.append(value)
+        user_meta = metadata.get("user_id")
+        if isinstance(user_meta, str):
+            candidates.append(user_meta)
+    elif isinstance(metadata, str):
+        candidates.append(metadata)
+
+    for key in (
+        "project_dir",
+        "projectDir",
+        "cwd",
+        "working_directory",
+        "primary_working_directory",
+        "worktree",
+    ):
+        value = body.get(key)
+        if isinstance(value, str):
+            candidates.append(value)
+
+    system = body.get("system")
+    if isinstance(system, str):
+        candidates.append(system)
+    elif isinstance(system, list):
+        for item in system:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str):
+                    candidates.append(text)
+            elif isinstance(item, str):
+                candidates.append(item)
+
+    raw_input = body.get("input")
+    if isinstance(raw_input, str):
+        candidates.append(raw_input)
+    elif isinstance(raw_input, list):
+        for item in raw_input:
+            if isinstance(item, str):
+                candidates.append(item)
+            elif isinstance(item, dict):
+                content = item.get("content")
+                if isinstance(content, str):
+                    candidates.append(content)
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict):
+                            text = part.get("text") or part.get("input_text")
+                            if isinstance(text, str):
+                                candidates.append(text)
+                        elif isinstance(part, str):
+                            candidates.append(part)
+                text = item.get("text") or item.get("input") or item.get("input_text")
+                if isinstance(text, str):
+                    candidates.append(text)
+
     messages = body.get("messages") or []
+    message_texts: list[str] = []
     # Ordered by specificity - more specific patterns first
     patterns = [
         # Claude Code worktree pattern (highest priority - explicit isolation)
-        re.compile(r"Worktree:\s*(/\S+)"),
+        re.compile(r"Worktree:\*?\*?\s*(/.+?)(?:\s*(?:\n|$))"),
         # Claude Code primary working directory pattern
-        re.compile(r"Primary working directory:\s*(/\S+)"),
+        re.compile(r"Primary working directory:\*?\*?\s*(/.+?)(?:\s*(?:\n|$))"),
         # JSON projectDir pattern (handles both "projectDir": "/path" and projectDir: /path)
         # Also handles trailing quotes from JSON strings
         re.compile(r"""projectDir["']?\s*[:=]\s*["']?(/\S+?)["']?(?:\s|,|$|})"""),
+        re.compile(r"""project[_-]?dir["']?\s*[:=]\s*["']?(/\S+?)["']?(?:\s|,|$|})""", re.I),
+        re.compile(r"""workspace[_-]?root["']?\s*[:=]\s*["']?(/\S+?)["']?(?:\s|,|$|})""", re.I),
+        re.compile(r"""gateway[_-]?workspace["']?\s*[:=]\s*["']?(/\S+?)["']?(?:\s|,|$|})""", re.I),
+        # Codex CLI environment context.
+        re.compile(r"<cwd>\s*(/.+?)\s*</cwd>", re.I | re.S),
         # Generic working directory pattern (lower priority)
-        re.compile(r"Working directory:\s*(/\S+)"),
+        re.compile(r"Working directory:\*?\*?\s*(/.+?)(?:\s*(?:\n|$))"),
         # CWD pattern (last resort)
         re.compile(r"(?:^|\s)CWD:\s*(/\S+)"),
     ]
+
+    def path_from_text(text: str) -> pathlib.Path | None:
+        matches: list[tuple[int, int, str]] = []
+        for priority, pat in enumerate(patterns):
+            for match in pat.finditer(text):
+                matches.append((match.start(1), -priority, match.group(1)))
+        # In Claude Code prompts the live environment block is appended after
+        # older summaries, so the later path is the safest source of truth.
+        for _pos, _priority, raw_path in sorted(matches, reverse=True):
+            cleaned = raw_path.strip().rstrip("\"'.,;:")
+            candidate = pathlib.Path(cleaned).expanduser().resolve()
+            if candidate.is_dir():
+                return candidate
+        return None
+
+    for raw in candidates:
+        try:
+            candidate = pathlib.Path(raw).expanduser().resolve()
+            if candidate.is_dir():
+                return candidate
+        except (OSError, ValueError):
+            pass
+        path = path_from_text(raw)
+        if path is not None:
+            return path
+
     for msg in messages:
         if not isinstance(msg, dict):
             continue
         content = msg.get("content")
-        texts = []
         if isinstance(content, str):
-            texts.append(content)
+            message_texts.append(content)
         elif isinstance(content, list):
             for item in content:
                 if isinstance(item, dict) and item.get("type") == "text":
-                    texts.append(str(item.get("text") or ""))
-        for text in texts:
-            for pat in patterns:
-                match = pat.search(text)
-                if match:
-                    raw_path = match.group(1).rstrip("\"'.,;:")
-                    candidate = pathlib.Path(raw_path).expanduser().resolve()
-                    if candidate.is_dir():
-                        return candidate
+                    message_texts.append(str(item.get("text") or ""))
+
+    # Claude Code appends the live environment later in the prompt.  Previous
+    # compacted summaries can contain stale Worktree values from another repo,
+    # so scan user messages from newest text block to oldest and within each
+    # block prefer the last match.
+    for text in reversed(message_texts):
+        path = path_from_text(text)
+        if path is not None:
+            return path
     return None
 
 
@@ -390,16 +487,11 @@ def _request_workspace_root(body: Json) -> pathlib.Path:
 def _workspace_scope(root: pathlib.Path):
     """Context manager that temporarily changes the workspace root."""
     from . import gateway_builtin_tools as _bt
-    old_root = getattr(_bt, '_WORKSPACE_ROOT_OVERRIDE', None)
-    _bt._WORKSPACE_ROOT_OVERRIDE = root
+    token = _bt._WORKSPACE_ROOT_OVERRIDE.set(pathlib.Path(root).resolve())
     try:
         yield root
     finally:
-        if old_root is None:
-            if hasattr(_bt, '_WORKSPACE_ROOT_OVERRIDE'):
-                delattr(_bt, '_WORKSPACE_ROOT_OVERRIDE')
-        else:
-            _bt._WORKSPACE_ROOT_OVERRIDE = old_root
+        _bt._WORKSPACE_ROOT_OVERRIDE.reset(token)
 
 def _normalize_tool_name(name: str) -> str:
     """Normalize tool name to match builtin registry."""
@@ -768,29 +860,26 @@ def _detect_intent_tool_calls(path: str, response: Json, body: Json) -> list[Too
     if not gateway_cfg.get("intent_detection_enabled", True):
         return []
 
-    # Only enable for weak upstream models that can't generate tool calls
+    # Only enable for weak upstream models that can't generate tool calls.
+    # Capabilities are stored under upstream.capabilities in the modern config;
+    # keep the legacy top-level fallback for older local config files.
     upstream_cfg = _upstream_config()
-    if upstream_cfg.get("supports_tools", True):
+    capabilities = upstream_cfg.get("capabilities") if isinstance(upstream_cfg.get("capabilities"), dict) else {}
+    native_capable = (
+        bool(capabilities.get("supports_tools", upstream_cfg.get("supports_tools", True)))
+        and bool(capabilities.get("supports_function_calls", upstream_cfg.get("supports_function_calls", True)))
+    )
+    tools_enabled = str(upstream_cfg.get("tools_enabled", "auto") or "auto").strip().lower()
+    if native_capable and tools_enabled not in {"off", "disabled", "false", "0", "none", "text_only", "adapter"}:
         return []  # Native tools supported, no need for intent detection
 
     text = _response_text(path, response)
     if not text or len(text) < 20:
         return []
 
-    # Extract the last user message to understand context
-    messages = body.get("messages") or []
-    last_user_text = ""
-    for msg in reversed(messages):
-        if isinstance(msg, dict) and msg.get("role") == "user":
-            content = msg.get("content")
-            if isinstance(content, str):
-                last_user_text = content[:2000]
-            elif isinstance(content, list):
-                for item in content:
-                    if isinstance(item, dict) and item.get("type") == "text":
-                        last_user_text = str(item.get("text") or "")[:2000]
-                        break
-            break
+    # Extract the last user message/input to understand context.  This supports
+    # both Claude Code Anthropic Messages and Codex Responses payloads.
+    last_user_text = _last_user_text(path, body)[:2000]
 
     calls: list[ToolCall] = []
     text_lower = text.lower()
@@ -1098,6 +1187,102 @@ def _direct_local_file_read_response(path: str, body: Json) -> Json | None:
         if value and re.search(r"[A-Za-z0-9\u4e00-\u9fff]", value):
             return _fallback_response(path, value, status_note="gateway_local_file_read")
     return None
+
+
+def _extract_explicit_skill_request(text: str) -> tuple[str, str]:
+    """Return (action, skill_name) for explicit local Skill requests.
+
+    This covers Claude Code/Codex prompts such as "list skills" or
+    "read skill tdd" when the active upstream cannot reliably emit a structured
+    Skill tool call.  The actual work still goes through the real Gateway Skill
+    executor, so this is a deterministic local runtime shortcut, not a fake
+    protocol-level tool result.
+    """
+    if not text:
+        return "", ""
+    lowered = text.lower()
+    if not any(token in lowered for token in ("skill", "skills", "技能")):
+        return "", ""
+    if any(token in lowered for token in ("list skills", "show skills", "available skills", "列出", "有哪些", "技能列表", "所有技能", "可用技能")):
+        return "list", ""
+    read_patterns = (
+        r"(?:read|show|open|view)\s+(?:the\s+)?skill\s+[`'\"“”]?([A-Za-z0-9_.-]+)",
+        r"skill\s+[`'\"“”]?([A-Za-z0-9_.-]+)[`'\"“”]?\s*(?:内容|说明|指南|怎么用|是什么)",
+        r"(?:读取|查看|打开|展示)\s*(?:skill|技能)\s*[`'\"“”]?([A-Za-z0-9_.-]+)",
+    )
+    for pattern in read_patterns:
+        match = re.search(pattern, text, flags=re.I)
+        if match:
+            name = match.group(1).strip().strip("`'\"“”.,;:，。；：")
+            if name:
+                return "read", name
+    return "", ""
+
+
+def _direct_local_skill_response(path: str, body: Json) -> Json | None:
+    """Satisfy explicit local Skill list/read prompts for weak upstreams."""
+    action, name = _extract_explicit_skill_request(_last_user_text(path, body))
+    if not action:
+        return None
+    arguments = {"name": name} if action == "read" else {}
+    result = _execute_tool_call(ToolCall(f"direct_skill_{uuid.uuid4().hex}", "Skill", arguments, {}), provider="direct_intent")
+    if not result.success:
+        return _fallback_response(path, result.content, status_note=f"gateway_local_skill_{result.failure_type or 'error'}")
+    return _fallback_response(path, result.content, status_note=f"gateway_local_skill_{action}")
+
+
+def _extract_explicit_shell_command_request(text: str) -> str:
+    """Return a command only when the user explicitly asks Gateway to run one."""
+    if not text:
+        return ""
+    lowered = text.lower()
+    if not any(token in lowered for token in ("bash", "shell", "command", "run", "execute", "terminal", "命令", "运行", "执行")):
+        return ""
+    patterns = (
+        r"(?:bash|shell|command|run|execute|terminal)[^`'\"]{0,120}`([^`\n]+)`",
+        r"`([^`\n]+)`[^`]{0,120}(?:bash|shell|command|run|execute|terminal)",
+        r"(?:命令|运行|执行)[^`'\"“”]{0,120}[`'\"“”]([^`'\"“”\n]+)[`'\"“”]",
+        r"[`'\"“”]([^`'\"“”\n]+)[`'\"“”][^`'\"“”]{0,120}(?:命令|运行|执行)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.I | re.S)
+        if match:
+            command = match.group(1).strip()
+            if command:
+                return command
+    return ""
+
+
+def _stdout_from_shell_tool_content(content: str) -> str:
+    marker = "stdout:\n"
+    if marker not in content:
+        return ""
+    stdout = content.split(marker, 1)[1]
+    if "\nstderr:\n" in stdout:
+        stdout = stdout.split("\nstderr:\n", 1)[0]
+    return stdout.strip()
+
+
+def _direct_local_bash_response(path: str, body: Json) -> Json | None:
+    """Satisfy narrow explicit Bash/shell prompts locally for weak upstreams.
+
+    This is not fake tool support: it only runs through the same permission-
+    gated ``Bash`` runtime used by direct tool calls and text tool orchestration.
+    It protects Claude Code/Codex adapter mode when a no-native-tools upstream
+    merely says "I will run the command" instead of emitting adapter tags.
+    """
+    user_text = _last_user_text(path, body)
+    command = _extract_explicit_shell_command_request(user_text)
+    if not command:
+        return None
+    result = _execute_tool_call(ToolCall(f"direct_bash_{uuid.uuid4().hex}", "Bash", {"command": command}, {}), provider="direct_intent")
+    if not result.success:
+        return _fallback_response(path, result.content, status_note=f"gateway_local_bash_{result.failure_type or 'error'}")
+    lowered = user_text.lower()
+    stdout = _stdout_from_shell_tool_content(result.content)
+    if stdout and any(token in lowered for token in ("stdout", "output only", "reply only", "answer only", "只输出", "仅输出")):
+        return _fallback_response(path, stdout, status_note="gateway_local_bash")
+    return _fallback_response(path, result.content, status_note="gateway_local_bash")
 
 
 def _weak_upstream_text_tools_active(gateway_mode: str) -> bool:
@@ -1461,9 +1646,14 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
     mode = str(os.environ.get("GATEWAY_TOOL_MODE") or gateway_cfg.get("tool_mode") or "orchestrate").lower()
     memory_body = _inject_recalled_memories(path, body)
     direct_file_response = _direct_local_file_read_response(path, memory_body) if _weak_upstream_text_tools_active(mode) else None
-    if direct_file_response is not None:
-        _remember_conversation_turn(path, body, direct_file_response)
-        return direct_file_response
+    direct_response = direct_file_response
+    if direct_response is None and _weak_upstream_text_tools_active(mode):
+        direct_response = _direct_local_skill_response(path, memory_body)
+    if direct_response is None and _weak_upstream_text_tools_active(mode):
+        direct_response = _direct_local_bash_response(path, memory_body)
+    if direct_response is not None:
+        _remember_conversation_turn(path, body, direct_response)
+        return direct_response
     upstream = client or NativeProxyClient()
     from .gateway_config import _upstream_protocol
     upstream_protocol = _upstream_protocol()

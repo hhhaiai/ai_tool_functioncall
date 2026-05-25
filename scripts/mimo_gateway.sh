@@ -3,7 +3,8 @@ set -euo pipefail
 
 # Local Gateway service for Claude Code / Codex / OpenCode.
 # Upstream credentials are read from env or the ignored local .gateway_service.json.
-# Your claude_m1 can point ANTHROPIC_BASE_URL to http://127.0.0.1:8885.
+# Claude Code should point ANTHROPIC_BASE_URL to http://127.0.0.1:8885/anthropic.
+# Codex should point its OpenAI-compatible provider base_url to http://127.0.0.1:8885/v1.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ACTION="${1:-start}"
@@ -46,19 +47,21 @@ KILL_PORT_OWNER="${GATEWAY_KILL_PORT_OWNER:-1}"
 
 export GATEWAY_CONFIG_PATH="$CONFIG_PATH"
 export GATEWAY_SQLITE_LOG_PATH="${GATEWAY_SQLITE_LOG_PATH:-$ROOT_DIR/gateway_log.sqlite3}"
+# Real/test upstream URLs must be supplied by env or the ignored local
+# .gateway_service.json; never bake a live address into the tracked script.
 export UPSTREAM_BASE_URL="${UPSTREAM_BASE_URL:-}"
 export UPSTREAM_API_KEY="${UPSTREAM_API_KEY:-}"
 export UPSTREAM_MODEL="${UPSTREAM_MODEL:-mimo-v2.5-pro}"
 export DOWNSTREAM_API_KEY
 export GATEWAY_WORKSPACE_ROOT="${GATEWAY_WORKSPACE_ROOT:-$PWD}"
 export GATEWAY_TOOL_MODE="${GATEWAY_TOOL_MODE:-orchestrate}"
-export GATEWAY_TOOLS_ENABLED="${GATEWAY_TOOLS_ENABLED:-off}"
+export GATEWAY_TOOLS_ENABLED="${GATEWAY_TOOLS_ENABLED:-adapter}"
 export GATEWAY_ALLOW_WRITE_TOOLS="${GATEWAY_ALLOW_WRITE_TOOLS:-1}"
 export GATEWAY_ALLOW_SHELL_TOOLS="${GATEWAY_ALLOW_SHELL_TOOLS:-1}"
 export GATEWAY_CONTEXT_ENABLED="${GATEWAY_CONTEXT_ENABLED:-1}"
 export GATEWAY_CONTEXT_FANOUT_ENABLED="${GATEWAY_CONTEXT_FANOUT_ENABLED:-1}"
-export GATEWAY_CONTEXT_MAX_INPUT_TOKENS="${GATEWAY_CONTEXT_MAX_INPUT_TOKENS:-8000}"
-export GATEWAY_CONTEXT_FANOUT_CHUNK_TOKENS="${GATEWAY_CONTEXT_FANOUT_CHUNK_TOKENS:-6000}"
+export GATEWAY_CONTEXT_MAX_INPUT_TOKENS="${GATEWAY_CONTEXT_MAX_INPUT_TOKENS:-1048576}"
+export GATEWAY_CONTEXT_FANOUT_CHUNK_TOKENS="${GATEWAY_CONTEXT_FANOUT_CHUNK_TOKENS:-120000}"
 export GATEWAY_CONTEXT_FANOUT_MAX_CHUNKS="${GATEWAY_CONTEXT_FANOUT_MAX_CHUNKS:-0}"
 export GATEWAY_CONTEXT_FANOUT_MAX_WORKERS="${GATEWAY_CONTEXT_FANOUT_MAX_WORKERS:-4}"
 export GATEWAY_MEMORY_ENABLED="${GATEWAY_MEMORY_ENABLED:-1}"
@@ -67,6 +70,12 @@ export GATEWAY_REQUEST_LOGGING="${GATEWAY_REQUEST_LOGGING:-1}"
 export GATEWAY_MAX_CONCURRENT_REQUESTS="${GATEWAY_MAX_CONCURRENT_REQUESTS:-32}"
 export UPSTREAM_MAX_CONCURRENCY="${UPSTREAM_MAX_CONCURRENCY:-32}"
 export UPSTREAM_TIMEOUT="${UPSTREAM_TIMEOUT:-60}"
+export UPSTREAM_MAX_INPUT_TOKENS="${UPSTREAM_MAX_INPUT_TOKENS:-1048576}"
+export UPSTREAM_MAX_OUTPUT_TOKENS="${UPSTREAM_MAX_OUTPUT_TOKENS:-131072}"
+export GATEWAY_CLIENT_CONTEXT_WINDOW="${GATEWAY_CLIENT_CONTEXT_WINDOW:-1048576}"
+export GATEWAY_CLIENT_AUTO_COMPACT_TOKEN_LIMIT="${GATEWAY_CLIENT_AUTO_COMPACT_TOKEN_LIMIT:-943718}"
+export GATEWAY_CLIENT_OUTPUT_TOKEN_LIMIT="${GATEWAY_CLIENT_OUTPUT_TOKEN_LIMIT:-131072}"
+export GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT="${GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT:-48000}"
 export GATEWAY_PUBLIC_BASE_URL="$PUBLIC_BASE_URL"
 export GATEWAY_DOWNSTREAM_MODEL_ALIAS="${GATEWAY_DOWNSTREAM_MODEL_ALIAS:-$UPSTREAM_MODEL}"
 export GATEWAY_REVIEW_MODEL_ALIAS="${GATEWAY_REVIEW_MODEL_ALIAS:-$UPSTREAM_MODEL}"
@@ -141,9 +150,11 @@ cfg['upstream'].update({
     'api_key': os.environ.get('UPSTREAM_API_KEY', ''),
     'model': os.environ.get('UPSTREAM_MODEL', 'mimo-v2.5-pro'),
     'protocol': os.environ.get('GATEWAY_UPSTREAM_PROTOCOL') or os.environ.get('UPSTREAM_PROTOCOL', 'openai_chat'),
-    'tools_enabled': os.environ.get('GATEWAY_TOOLS_ENABLED', 'off'),
+    'tools_enabled': os.environ.get('GATEWAY_TOOLS_ENABLED', 'adapter'),
     'native_tools_verified': False,
     'use_for_coding': True,
+    'max_input_tokens': int(os.environ.get('UPSTREAM_MAX_INPUT_TOKENS', '1048576')),
+    'max_output_tokens': int(os.environ.get('UPSTREAM_MAX_OUTPUT_TOKENS', '131072')),
     'capabilities': {
         'supports_streaming': os.environ.get('UPSTREAM_SUPPORTS_STREAMING', '1').lower() in {'1','true','yes'},
         'supports_tools': os.environ.get('UPSTREAM_SUPPORTS_TOOLS', '0').lower() in {'1','true','yes'},
@@ -179,6 +190,12 @@ cfg.setdefault('gateway', {})['client_snippet_api_key'] = key
 cfg['gateway']['allow_write_tools'] = os.environ.get('GATEWAY_ALLOW_WRITE_TOOLS', '1').lower() in {'1','true','yes'}
 cfg['gateway']['allow_shell_tools'] = os.environ.get('GATEWAY_ALLOW_SHELL_TOOLS', '1').lower() in {'1','true','yes'}
 cfg['gateway']['workspace_root'] = os.environ.get('GATEWAY_WORKSPACE_ROOT', str(root))
+cfg['gateway']['client_context_window'] = int(os.environ.get('GATEWAY_CLIENT_CONTEXT_WINDOW', '1048576'))
+cfg['gateway']['client_auto_compact_token_limit'] = int(os.environ.get('GATEWAY_CLIENT_AUTO_COMPACT_TOKEN_LIMIT', '943718'))
+cfg['gateway']['client_output_token_limit'] = int(os.environ.get('GATEWAY_CLIENT_OUTPUT_TOKEN_LIMIT', '131072'))
+cfg['gateway']['text_tool_adapter_compact_token_limit'] = int(os.environ.get('GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT', '48000'))
+cfg.setdefault('context', {})['max_input_tokens'] = int(os.environ.get('GATEWAY_CONTEXT_MAX_INPUT_TOKENS', '1048576'))
+cfg.setdefault('context', {})['fanout_chunk_tokens'] = int(os.environ.get('GATEWAY_CONTEXT_FANOUT_CHUNK_TOKENS', '120000'))
 cfg['gateway']['sqlite_log_path'] = os.environ.get('GATEWAY_SQLITE_LOG_PATH', str(root / 'gateway_log.sqlite3'))
 config_path.write_text(json.dumps(gateway._sync_active_upstream(cfg), ensure_ascii=False, indent=2), encoding='utf-8')
 print(f'wrote gateway config: {config_path}', flush=True)
@@ -204,6 +221,8 @@ write_launchd_plist() {
     <key>UPSTREAM_BASE_URL</key><string>${UPSTREAM_BASE_URL}</string>
     <key>UPSTREAM_API_KEY</key><string>${UPSTREAM_API_KEY}</string>
     <key>UPSTREAM_MODEL</key><string>${UPSTREAM_MODEL}</string>
+    <key>UPSTREAM_MAX_INPUT_TOKENS</key><string>${UPSTREAM_MAX_INPUT_TOKENS}</string>
+    <key>UPSTREAM_MAX_OUTPUT_TOKENS</key><string>${UPSTREAM_MAX_OUTPUT_TOKENS}</string>
     <key>DOWNSTREAM_API_KEY</key><string>${DOWNSTREAM_API_KEY}</string>
     <key>GATEWAY_WORKSPACE_ROOT</key><string>${GATEWAY_WORKSPACE_ROOT}</string>
     <key>GATEWAY_TOOL_MODE</key><string>${GATEWAY_TOOL_MODE}</string>
@@ -212,6 +231,12 @@ write_launchd_plist() {
     <key>GATEWAY_ALLOW_SHELL_TOOLS</key><string>${GATEWAY_ALLOW_SHELL_TOOLS}</string>
     <key>GATEWAY_CONTEXT_ENABLED</key><string>${GATEWAY_CONTEXT_ENABLED}</string>
     <key>GATEWAY_CONTEXT_FANOUT_ENABLED</key><string>${GATEWAY_CONTEXT_FANOUT_ENABLED}</string>
+    <key>GATEWAY_CONTEXT_MAX_INPUT_TOKENS</key><string>${GATEWAY_CONTEXT_MAX_INPUT_TOKENS}</string>
+    <key>GATEWAY_CONTEXT_FANOUT_CHUNK_TOKENS</key><string>${GATEWAY_CONTEXT_FANOUT_CHUNK_TOKENS}</string>
+    <key>GATEWAY_CLIENT_CONTEXT_WINDOW</key><string>${GATEWAY_CLIENT_CONTEXT_WINDOW}</string>
+    <key>GATEWAY_CLIENT_AUTO_COMPACT_TOKEN_LIMIT</key><string>${GATEWAY_CLIENT_AUTO_COMPACT_TOKEN_LIMIT}</string>
+    <key>GATEWAY_CLIENT_OUTPUT_TOKEN_LIMIT</key><string>${GATEWAY_CLIENT_OUTPUT_TOKEN_LIMIT}</string>
+    <key>GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT</key><string>${GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT}</string>
     <key>GATEWAY_MEMORY_ENABLED</key><string>${GATEWAY_MEMORY_ENABLED}</string>
     <key>GATEWAY_LOGGING_BACKEND</key><string>${GATEWAY_LOGGING_BACKEND}</string>
   </dict>
@@ -333,16 +358,31 @@ status_service() {
 }
 
 verify_all() {
-  echo "== 1/4 compile + unit tests =="
+  echo "== 1/5 compile + unit tests =="
   python3 -m py_compile "$ROOT_DIR/src/toolcall_gateway.py" "$ROOT_DIR/src/gateway_app.py" "$ROOT_DIR/src/gateway_builtin_tools.py" "$ROOT_DIR/tests/test_gateway.py" "$ROOT_DIR/tests/integration/"*.py
   local test_dir
   test_dir="$(mktemp -d)"
   env \
     -u UPSTREAM_BASE_URL -u UPSTREAM_API_KEY -u UPSTREAM_MODEL \
-    -u DOWNSTREAM_API_KEY -u GATEWAY_TOOLS_ENABLED -u GATEWAY_TOOL_MODE \
+    -u UPSTREAM_MAX_CONCURRENCY -u UPSTREAM_TIMEOUT \
+    -u UPSTREAM_MAX_INPUT_TOKENS -u UPSTREAM_MAX_OUTPUT_TOKENS \
+    -u DOWNSTREAM_API_KEY -u GATEWAY_DOWNSTREAM_KEY \
+    -u GATEWAY_TOOLS_ENABLED -u GATEWAY_TOOL_MODE \
     -u GATEWAY_ALLOW_WRITE_TOOLS -u GATEWAY_ALLOW_SHELL_TOOLS \
     -u GATEWAY_CONTEXT_ENABLED -u GATEWAY_CONTEXT_FANOUT_ENABLED \
+    -u GATEWAY_CONTEXT_MAX_INPUT_TOKENS -u GATEWAY_CONTEXT_FANOUT_CHUNK_TOKENS \
+    -u GATEWAY_CONTEXT_FANOUT_MAX_CHUNKS -u GATEWAY_CONTEXT_FANOUT_MAX_WORKERS \
     -u GATEWAY_UPSTREAM_STREAM_AGGREGATE -u GATEWAY_MEMORY_ENABLED \
+    -u GATEWAY_LOGGING_BACKEND -u GATEWAY_REQUEST_LOGGING \
+    -u GATEWAY_MAX_CONCURRENT_REQUESTS -u GATEWAY_WORKSPACE_ROOT \
+    -u GATEWAY_SKILLS_DIRS -u GATEWAY_PUBLIC_BASE_URL \
+    -u GATEWAY_DOWNSTREAM_MODEL_ALIAS -u GATEWAY_REVIEW_MODEL_ALIAS \
+    -u GATEWAY_ADMIN_PASSWORD -u GATEWAY_ADMIN_PASSWORD_HASH \
+    -u GATEWAY_CLIENT_CONTEXT_WINDOW -u GATEWAY_CLIENT_AUTO_COMPACT_TOKEN_LIMIT \
+    -u GATEWAY_CLIENT_OUTPUT_TOKEN_LIMIT -u GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT \
+    -u GATEWAY_MAX_REQUEST_BODY_BYTES -u GATEWAY_MAX_LOG_PAYLOAD_CHARS \
+    -u GATEWAY_MAX_TOOL_ROUNDS -u GATEWAY_TOOL_MAX_RETRIES \
+    -u GATEWAY_READ_DEFAULT_LIMIT -u GATEWAY_ALLOW_FILE_LOGGING \
     PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
     GATEWAY_CONFIG_PATH="$test_dir/config.json" \
     GATEWAY_SQLITE_LOG_PATH="$test_dir/gateway.sqlite3" \
@@ -366,12 +406,18 @@ except Exception:
     fallback()
 PY
 )"
-  echo "== 2/4 CORE TOOL ACCEPTANCE =="
+  echo "== 2/5 CORE TOOL ACCEPTANCE =="
   "$ROOT_DIR/tests/integration/tool_acceptance.py" --base-url "http://127.0.0.1:${PORT}" --key "$effective_key"
-  echo "== 3/4 security/auth guardrails =="
+  echo "== 3/5 security/auth guardrails =="
   "$ROOT_DIR/tests/integration/security_gateway_checks.py" --base-url "http://127.0.0.1:${PORT}" --key "$effective_key"
-  echo "== 4/4 concurrency/performance smoke =="
+  echo "== 4/5 concurrency/performance smoke =="
   "$ROOT_DIR/tests/integration/stress_gateway_concurrency.py" --base-url "http://127.0.0.1:${PORT}" --key "$effective_key" --workers "${GATEWAY_VERIFY_WORKERS:-16}" --direct-tool-requests "${GATEWAY_VERIFY_DIRECT_REQUESTS:-32}" --model-requests "${GATEWAY_VERIFY_MODEL_REQUESTS:-1}"
+  echo "== 5/5 Claude/Codex project-scope smoke =="
+  local cli_args=()
+  if [[ "${GATEWAY_VERIFY_REQUIRE_CLI:-0}" == "1" || "${GATEWAY_VERIFY_REQUIRE_CLI:-0}" == "true" || "${GATEWAY_VERIFY_REQUIRE_CLI:-0}" == "yes" ]]; then
+    cli_args+=(--require-claude --require-codex)
+  fi
+  "$ROOT_DIR/tests/integration/project_scope_cli_smoke.py" "${cli_args[@]}"
 }
 
 case "$ACTION" in

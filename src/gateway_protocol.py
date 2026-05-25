@@ -368,6 +368,31 @@ def _from_openai_chat_response(path: str, response: Json) -> Json:
 
 
 def _last_user_text(path: str, body: Json) -> str:
+    if "/responses" in path and "input" in body:
+        raw_input = body.get("input")
+        if isinstance(raw_input, str):
+            return raw_input.strip()
+        if isinstance(raw_input, list):
+            for item in reversed(raw_input):
+                if isinstance(item, str):
+                    text = item.strip()
+                    if text:
+                        return text
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                role = item.get("role")
+                item_type = item.get("type")
+                if role and role != "user":
+                    continue
+                if item_type in {"function_call_output", "custom_tool_call_output"}:
+                    continue
+                content = item.get("content")
+                if content is None:
+                    content = item.get("input") or item.get("text")
+                text = _text_from_content(content).strip()
+                if text and not text.startswith("<system-reminder>"):
+                    return text
     messages = body.get("messages") or []
     for msg in reversed(messages):
         if isinstance(msg, dict) and msg.get("role") == "user":
@@ -688,8 +713,93 @@ def _from_openai_chat_to_responses_response(response: Json) -> Json:
 # Unified conversion entry points
 # =============================================================================
 
+_GATEWAY_INTERNAL_REQUEST_FIELDS = {
+    "workspace_root",
+    "gateway_workspace",
+    "project_dir",
+    "projectDir",
+    "cwd",
+    "working_directory",
+    "primary_working_directory",
+    "worktree",
+}
+
+
+def _strip_gateway_internal_mapping_fields(value: Json) -> Json:
+    sanitized = copy.deepcopy(value)
+    for key in _GATEWAY_INTERNAL_REQUEST_FIELDS:
+        sanitized.pop(key, None)
+    for nested_key in ("user_id",):
+        nested = sanitized.get(nested_key)
+        if isinstance(nested, dict):
+            nested_sanitized = _strip_gateway_internal_mapping_fields(nested)
+            if nested_sanitized:
+                sanitized[nested_key] = nested_sanitized
+            else:
+                sanitized.pop(nested_key, None)
+        elif isinstance(nested, str):
+            try:
+                parsed = json.loads(nested)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                nested_sanitized = _strip_gateway_internal_mapping_fields(parsed)
+                if nested_sanitized:
+                    sanitized[nested_key] = json.dumps(nested_sanitized, ensure_ascii=False)
+                else:
+                    sanitized.pop(nested_key, None)
+    return sanitized
+
+
+def _metadata_string_contains_internal_routing(value: str) -> bool:
+    lowered = value.lower()
+    return any(
+        token in lowered
+        for token in (
+            "workspace_root",
+            "gateway_workspace",
+            "projectdir",
+            "project_dir",
+            "working_directory",
+            "primary working directory",
+            "primary_working_directory",
+            "worktree",
+            "cwd",
+        )
+    )
+
+
+def _strip_gateway_internal_request_fields(body: Json) -> Json:
+    """Remove Gateway-only routing fields before forwarding to an upstream LLM."""
+    sanitized = copy.deepcopy(body)
+    for key in _GATEWAY_INTERNAL_REQUEST_FIELDS:
+        sanitized.pop(key, None)
+    metadata = sanitized.get("metadata")
+    if isinstance(metadata, dict):
+        sanitized_metadata = _strip_gateway_internal_mapping_fields(metadata)
+        if sanitized_metadata:
+            sanitized["metadata"] = sanitized_metadata
+        else:
+            sanitized.pop("metadata", None)
+    elif isinstance(metadata, str):
+        try:
+            parsed_metadata = json.loads(metadata)
+        except json.JSONDecodeError:
+            parsed_metadata = None
+        if isinstance(parsed_metadata, dict):
+            sanitized_metadata = _strip_gateway_internal_mapping_fields(parsed_metadata)
+            if sanitized_metadata:
+                sanitized["metadata"] = sanitized_metadata
+            else:
+                sanitized.pop("metadata", None)
+        elif _metadata_string_contains_internal_routing(metadata):
+            sanitized.pop("metadata", None)
+    return sanitized
+
+
 def _convert_request_to_upstream(downstream_path: str, body: Json, upstream_protocol: str) -> tuple[str, Json]:
     """Convert downstream request to upstream format. Returns (upstream_path, converted_body)."""
+    body = _strip_gateway_internal_request_fields(body)
     if upstream_protocol == "anthropic_messages":
         if "/messages" in downstream_path:
             return "/v1/messages", body

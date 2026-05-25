@@ -27,12 +27,12 @@ except Exception:
 PY
 }
 
-BASE_URL="${ANTHROPIC_BASE_URL:-http://127.0.0.1:${PORT}}"
+BASE_URL="${ANTHROPIC_BASE_URL:-http://127.0.0.1:${PORT}/anthropic}"
 CONFIG_API_KEY="$(config_value gateway.client_snippet_api_key local-gateway-key)"
 CONFIG_MODEL="$(config_value upstream.model mimo-v2.5-pro)"
 API_KEY="${ANTHROPIC_AUTH_TOKEN:-${DOWNSTREAM_API_KEY:-$CONFIG_API_KEY}}"
 MODEL="${ANTHROPIC_MODEL:-${UPSTREAM_MODEL:-$CONFIG_MODEL}}"
-CLAUDE_BIN="${CLAUDE_BIN:-/usr/local/bin/claude}"
+CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude 2>/dev/null || true)}"
 
 wait_health() {
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do

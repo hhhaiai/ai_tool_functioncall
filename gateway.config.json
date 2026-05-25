@@ -6,12 +6,12 @@
   "upstream": {
     "base_url": "",
     "api_key": "",
-    "model": "",
+    "model": "mimo-v2.5-pro",
     "protocol": "openai_chat",
-    "tools_enabled": "auto",
+    "tools_enabled": "adapter",
     "timeout_seconds": 60,
-    "max_input_tokens": 128000,
-    "max_output_tokens": 8192,
+    "max_input_tokens": 1048576,
+    "max_output_tokens": 131072,
     "max_concurrency": 32,
     "paths": {
       "models": "/v1/models",
@@ -21,9 +21,9 @@
     },
     "capabilities": {
       "supports_streaming": true,
-      "supports_tools": true,
-      "supports_function_calls": true,
-      "supports_parallel_tool_calls": true,
+      "supports_tools": false,
+      "supports_function_calls": false,
+      "supports_parallel_tool_calls": false,
       "supports_vision": false,
       "supports_network": false,
       "supports_json_schema": true
@@ -50,17 +50,18 @@
     "client_snippet_api_key": "",
     "downstream_model_alias": "",
     "review_model_alias": "",
-    "client_context_window": 1000000,
-    "client_auto_compact_token_limit": 900000,
-    "client_output_token_limit": 128000
+    "client_context_window": 1048576,
+    "client_auto_compact_token_limit": 943718,
+    "client_output_token_limit": 131072,
+    "text_tool_adapter_compact_token_limit": 48000
   },
   "context": {
     "enabled": true,
-    "max_input_tokens": 24000,
+    "max_input_tokens": 1048576,
     "keep_recent_messages": 12,
     "summary_max_chars": 6000,
     "fanout_enabled": true,
-    "fanout_chunk_tokens": 12000,
+    "fanout_chunk_tokens": 120000,
     "fanout_max_chunks": 0,
     "fanout_max_workers": 4,
     "quality_review_enabled": true,

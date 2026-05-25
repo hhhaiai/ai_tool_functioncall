@@ -70,9 +70,9 @@ vi .gateway_service.json
 ```json
 {
   "upstream": {
-    "base_url": "https://api.openai.com",
+    "base_url": "<YOUR_TEST_UPSTREAM_BASE_URL>",
     "api_key": "<YOUR_UPSTREAM_API_KEY>",
-    "model": "gpt-4o"
+    "model": "mimo-v2.5-pro"
   },
   "gateway": {
     "workspace_root": "./workspace",
@@ -125,14 +125,14 @@ curl http://127.0.0.1:8885/healthz
     "password_hash": ""
   },
   "upstream": {
-    "base_url": "https://api.openai.com",
+    "base_url": "<YOUR_TEST_UPSTREAM_BASE_URL>",
     "api_key": "<YOUR_UPSTREAM_API_KEY>",
-    "model": "gpt-4o",
+    "model": "mimo-v2.5-pro",
     "protocol": "openai_chat",
-    "tools_enabled": "auto",
+    "tools_enabled": "adapter",
     "timeout_seconds": 60,
-    "max_input_tokens": 128000,
-    "max_output_tokens": 8192,
+    "max_input_tokens": 1048576,
+    "max_output_tokens": 131072,
     "max_concurrency": 32,
     "paths": {
       "models": "/v1/models",
@@ -142,9 +142,9 @@ curl http://127.0.0.1:8885/healthz
     },
     "capabilities": {
       "supports_streaming": true,
-      "supports_tools": true,
-      "supports_function_calls": true,
-      "supports_parallel_tool_calls": true,
+      "supports_tools": false,
+      "supports_function_calls": false,
+      "supports_parallel_tool_calls": false,
       "supports_vision": false,
       "supports_network": false,
       "supports_web_search": false,
@@ -164,13 +164,18 @@ curl http://127.0.0.1:8885/healthz
     "public_base_url": "http://127.0.0.1:8885",
     "client_snippet_api_key": "your-gateway-key",
     "downstream_model_alias": "",
+    "client_context_window": 1048576,
+    "client_auto_compact_token_limit": 943718,
+    "client_output_token_limit": 131072,
+    "text_tool_adapter_compact_token_limit": 48000,
     "local_planner_enabled": true,
     "local_planner_max_files": 24
   },
   "context": {
     "enabled": true,
-    "max_input_tokens": 24000,
+    "max_input_tokens": 1048576,
     "fanout_enabled": true,
+    "fanout_chunk_tokens": 120000,
     "memory_enabled": true
   },
   "downstream_keys": [],
@@ -190,21 +195,23 @@ curl http://127.0.0.1:8885/healthz
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
 | `admin.password` | admin | 管理员密码；加载/保存时会归一化为 `password_hash`，生产环境必须改为强密码或使用 `GATEWAY_ADMIN_PASSWORD` |
-| `upstream.base_url` | - | 上游 LLM API 地址 |
+| `upstream.base_url` | 空（模板）/ 本地配置 | 上游 LLM API 地址；真实测试地址只放 `.gateway_service.json`、`.env` 或运行时环境变量，不提交；当前 Mimo 类上游支持 chat/responses/messages，但无 `/anthropic` 别名和 direct tools endpoint |
 | `upstream.api_key` | - | 上游 API Key |
-| `upstream.model` | - | 默认模型名称 |
+| `upstream.model` | `mimo-v2.5-pro`（模板） | 默认模型名称 |
 | `upstream.protocol` | openai_chat | 上游协议类型 |
-| `upstream.tools_enabled` | auto | 工具模式：`auto` 按能力自动选择；`native` 发送原生 tools；`native_only` 能力不足即失败；`adapter`/`text_only`/`off` 走 Gateway 本地真实工具文本适配 |
+| `upstream.max_input_tokens` / `max_output_tokens` | 1048576 / 131072（Mimo 模板） | 上游上下文/输出预算声明；客户端片段按 1M 同步 |
+| `upstream.tools_enabled` | adapter（Mimo 模板） | 工具模式：`auto` 按能力自动选择；`native` 发送原生 tools；`native_only` 能力不足即失败；`adapter`/`text_only`/`off` 走 Gateway 本地真实工具文本适配 |
 | `upstream.paths.models` | `/v1/models` | Admin UI 模型自动获取和 `/v1/models` 转发使用的上游路径 |
-| `upstream.capabilities.supports_tools` / `supports_function_calls` | true | 上游是否原生支持 tools/function calls；`auto` 模式会据此决定是否发送原生 tools |
+| `upstream.capabilities.supports_tools` / `supports_function_calls` | false（Mimo 模板） | 上游是否原生支持当前客户端所需 tools/function calls；Mimo `/v1/messages` forced probe 可返回 `tool_use`，但 `/v1/responses` function_call 未证实，Claude Code/Codex 默认由 Gateway 本地 runtime 执行 |
 | `upstream.capabilities.supports_vision` | false | 上游是否支持图片/截图/识图输入；在 Admin UI 明确展示和保存 |
 | `upstream.capabilities.supports_network` | false | 上游模型是否具备联网能力；在 Admin UI 明确展示和保存 |
 | `upstream.capabilities.supports_web_search` | false | 上游模型是否支持 web search；在 Admin UI 明确展示和保存 |
-| `gateway.workspace_root` | `./workspace`（模板）/ 当前目录（无配置时） | 工具读写的根目录；请求体显式 root 优先，其次是非默认 `GATEWAY_WORKSPACE_ROOT`，再其次是保存配置，最后才是默认当前目录 |
+| `gateway.workspace_root` | `./workspace`（模板）/ 当前目录（无配置时） | 工具读写的兜底根目录；当前请求的显式 `workspace_root` / `gateway_workspace` 优先，其次自动识别 Claude Code / Codex 下游项目目录，再其次才是非默认 `GATEWAY_WORKSPACE_ROOT`、保存配置和默认当前目录 |
 | `gateway.tool_mode` | orchestrate | 工具模式：`orchestrate` / `native_passthrough` / `proxy`；兼容旧值 `passthrough` |
 | `gateway.allow_write_tools` | false | 是否允许文件写入 |
 | `gateway.allow_shell_tools` | false | 是否允许 Shell 执行 |
 | `gateway.client_snippet_api_key` | - | 客户端连接 Gateway 的 API Key；保存配置时会自动同步为可认证的 downstream key |
+| `gateway.client_context_window` | 1048576 | 下游 Claude Code/Codex 配置片段中的上下文窗口；Mimo 按 1M 配置 |
 | `gateway.max_tool_rounds` | 5 | orchestrate 模式最大工具调用轮数；运行时优先使用 `GATEWAY_MAX_TOOL_ROUNDS` 环境变量，其次使用 Admin/配置文件保存值 |
 | `gateway.max_concurrent_requests` | 32 | Gateway 下游 API 请求并发上限；HTTP 入口会先获取并发槽位，超过上限按 `concurrency_queue_timeout_seconds` 等待后返回 429 |
 | `gateway.concurrency_queue_timeout_seconds` | 5.0 | 并发槽位排队等待时间；超时返回 429 |
@@ -212,8 +219,8 @@ curl http://127.0.0.1:8885/healthz
 | `gateway.max_request_body_bytes` | 67108864 | HTTP POST 请求体读取前上限；超限返回 413，避免大请求先占用内存 |
 | `gateway.max_log_payload_chars` | 200000 | 单个 request/response 日志 payload 与 tool failure 内容截断上限；先遮盖敏感字段再截断 |
 | `gateway.text_tool_adapter_compact_token_limit` | 48000 | 弱上游文本工具适配前的压缩阈值上限；实际阈值动态计算为 `max(8000, min(upstream.max_input_tokens * 0.45, 此值))`；设为 0 可关闭 |
-| `gateway.local_planner_enabled` | true | 对分析/审查请求以及点名 `read/show/cat/open/查看/读取` 文件路径的请求，先用 Gateway 本地真实读文件/目录/符号工具注入证据；弱上游不发 tool call 时也能稳定完成本地文件读取 smoke |
-| `context.max_input_tokens` | 24000 | 超过此值触发上下文压缩 |
+| `gateway.local_planner_enabled` | true | 对分析/审查请求以及点名 `read/show/cat/open/查看/读取` 文件路径的请求，先用 Gateway 本地真实读文件/目录/符号工具注入证据；弱上游不发 tool call 时也能稳定完成本地文件读取 smoke；文件路径按当前下游项目根隔离 |
+| `context.max_input_tokens` | 1048576 | Mimo 1M 上下文阈值；超过此值触发上下文压缩/扇出 |
 
 ### 3.4 环境变量对照表
 
@@ -222,11 +229,15 @@ curl http://127.0.0.1:8885/healthz
 | `UPSTREAM_BASE_URL` | upstream.base_url | 上游 API 地址 |
 | `UPSTREAM_API_KEY` | upstream.api_key | 上游 API Key |
 | `UPSTREAM_MODEL` | upstream.model | 默认模型 |
+| `UPSTREAM_MAX_INPUT_TOKENS` / `UPSTREAM_MAX_OUTPUT_TOKENS` | upstream token limits | Mimo 模板为 `1048576` / `131072` |
+| `GATEWAY_TOOLS_ENABLED` | upstream.tools_enabled | Mimo 跨 Claude Code/Codex 稳定接入时设为 `adapter` |
+| `UPSTREAM_SUPPORTS_TOOLS` / `UPSTREAM_SUPPORTS_FUNCTION_CALLS` | upstream.capabilities | Mimo Messages `tool_use` 仅部分证实；Codex Responses function_call 未证实，默认均设为 `0` |
 | `GATEWAY_UPSTREAM_PROTOCOL` | upstream.protocol | 上游协议类型，优先于 legacy `UPSTREAM_PROTOCOL` |
 | `UPSTREAM_PROTOCOL` | upstream.protocol | 兼容旧环境变量，未设置 `GATEWAY_UPSTREAM_PROTOCOL` 时生效 |
 | `GATEWAY_DOWNSTREAM_KEY` | downstream key + gateway.client_snippet_api_key | 下游 API Key；环境变量会同时用于认证和客户端片段 |
 | `GATEWAY_ADMIN_PASSWORD` | admin.password | 管理员密码 |
-| `GATEWAY_WORKSPACE_ROOT` | gateway.workspace_root | 显式设置为非当前目录时优先于保存配置；启动脚本默认导出的 `$PWD` 只作为兜底，不会压过 UI/配置保存的 workspace_root |
+| `GATEWAY_WORKSPACE_ROOT` | gateway.workspace_root | 显式设置为非当前目录时优先于保存配置，但仍低于请求体 root 和下游客户端项目目录；启动脚本默认导出的 `$PWD` 只作为兜底，不会压过 UI/配置保存的 workspace_root |
+| `GATEWAY_SKILLS_DIRS` | Skill tool search path | 额外 skills 目录，使用 `:` 分隔；加载顺序在当前下游项目 skills、项目内插件 skills、用户全局 skills 之后 |
 | `GATEWAY_PORT` | - | 监听端口（默认 8885） |
 | `GATEWAY_HOST` | - | 监听地址（默认 0.0.0.0） |
 | `GATEWAY_SQLITE_LOG_PATH` | gateway.sqlite_log_path | SQLite 请求/工具/记忆日志路径 |
@@ -234,6 +245,8 @@ curl http://127.0.0.1:8885/healthz
 | `GATEWAY_MAX_REQUEST_BODY_BYTES` | gateway.max_request_body_bytes | POST 请求体读取前字节上限，默认 64MB，超限返回 413 |
 | `GATEWAY_MAX_LOG_PAYLOAD_CHARS` | gateway.max_log_payload_chars | 单个 request/response 日志 payload 与 tool failure 内容字符上限，默认 200000 |
 | `GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT` | gateway.text_tool_adapter_compact_token_limit | 文本工具适配前的压缩阈值上限，默认 48000；实际阈值动态计算；设为 0 可关闭 |
+| `GATEWAY_CONTEXT_MAX_INPUT_TOKENS` | context.max_input_tokens | Mimo 1M 模板为 `1048576` |
+| `GATEWAY_CLIENT_CONTEXT_WINDOW` | gateway.client_context_window | Claude Code/Codex 客户端上下文窗口，Mimo 模板为 `1048576` |
 
 配置文件存在但 JSON 损坏或根节点不是对象时，Gateway 会 fail closed：Admin/API 请求返回结构化 500 `invalid gateway config`，不会静默回退到默认 `admin/admin` 或无下游鉴权。修复方式是恢复有效 `.gateway_service.json`，而不是依赖代码默认值。
 
@@ -324,7 +337,7 @@ curl http://127.0.0.1:8885/v1/chat/completions \
   -H "Authorization: Bearer your-gateway-api-key" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gpt-4o",
+    "model": "mimo-v2.5-pro",
     "messages": [{"role": "user", "content": "Hello"}]
   }'
 
@@ -336,7 +349,7 @@ curl http://127.0.0.1:8885/v1/models \
 ### 5.4 运行测试套件
 
 ```bash
-# 运行全部测试（当前 167 个）
+# 运行全部测试
 python3 -m pytest -q
 
 # 运行集成测试
@@ -366,41 +379,81 @@ curl -fsS -H 'authorization: Bearer smoke-key' -H 'content-type: application/jso
   http://127.0.0.1:8899/v1/tools/call
 ```
 
-本轮稳定性验证还覆盖了 Admin 数字字段错误请求：非法数字应返回 400，缺失字段应保留旧配置，`gateway.max_tool_rounds` 应实际限制非流式/流式工具循环。
+本轮稳定性验证覆盖 Admin 数字字段错误请求：非法数字应返回 400，缺失字段应保留旧配置，`gateway.max_tool_rounds` 应实际限制非流式/流式工具循环。
 
-项目级验证脚本也已通过：
+项目级验证脚本也纳入 `verify`。默认会验证 Gateway 自身的项目根隔离，若本机没有 Claude/Codex CLI 会跳过对应 CLI 子项；设置 `GATEWAY_VERIFY_REQUIRE_CLI=1` 时 Claude Code CLI 与 Codex CLI 也必须通过：
 
 ```bash
-GATEWAY_VERIFY_MODEL_REQUESTS=0 GATEWAY_VERIFY_DIRECT_REQUESTS=24 GATEWAY_VERIFY_WORKERS=8 ./scripts/mimo_gateway.sh verify
-# 167 unittest tests OK
+GATEWAY_VERIFY_MODEL_REQUESTS=0 GATEWAY_VERIFY_DIRECT_REQUESTS=24 GATEWAY_VERIFY_WORKERS=8 GATEWAY_VERIFY_REQUIRE_CLI=1 ./scripts/mimo_gateway.sh verify
+# unittest tests OK
 # tool acceptance OK
 # security/auth guardrails OK
 # 24-request concurrency/performance smoke OK
+# Claude/Codex project-scope smoke OK
 ```
 
-### 5.6 当前 8885 + Claude Code 复验记录
-
-2026-05-24 在本机默认配置上已复验，最终 HTTP artifact 为 `.gateway_runtime/final-smoke-20260524-074454-goal-audit/summary.json`，Claude Code 本地文件 artifact 为 `.gateway_runtime/claude-local-file-probe-20260524-074546-goal-audit.summary.json`：
+也可以单独复跑项目根隔离 smoke：
 
 ```bash
+python3 tests/integration/project_scope_cli_smoke.py --require-claude --require-codex
+# 覆盖 direct Skills、项目插件 skill、/v1/functions/call、相对/绝对 .traces、Memory 项目根隔离、
+# Anthropic streaming/Claude Code Primary working directory、
+# Responses streaming/Codex <environment_context><cwd>，以及真实 Claude/Codex CLI。
+```
+
+如果要本地搭建“真实上游形态”的测试服务，但不想把真实公网测试地址写入代码，可运行内置 mock 上游：
+
+```bash
+python3 scripts/mock_openai_upstream.py --port 9001 --model mimo-v2.5-pro
+UPSTREAM_BASE_URL=http://127.0.0.1:9001 \
+GATEWAY_DOWNSTREAM_KEY=local-test-key \
+GATEWAY_ADMIN_PASSWORD=admin \
 ./scripts/mimo_gateway.sh start
-curl -fsS http://127.0.0.1:8885/healthz
-curl -fsS -u admin:admin http://127.0.0.1:8885/ui >/dev/null
-curl -fsS -u admin:admin http://127.0.0.1:8885/admin/upstream-models.json | python3 -m json.tool
+```
+
+这个 mock 提供 `/v1/models`、`/v1/chat/completions`、`/v1/responses`、`/v1/messages`，并刻意让 `/anthropic/*`、`/v1/tools/call`、`/v1/functions/call` 返回 404，用来复现“Mimo 类弱上游 + Gateway adapter/orchestrate 补齐工具能力”的接入形态。
+
+### 5.6 当前 Mimo 上游 + Gateway adapter 复验记录
+
+2026-05-25 的结论是：真实测试 Mimo OpenAI-compatible 上游可用（地址只在本地 ignored 配置/环境变量中保存）；它支持 `/v1/chat/completions`、`/v1/responses`、`/v1/messages`，并且 `/v1/messages` forced tool_choice 探针可返回 Anthropic `tool_use`。但它没有 `/anthropic` 兼容别名、没有 direct tools/functions runtime endpoint，且 `/v1/responses` forced tool probe 未返回 Codex 需要的 `function_call`。为了同时稳定支持 Claude Code + Codex，不要让客户端直连该上游；应让客户端连接本 Gateway：
+
+```bash
+# Gateway 本地真实工具 runtime 验活；不依赖上游 tool endpoint
 curl -fsS http://127.0.0.1:8885/v1/tools/call \
   -H 'Authorization: Bearer <your-gateway-key>' \
   -H 'Content-Type: application/json' \
   -d '{"tool":"calc","arguments":{"expr":"2+2"}}'
 
-curl -fsS http://127.0.0.1:8885/anthropic/v1/messages \
-  -H 'Authorization: Bearer <your-gateway-key>' \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"mimo-v2.5-pro","messages":[{"role":"user","content":"What is 2+2?"}],"tools":[{"name":"calc","description":"Evaluate math expression","input_schema":{"type":"object","properties":{"expr":{"type":"string"}},"required":["expr"]}}],"max_tokens":100}'
+# Claude Code 走 Gateway /anthropic，不直连 Mimo
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8885/anthropic
+export ANTHROPIC_AUTH_TOKEN=<your-gateway-key>
+
+# Codex 走 Gateway /v1，建议 wire_api=responses
+export OPENAI_BASE_URL=http://127.0.0.1:8885/v1
+export OPENAI_API_KEY=<your-gateway-key>
 ```
 
-结果：健康检查、UI、`/v1/chat/completions`、`/anthropic/v1/messages`、`/v1/responses`、`/v1/tools/call`、`/v1/functions/call`、真实上游 `/v1/models` 拉取均通过；Claude Code `claude_mnative` 本地文件 smoke exit 0 且 stdout 精确为 `2+2=4`，且没有 `too long` / `malformed` / `empty response` 已知失败标记。上游模型可能自带 `<think>` 文本，这是上游输出风格，不是 Gateway 协议错误。并发阀门也已用 HTTP 入口回归验证：占满 `gateway.max_concurrent_requests` 后继续请求会返回结构化 429，而不是绕过 UI 中保存的限制。
+已复验/回归覆盖：
 
-代码回归还覆盖了两条工具编排链：Claude Code/Anthropic Messages 路径返回 `tool_use name=calc input.expr` 时执行内置 `calculator` 并回填；Codex/OpenAI Responses 路径返回 `function_call name=calc arguments.expr` 时执行真实工具并把 `role=tool content=4` 传回上游继续生成。`/v1/responses` 返回会归一化为 strict Responses shape，至少包含 `id`、`object=response`、`output`、`status`、`usage`。
+```text
+remote /v1/models / chat / responses / messages     OK
+remote /anthropic/v1/messages                       404（上游无该别名）
+remote /v1/tools/call / /v1/functions/call          404（上游无工具端点）
+remote /v1/messages forced tool_choice              OK，返回 Anthropic tool_use
+remote /v1/responses forced tool probe              未返回 function_call，仅 reasoning/message
+Gateway /v1/tools/call Bash/calculator              OK，本地真实执行
+Gateway /v1/functions/call project trace            OK，按下游项目根读取 .traces，不串到服务根
+Gateway /anthropic/v1/messages streaming Read/Bash/Skill OK，adapter/orchestrate 确定性本地工具分支
+Anthropic SSE tool_use.input -> input_json_delta     OK，兼容 Claude Code streaming parser
+Gateway /v1/responses streaming Bash                OK，Responses SSE 含 output_item/content_part/done，兼容 Codex parser
+Gateway streaming passthrough internal fields       OK，转发上游前剥离 workspace/project 路由字段
+Claude Code Primary working directory               OK，优先于旧摘要 Worktree，工具/Skills/项目级 .traces 按下游项目根隔离
+Codex Responses <environment_context><cwd>           OK，Skills 和工具路径按 Codex 项目根隔离
+Gateway Skill/list_skills/read_skill                 OK，项目 `.codex/.claude/.opencode/.agents/skills`、`skills/`、项目内插件 skills、全局 skills、GATEWAY_SKILLS_DIRS
+Gateway Memory/RecallMemory                         OK，默认只列出当前下游项目根，服务目录记忆不串入项目
+Live Claude Code CLI + Codex CLI project smoke       OK，可复跑 `tests/integration/project_scope_cli_smoke.py --require-claude --require-codex`；示例 artifact `.gateway_runtime/project-scope-cli-smoke-20260525-035342/summary.json`，pass=true
+Mimo context                                        1048576 tokens（1M）
+```
 
 ---
 
@@ -420,7 +473,9 @@ claude_mnative() {
     export ANTHROPIC_MODEL="mimo-v2.5-pro"
     export ANTHROPIC_SMALL_FAST_MODEL="mimo-v2.5-pro"
     export ENABLE_LSP_TOOL="1"
-    /opt/homebrew/bin/claude --dangerously-skip-permissions "$@"
+    local claude_bin="${CLAUDE_BIN:-$(command -v claude 2>/dev/null || true)}"
+    if [ -z "$claude_bin" ]; then echo "Claude binary not found; set CLAUDE_BIN" >&2; return 127; fi
+    "$claude_bin" --dangerously-skip-permissions "$@"
 }
 
 # 非交互验活；期望返回 OK 或等价短答。
@@ -431,6 +486,8 @@ claude_mnative -p "Reply with OK only."
 `/anthropic/v1/messages` / `/anthropic/v1/messages/count_tokens`，Gateway 在
 HTTP 入口规范化为内部 `/v1/messages` / `/v1/messages/count_tokens`。下游鉴权
 同时接受 `Authorization: Bearer <key>` 和 Anthropic SDK 常见的 `x-api-key: <key>`。
+不要把 Claude Code 直接指向真实测试上游：该上游没有 `/anthropic/v1/messages` 别名，也没有本地工具执行端点。
+即使该上游 `/v1/messages` forced probe 可返回 `tool_use`，Claude Code 仍需要 Gateway 的 `/anthropic` 兼容别名、SSE 规范化和本地工具 runtime。
 
 ### 6.2 OpenCode
 
@@ -443,9 +500,24 @@ opencode
 ### 6.3 Codex CLI
 
 ```bash
-export OPENAI_BASE_URL=http://127.0.0.1:8885/v1
 export OPENAI_API_KEY=your-gateway-api-key
 codex
+```
+
+`~/.codex/config.toml` 片段：
+
+```toml
+model_provider = "gateway"
+model = "mimo-v2.5-pro"
+model_reasoning_effort = "xhigh"
+model_context_window = 1048576
+model_max_output_tokens = 131072
+
+[model_providers.gateway]
+name = "gateway"
+base_url = "http://127.0.0.1:8885/v1"
+env_key = "OPENAI_API_KEY"
+wire_api = "responses"
 ```
 
 ### 6.4 Python OpenAI SDK
@@ -594,7 +666,7 @@ curl $UPSTREAM_BASE_URL/v1/models -H "Authorization: Bearer $UPSTREAM_API_KEY"
 ```json
 {
   "upstream": {
-    "tools_enabled": "auto"
+    "tools_enabled": "adapter"
   },
   "gateway": {
     "tool_mode": "orchestrate"

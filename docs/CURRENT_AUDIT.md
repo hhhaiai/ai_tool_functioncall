@@ -1,4 +1,4 @@
-# 当前审计结论（2026-05-23）
+# 当前审计结论（2026-05-25）
 
 本文件记录本轮对 `ai_tool_functioncall` 当前工作区的结构审计、风险点核验和回归修复结果。
 
@@ -39,7 +39,7 @@
 | 4 | `_get_long_context_upstream()` 直接改 `os.environ` 有竞态 | 当前工作区不成立 | 当前函数直接构造 `NativeProxyClient(base_url/api_key/model)`，没有修改 `os.environ`。 |
 | 5 | 流式文本 fallback 缺 `text_fallback` 标志 | 当前工作区已修 | `gateway_streaming.py` 识别文本工具调用后设置 `text_fallback=True`，并复用 runtime 的 `_append_text_tool_results()` / `_append_tool_results()` 回填路径；orchestrate-stream 调上游时强制非 stream。 |
 | 6 | `.bak` 文件残留 | 真实存在，已清理 | 删除 `src/gateway_tool_runtime.py.bak`。 |
-| 7 | 测试覆盖盲区 | 外部结论过时/夸大 | 当前有 167 个 pytest 回归测试，覆盖协议转换、流式、工具编排、上下文 fan-out、SQLite 记忆、HTTP 路由、MCP、HTTP Action、鉴权、路径沙箱和 provider 失败语义等。仍可继续加强真实 provider 集成测试。 |
+| 7 | 测试覆盖盲区 | 外部结论过时/夸大 | 当前有 200 个 pytest 回归测试，覆盖协议转换、流式、工具编排、上下文 fan-out、SQLite 记忆、HTTP 路由、MCP、HTTP Action、鉴权、路径沙箱、provider 失败语义、Claude Code/Codex 项目根识别、Skills/plugin/.traces/Memory 隔离、streaming passthrough 内部字段剥离等。仍可继续加强真实 provider 集成测试。 |
 | 8 | `__getattr__` shim 每次 miss import，脆弱 | 当前工作区已修 | 已删除 `gateway_tool_runtime.py` 末尾动态 `__getattr__`；旧入口兼容由 `gateway_app.py` 的显式重导出和 module wrapper 承担。 |
 
 ## 3. 本轮实际发现并修复的当前回归
@@ -216,6 +216,11 @@
    - 问题：当上游标记不支持 native tools、Gateway 走文本工具适配时，真实上游有时不会按 `<function=Read>` 发起工具调用，而是只回答“Let me read that file”，导致本地文件读取类 smoke exit 0 但没有读到文件内容。
    - 修复：local planner 的路径识别从仅支持 `@path` 扩展到绝对路径、相对路径和常见源码/文本文件名；对“read/show/cat/open/查看/读取”等点名文件请求，弱上游文本工具模式下 Gateway 会对“输出 marker 后面的值”这类明确请求走窄口径本地直读，直接返回真实文件值。新增回归测试覆盖绝对路径文件读取；同时修正 workspace root 优先级为请求体显式 root > 非默认 `GATEWAY_WORKSPACE_ROOT` > 保存配置 `gateway.workspace_root` > 默认根，避免启动脚本默认 `$PWD` 压过 UI 配置，也不破坏显式 env root 的 direct tool 场景。真实 Claude Code 本地文件 smoke 复验通过。
 
+43. **服务启动目录与下游项目目录必须隔离**
+   - 问题：Gateway 作为中游服务启动在自身仓库时，不能把服务 cwd 当成 Claude Code/Codex 的项目目录；`/Users/sanbo/Desktop/PersonalAIBrain/.traces` 这类路径属于下游项目级目录，Skills/plugin/Memory 也必须按下游项目根隔离。
+   - 修复：请求级 workspace root 改为 `ContextVar`，并从请求显式字段、Claude Code `Primary working directory` / `Worktree`、Codex `<environment_context><cwd>`、metadata `projectDir` / `cwd` 等来源解析下游项目根；`Skill` 扫描项目 `.codex/.claude/.opencode/.agents/skills`、`skills/` 和项目内插件 manifest，拒绝插件 skills 跳出项目根；`multi_tool_use.parallel` 继承当前请求根；`Memory`/`RecallMemory` 默认只读写当前项目根；普通转发和 streaming passthrough 都会剥离 Gateway 内部 workspace/project 路由字段，包括 metadata JSON 字符串和 `metadata.user_id` 内嵌 JSON。
+   - 验证：新增可复跑脚本 `tests/integration/project_scope_cli_smoke.py`；live smoke `.gateway_runtime/project-scope-cli-smoke-20260525-035342/summary.json` 为 `pass=true`，覆盖 direct Skills、plugin skill、`/v1/functions/call`、相对/绝对 `.traces`、Memory 项目根隔离、Anthropic SSE、Responses SSE、Claude Code CLI 和 Codex CLI。`./scripts/mimo_gateway.sh verify` 已纳入该 smoke，`GATEWAY_VERIFY_REQUIRE_CLI=1` 会强制 Claude/Codex CLI 必须通过。
+
 ## 4. 当前验证结果
 
 ```bash
@@ -226,10 +231,10 @@ bash -n scripts/mimo_gateway.sh scripts/deploy.sh scripts/generate-ssl.sh script
 # OK
 
 python3 -m pytest -q
-# 167 passed
+# 200 passed
 
-GATEWAY_VERIFY_MODEL_REQUESTS=0 GATEWAY_VERIFY_DIRECT_REQUESTS=24 GATEWAY_VERIFY_WORKERS=8 ./scripts/mimo_gateway.sh verify
-# 167 unittest tests OK; tool acceptance OK; security/auth guardrails OK; 24-request concurrency/performance smoke OK
+GATEWAY_VERIFY_MODEL_REQUESTS=0 GATEWAY_VERIFY_DIRECT_REQUESTS=24 GATEWAY_VERIFY_WORKERS=8 GATEWAY_VERIFY_REQUIRE_CLI=1 ./scripts/mimo_gateway.sh verify
+# unittest tests OK; tool acceptance OK; security/auth guardrails OK; 24-request concurrency/performance smoke OK; Claude/Codex project-scope smoke OK
 
 # HTTP/UI/API smoke on local 127.0.0.1:8885
 # GET /healthz, /ui, /admin/upstream-models.json
@@ -238,6 +243,8 @@ GATEWAY_VERIFY_MODEL_REQUESTS=0 GATEWAY_VERIFY_DIRECT_REQUESTS=24 GATEWAY_VERIFY
 # Codex /v1/responses strict object=response shape
 # OK
 # artifact: .gateway_runtime/final-smoke-20260524-074454-goal-audit/summary.json
+# reusable project-scope smoke: tests/integration/project_scope_cli_smoke.py --require-claude --require-codex
+# example project-scope smoke artifact: .gateway_runtime/project-scope-cli-smoke-20260525-035342/summary.json
 
 # Claude Code local-file smoke
 # ANTHROPIC_BASE_URL=http://127.0.0.1:8885/anthropic ANTHROPIC_AUTH_TOKEN=<gateway-key> claude -p "Read local file <probe> and answer with only the value after gateway-local-file-probe."

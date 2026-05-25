@@ -21,14 +21,14 @@ admin:
 # 上游服务（你的真实 LLM API）
 # ----------------------------------------------------------------------------
 upstream:
-  base_url: ""                       # 例: https://api.openai.com
+  base_url: ""                         # 真实/测试上游地址只放本地 .gateway_service.json 或环境变量，不提交
   api_key: ""                        # 例: <YOUR_UPSTREAM_API_KEY>
-  model: ""                          # 例: gpt-4o, mimo-v2.5-pro
+  model: "mimo-v2.5-pro"              # Mimo 默认模型
   protocol: openai_chat              # openai_chat | anthropic_messages | openai_responses
-  tools_enabled: auto                # auto | on | off
+  tools_enabled: adapter             # Mimo Messages 可 forced tool_use；Codex/Responses function_call 未证实，默认走 Gateway 本地真实工具适配
   timeout_seconds: 60
-  max_input_tokens: 128000
-  max_output_tokens: 8192
+  max_input_tokens: 1048576
+  max_output_tokens: 131072
   max_concurrency: 32
 
   # 上游 API 路径（通常不需要修改）
@@ -41,9 +41,9 @@ upstream:
   # 上游能力声明（自动探测，通常不需要手动设置）
   capabilities:
     supports_streaming: true
-    supports_tools: true
-    supports_function_calls: true
-    supports_parallel_tool_calls: true
+    supports_tools: false
+    supports_function_calls: false
+    supports_parallel_tool_calls: false
     supports_vision: false
     supports_network: false
     supports_json_schema: true
@@ -79,8 +79,9 @@ gateway:
   local_planner_max_files: 24        # 最大分析文件数
   local_planner_max_bytes_per_file: 24000
 
-  # 文本工具调用回退（当上游不支持 tools 时）
+  # 文本工具调用回退（当上游不支持或未稳定支持当前客户端协议的 tools 时）
   text_tool_call_fallback_enabled: true
+  text_tool_adapter_compact_token_limit: 48000  # 弱上游文本工具适配前的专项压缩上限
 
   # 公开访问地址（用于生成客户端配置片段）
   public_base_url: http://127.0.0.1:8885
@@ -93,22 +94,22 @@ gateway:
   review_model_alias: ""             # 质量审查用的模型名
 
   # 客户端上下文窗口
-  client_context_window: 1000000
-  client_auto_compact_token_limit: 900000
-  client_output_token_limit: 128000
+  client_context_window: 1048576
+  client_auto_compact_token_limit: 943718
+  client_output_token_limit: 131072
 
 # ----------------------------------------------------------------------------
 # 上下文管理（长上下文压缩、记忆、扇出）
 # ----------------------------------------------------------------------------
 context:
   enabled: true
-  max_input_tokens: 24000            # 超过此值触发压缩
+  max_input_tokens: 1048576          # Mimo 1M 上下文；超过此值触发压缩/扇出
   keep_recent_messages: 12           # 保留最近 N 条消息
   summary_max_chars: 6000            # 摘要最大字符数
 
   # 扇出（大请求拆分并行处理）
   fanout_enabled: true
-  fanout_chunk_tokens: 12000         # 每块 token 数
+  fanout_chunk_tokens: 120000        # 每块 token 数
   fanout_max_chunks: 0               # 0=不限制
   fanout_max_workers: 4              # 并行 worker 数
 

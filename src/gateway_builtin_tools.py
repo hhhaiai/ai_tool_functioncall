@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import base64
 import concurrent.futures
+import contextvars
 import datetime as _dt
 import glob
 import html
@@ -50,6 +51,11 @@ from .gateway_config import _config_env
 
 Json = dict[str, Any]
 
+_WORKSPACE_ROOT_OVERRIDE: contextvars.ContextVar[pathlib.Path | None] = contextvars.ContextVar(
+    "gateway_workspace_root_override",
+    default=None,
+)
+
 @dataclass(frozen=True)
 class GatewayTool:
     name: str
@@ -67,8 +73,7 @@ class ToolCall:
     raw: Json
 
 def _workspace_root():
-    from . import gateway_builtin_tools as _self
-    override = getattr(_self, '_WORKSPACE_ROOT_OVERRIDE', None)
+    override = _WORKSPACE_ROOT_OVERRIDE.get()
     if override is not None:
         return pathlib.Path(override).resolve()
     env_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
@@ -1024,8 +1029,14 @@ def _tool_memory(args: Json) -> str:
     from .gateway_context import _memory_extract_keywords, _sqlite_insert_memory, _sqlite_tail_memories
 
     action = str(args.get("action") or args.get("operation") or "list").lower()
+    workspace = str(_workspace_root())
     if action in {"list", "read", "recall"}:
-        return json.dumps({"memories": _sqlite_tail_memories(int(args.get("limit") or 50))}, ensure_ascii=False, indent=2)
+        include_all = bool(args.get("all_workspaces") or args.get("include_all_workspaces"))
+        return json.dumps(
+            {"memories": _sqlite_tail_memories(int(args.get("limit") or 50), None if include_all else workspace)},
+            ensure_ascii=False,
+            indent=2,
+        )
     if action in {"write", "remember", "add"}:
         summary = str(args.get("summary") or args.get("content") or args.get("text") or "").strip()
         if not summary:
@@ -1033,14 +1044,14 @@ def _tool_memory(args: Json) -> str:
         keywords = args.get("keywords") if isinstance(args.get("keywords"), list) else _memory_extract_keywords(summary)
         _sqlite_insert_memory(
             str(args.get("session_key") or "manual"),
-            str(args.get("workspace_root") or _workspace_root()),
+            workspace,
             str(args.get("kind") or "manual"),
             summary,
             [str(k) for k in keywords],
             str(args.get("source_request_id") or "manual"),
             int(args.get("importance") or 2),
         )
-        return json.dumps({"ok": True, "stored": True, "keywords": keywords}, ensure_ascii=False)
+        return json.dumps({"ok": True, "stored": True, "workspace_root": workspace, "keywords": keywords}, ensure_ascii=False)
     raise ToolExecutionError(f"unsupported memory action: {action}", failure_type="invalid_input")
 
 
@@ -1048,8 +1059,16 @@ def _tool_multi_tool_use_parallel(args: Json) -> str:
     tool_uses = args.get("tool_uses") or args.get("calls") or []
     if not isinstance(tool_uses, list):
         raise ToolExecutionError("tool_uses must be a list", failure_type="invalid_input")
+    workspace = _workspace_root()
 
     def run_one(index_and_item: tuple[int, Any]) -> Json:
+        token = _WORKSPACE_ROOT_OVERRIDE.set(workspace)
+        try:
+            return run_one_scoped(index_and_item)
+        finally:
+            _WORKSPACE_ROOT_OVERRIDE.reset(token)
+
+    def run_one_scoped(index_and_item: tuple[int, Any]) -> Json:
         index, item = index_and_item
         if not isinstance(item, dict):
             return {"index": index, "success": False, "failure_type": "invalid_input", "content": "tool use must be object"}
@@ -1360,16 +1379,89 @@ def _tool_agent(args: Json) -> str:
     return json.dumps({"strategy": "agent_fanout_synthesis", "chunks": len(chunks), "workers": workers, "output": final}, ensure_ascii=False, indent=2)
 
 
-def _skill_dirs() -> list[pathlib.Path]:
-    candidates = [
-        pathlib.Path.cwd() / ".codex" / "skills",
-        pathlib.Path.home() / ".codex" / "skills",
-        pathlib.Path.home() / ".agents" / "skills",
+def _plugin_skill_dirs(workspace: pathlib.Path) -> list[pathlib.Path]:
+    """Return project-local plugin skill directories declared by plugin manifests.
+
+    Plugin manifests can name a relative ``skills`` directory.  Only paths that
+    stay inside the active workspace are accepted, so a plugin installed in the
+    Gateway service checkout cannot make another downstream project load its
+    skills accidentally.
+    """
+    workspace = workspace.resolve(strict=False)
+    plugin_containers = [
+        workspace / ".codex" / "plugins",
+        workspace / ".claude" / "plugins",
+        workspace / ".opencode" / "plugins",
+        workspace / "plugins",
     ]
+    manifests: list[pathlib.Path] = []
+    for container in plugin_containers:
+        if not container.is_dir():
+            continue
+        for pattern in (
+            "*/.codex-plugin/plugin.json",
+            "*/.claude-plugin/plugin.json",
+            "*/.opencode-plugin/plugin.json",
+            "*/plugin.json",
+        ):
+            manifests.extend(container.glob(pattern))
+
+    result: list[pathlib.Path] = []
+    for manifest in manifests:
+        try:
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        raw_skills = payload.get("skills") or payload.get("skill")
+        if not raw_skills:
+            continue
+        values = raw_skills if isinstance(raw_skills, list) else [raw_skills]
+        plugin_root = manifest.parent.parent if manifest.parent.name.endswith("-plugin") else manifest.parent
+        for raw_value in values:
+            if not isinstance(raw_value, str) or not raw_value.strip():
+                continue
+            raw_path = pathlib.Path(raw_value).expanduser()
+            candidate = raw_path if raw_path.is_absolute() else plugin_root / raw_path
+            resolved = candidate.resolve(strict=False)
+            try:
+                resolved.relative_to(workspace)
+            except ValueError:
+                continue
+            result.append(resolved)
+    return result
+
+
+def _skill_dirs() -> list[pathlib.Path]:
+    workspace = _workspace_root()
+    home = pathlib.Path.home()
+    candidates: list[pathlib.Path] = [
+        # Workspace-local skills first so downstream project intelligence wins.
+        workspace / ".codex" / "skills",
+        workspace / ".agents" / "skills",
+        workspace / ".claude" / "skills",
+        workspace / ".opencode" / "skills",
+        workspace / "skills",
+        *_plugin_skill_dirs(workspace),
+    ]
+    candidates.extend([
+        # Then user-global skill stores used by Codex, Claude Code, and OMX.
+        home / ".codex" / "skills",
+        home / ".agents" / "skills",
+        home / ".claude" / "skills",
+        home / ".opencode" / "skills",
+    ])
     extra = os.environ.get("GATEWAY_SKILLS_DIRS")
     if extra:
         candidates.extend(pathlib.Path(part) for part in extra.split(os.pathsep) if part)
-    return [path for path in candidates if path.is_dir()]
+    seen: set[pathlib.Path] = set()
+    existing: list[pathlib.Path] = []
+    for path in candidates:
+        resolved = path.expanduser().resolve(strict=False)
+        if resolved in seen or not resolved.is_dir():
+            continue
+        seen.add(resolved)
+        existing.append(resolved)
+    return existing
 
 
 def _load_skill(name: str) -> tuple[pathlib.Path, str] | None:

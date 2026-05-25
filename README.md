@@ -56,34 +56,38 @@
 | 上下文压缩、SQLite 记忆、fan-out | 已实现并有测试 | `src/gateway_context.py` |
 | Admin UI / client config snippets / 上游模型自动获取 | 已实现并有测试 | `src/gateway_admin.py`, `src/gateway_http_handler.py` |
 
-当前回归测试：
+当前回归测试（以实际门禁输出为准）：
 
 ```bash
+python3 -m compileall -q src tests
+bash -n scripts/mimo_gateway.sh scripts/deploy.sh scripts/generate-ssl.sh scripts/claude_m1.sh scripts/install_deps.sh
+git diff --check
 python3 -m pytest -q
-# 167 passed
-
-GATEWAY_VERIFY_MODEL_REQUESTS=0 GATEWAY_VERIFY_DIRECT_REQUESTS=24 GATEWAY_VERIFY_WORKERS=8 ./scripts/mimo_gateway.sh verify
-# 167 unittest tests + tool acceptance + security/auth guardrails + concurrency smoke OK
+# 200 passed
 ```
 
-本轮真实 8885 稳定性复验（2026-05-24）：
+本轮真实测试上游 / Mimo 兼容结论（2026-05-25，地址只保存在本地 ignored 配置或环境变量中）：
 
 ```text
-./scripts/mimo_gateway.sh start                OK
-GET  /healthz                                  OK，builtin_tool_count=67
-GET  /ui                                       OK，包含 Gateway Control Center / Capability Matrix / Fetch Models / claude_mnative()
-GET  /admin/upstream-models.json               OK，从真实上游返回 mimo-v2.5-pro 等模型
-POST /v1/chat/completions                      OK
-POST /anthropic/v1/messages                    OK，返回严格 Anthropic message shape
-POST /anthropic/v1/messages + tools(calc/expr) OK，无 too-long / malformed response
-POST /v1/tools/call calc expr=2+2              OK，返回 4
-POST /v1/functions/call calc expr=6*7          OK，返回 42
-Claude Code local-file smoke                  OK，stdout=2+2=4，无 too-long / malformed / empty response
-Codex /v1/responses tool chain calc/expr       OK，回归覆盖到工具结果回填
-Codex /v1/responses strict shape               OK，返回 object=response/id/status/usage
-Claude /v1/messages tool chain calc/expr       OK，回归覆盖到 tool_use 结果回填
-artifact: .gateway_runtime/final-smoke-20260524-074454-goal-audit/summary.json
-claude-local-file-artifact: .gateway_runtime/claude-local-file-probe-20260524-074546-goal-audit.summary.json
+GET  /v1/models                         OK，返回 mimo-v2.5-pro 等模型
+POST /v1/chat/completions               OK
+POST /v1/responses                      OK
+POST /v1/messages                       OK
+POST /anthropic/v1/messages             上游直连 404（必须通过本 Gateway 的 /anthropic 别名）
+POST /v1/tools/call / /v1/functions/call 上游直连 404（必须由本 Gateway 本地 tool runtime 执行）
+POST /v1/messages + forced tool_choice   OK，可返回 Anthropic tool_use（例如 echo_probe）
+POST /v1/responses + forced tool probe    未返回 function_call，仅 reasoning/message
+
+正确接入方式：
+Claude Code -> http://127.0.0.1:8885/anthropic -> Gateway adapter/orchestrate -> Mimo text reasoning
+Codex       -> http://127.0.0.1:8885/v1        -> Gateway adapter/orchestrate -> Mimo text reasoning
+工具执行     -> Gateway 本地真实 runtime / MCP / HTTP Actions；不是把 prompt 文本伪装成工具成功。
+项目目录     -> 请求体显式 root 或下游客户端项目目录；不是 Gateway 服务启动目录。
+Skills/插件  -> 先加载该项目目录的 skills 和项目内插件声明的 skills。
+
+Mimo 上下文按 1M 配置：upstream.max_input_tokens=1048576，gateway/client_context_window=1048576。
+已覆盖：Anthropic SSE tool_use.input 规范化为 input_json_delta；streaming adapter 本地 Read/Bash/Skill 确定性 smoke；direct `/v1/tools/call` / `/v1/functions/call`；Claude Code / Codex 项目目录识别；项目级 `.traces` 读取隔离；项目内 plugin skills；Memory/RecallMemory 项目根隔离；streaming passthrough 也会剥离 Gateway 内部 workspace 路由字段。
+可复跑的项目级 smoke：`tests/integration/project_scope_cli_smoke.py`；`./scripts/mimo_gateway.sh verify` 已包含它，设置 `GATEWAY_VERIFY_REQUIRE_CLI=1` 时会把 Claude Code CLI 与 Codex CLI 也作为必过项。示例 artifact: `.gateway_runtime/project-scope-cli-smoke-20260525-035342/summary.json`，`pass=true`。
 ```
 
 ---
@@ -96,10 +100,16 @@ cp gateway.config.json .gateway_service.json
 vi .gateway_service.json
 
 # 至少确认这些值：
-# - upstream.base_url / upstream.api_key / upstream.model
+# - upstream.base_url=<你的真实测试上游地址> / upstream.model=mimo-v2.5-pro
+# - upstream.tools_enabled=adapter，capabilities.supports_tools=false，supports_function_calls=false
+#   说明：Mimo /v1/messages forced probe 可返回 tool_use，但 /anthropic 别名、direct tool endpoint、
+#   Codex /v1/responses function_call 未证实；为了 Claude Code + Codex 一致稳定，默认仍走 Gateway adapter。
+# - upstream.max_input_tokens=1048576，gateway.client_context_window=1048576
 # - gateway.client_snippet_api_key 或环境变量 GATEWAY_DOWNSTREAM_KEY
 # - admin.password 或环境变量 GATEWAY_ADMIN_PASSWORD
-# 注意：README/docs 中的 test-gateway-key / upstream.example.local 都是占位示例；真实账号只放 .gateway_service.json 或环境变量，不提交。
+# - 下游项目目录优先来自请求体 workspace_root/gateway_workspace、Claude Code 的
+#   Primary working directory/Worktree、Codex Responses 的 <environment_context><cwd>
+# 注意：真实账号/API key 只放 .gateway_service.json 或环境变量，不提交。
 
 # 2. 后台启动（默认端口 8885）
 ./scripts/mimo_gateway.sh start
@@ -162,6 +172,13 @@ UPSTREAM_MODEL="smoke-model" \
 python3 src/toolcall_gateway.py --host 127.0.0.1 --port 8899
 ```
 
+如果不想触达真实测试上游，也可以先起一个本地弱上游 mock：
+
+```bash
+python3 scripts/mock_openai_upstream.py --port 9001 --model mimo-v2.5-pro
+UPSTREAM_BASE_URL=http://127.0.0.1:9001 ./scripts/mimo_gateway.sh start
+```
+
 验活命令：
 
 ```bash
@@ -186,7 +203,9 @@ curl -fsS http://127.0.0.1:8885/v1/tools/call \
 
 推荐用 Anthropic-compatible 前缀 `/anthropic`，这样 Claude Code 会请求
 `http://127.0.0.1:8885/anthropic/v1/messages`，Gateway 会规范化到内部
-`/v1/messages` 再按当前上游 profile 转发。
+`/v1/messages` 再按当前上游 profile 转发。不要把 Claude Code 直接指向
+真实测试上游：该上游没有 `/anthropic/v1/messages` 别名，也没有本地工具执行端点；
+即使 `/v1/messages` 强制探针可返回 `tool_use`，Claude Code 仍需要 Gateway 的别名、SSE 规范化和本地 runtime。
 
 ```bash
 claude_mnative() {
@@ -200,7 +219,9 @@ claude_mnative() {
     export ANTHROPIC_MODEL="mimo-v2.5-pro"
     export ANTHROPIC_SMALL_FAST_MODEL="mimo-v2.5-pro"
     export ENABLE_LSP_TOOL="1"
-    /opt/homebrew/bin/claude --dangerously-skip-permissions "$@"
+    local claude_bin="${CLAUDE_BIN:-$(command -v claude 2>/dev/null || true)}"
+    if [ -z "$claude_bin" ]; then echo "Claude binary not found; set CLAUDE_BIN" >&2; return 127; fi
+    "$claude_bin" --dangerously-skip-permissions "$@"
 }
 
 # 非交互验活
@@ -216,6 +237,23 @@ claude_mnative -p "Reply with OK only."
 ```bash
 export OPENAI_BASE_URL="http://127.0.0.1:8885/v1"
 export OPENAI_API_KEY="your-gateway-key"
+# Codex 建议 wire_api=responses；base_url 指本 Gateway /v1，不要直连 Mimo 上游。
+```
+
+Codex `config.toml` 片段：
+
+```toml
+model_provider = "gateway"
+model = "mimo-v2.5-pro"
+model_reasoning_effort = "xhigh"
+model_context_window = 1048576
+model_max_output_tokens = 131072
+
+[model_providers.gateway]
+name = "gateway"
+base_url = "http://127.0.0.1:8885/v1"
+env_key = "OPENAI_API_KEY"
+wire_api = "responses"
 ```
 
 Python SDK 示例：
@@ -290,7 +328,12 @@ src/
 ## 重要边界
 
 - Gateway 不把假的 tool result 伪装成真实成功。
+- 真实测试上游 / Mimo 直连缺少 `/anthropic` 别名和 direct tools endpoint；`/v1/messages` forced probe 可返回 Anthropic `tool_use`，但 Codex `/v1/responses` function_call 未证实。因此 Claude Code/Codex 默认由本 Gateway 的 adapter/orchestrate + 本地真实工具 runtime 提供稳定工具能力；真实地址只放本地 `.gateway_service.json`、`.env` 或运行时环境变量，不写入提交代码。
 - 文本 fallback 只是一种弱上游兼容方式；工具仍由 Gateway/MCP/HTTP Action/真实 executor 执行。
+- Gateway 是中游服务，不能把服务启动目录当作用户项目目录；工具读写、项目级 `.traces`、SQLite 记忆隔离、Skills/插件都以当前请求解析出的下游项目根为准。`Memory`/`RecallMemory` 默认也只读写当前项目根，避免服务目录或其他项目记忆串入。
+- `workspace_root` / `gateway_workspace` / `projectDir` / `cwd` 等字段只作为 Gateway 内部路由信号；普通转发和 streaming passthrough 都会在上游请求前剥离，metadata JSON 字符串和 `metadata.user_id` 内嵌 JSON 里的同类字段也会清理。
+- `Skill`/`list_skills`/`read_skill`/`run_skill` 是真实 Gateway 工具；项目内 skills 优先，服务 cwd 下的 skills 不会串入另一个项目，用户全局 skills 和显式 `GATEWAY_SKILLS_DIRS` 在项目目录之后加载。
+- 项目内插件只读取当前项目根下 `.codex/plugins`、`.claude/plugins`、`.opencode/plugins`、`plugins` 中 manifest 声明的 skills，且 skills 路径必须仍在项目根内。
 - 写文件、Shell、GUI、网络类工具要通过配置显式授权；公开模板和 Docker 默认关闭写入/Shell。
 - `admin.password` 模板字段会在加载/保存时转换为 `password_hash`，避免明文密码被回写。
 - `gateway.client_snippet_api_key` 会自动同步成可认证的 downstream key，避免复制出的客户端配置不可用。

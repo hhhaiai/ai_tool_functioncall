@@ -214,11 +214,20 @@ def get_install_command(server_id: str) -> str | None:
 
 def scan_local_skills() -> list[dict[str, Any]]:
     """Scan local skills directories for available skills."""
-    candidates = [
-        pathlib.Path.cwd() / ".codex" / "skills",
-        pathlib.Path.home() / ".codex" / "skills",
-        pathlib.Path.home() / ".agents" / "skills",
-    ]
+    try:
+        from .gateway_builtin_tools import _skill_dirs
+    except ImportError:
+        try:
+            from src.gateway_builtin_tools import _skill_dirs  # type: ignore
+        except ImportError:
+            def _skill_dirs() -> list[pathlib.Path]:  # type: ignore
+                return [
+                    pathlib.Path.home() / ".codex" / "skills",
+                    pathlib.Path.home() / ".agents" / "skills",
+                    pathlib.Path.home() / ".claude" / "skills",
+                    pathlib.Path.home() / ".opencode" / "skills",
+                ]
+    candidates = _skill_dirs()
     skills = []
     for skill_dir in candidates:
         if skill_dir.is_dir():
