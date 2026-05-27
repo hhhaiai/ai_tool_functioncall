@@ -7,7 +7,10 @@ from __future__ import annotations
 
 import json
 import copy
+import logging
 import os
+
+_logger = logging.getLogger(__name__)
 import pathlib
 import re
 import subprocess
@@ -524,7 +527,7 @@ def _normalize_tool_args(name: str, arguments: Json) -> Json:
     props = tool.parameters.get("properties", {})
     if not props:
         return arguments
-    # Map common aliases
+    # Map common aliases - only apply if the target property exists in schema
     alias_map = {
         "command": "cmd",
         "cmd": "command",
@@ -844,6 +847,92 @@ def _extract_text_tool_calls(path: str, response: Json) -> list[ToolCall]:
     return _parse_text_tool_calls(_response_text(path, response))
 
 
+def _convert_text_calls_to_downstream_response(
+    path: str,
+    text_calls: list["ToolCall"],
+    original_response: Json,
+    upstream_protocol: str,
+) -> Json:
+    """Convert parsed text-based tool calls into native downstream protocol format.
+
+    Instead of executing tools locally, this creates a proper tool_use / function_call
+    response that the downstream client (Claude Code / Codex) will execute.
+    """
+    if not text_calls:
+        return original_response
+
+    # Build Anthropic Messages format (tool_use blocks)
+    if "/messages" in path:
+        content_parts: list[dict] = []
+        for call in text_calls:
+            content_parts.append({
+                "type": "tool_use",
+                "id": call.call_id,
+                "name": call.name,
+                "input": call.arguments,
+            })
+        return {
+            "id": f"msg_gateway_{uuid.uuid4().hex}",
+            "type": "message",
+            "role": "assistant",
+            "model": original_response.get("model") or "",
+            "content": content_parts,
+            "stop_reason": "tool_use",
+            "stop_sequence": None,
+            "usage": original_response.get("usage") or {"input_tokens": 0, "output_tokens": 0},
+        }
+
+    # Build OpenAI Chat format (tool_calls)
+    if "/chat/completions" in path:
+        tool_calls = []
+        for call in text_calls:
+            tool_calls.append({
+                "id": call.call_id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                },
+            })
+        choices = original_response.get("choices") or [{}]
+        choice = dict(choices[0]) if choices else {}
+        message = dict(choice.get("message") or {})
+        # Include any text content before tool calls
+        if message.get("content"):
+            pass  # Keep existing content
+        message["tool_calls"] = tool_calls
+        choice["message"] = message
+        choice["finish_reason"] = "tool_calls"
+        return {
+            "id": original_response.get("id") or f"chatcmpl_gateway_{uuid.uuid4().hex}",
+            "object": "chat.completion",
+            "model": original_response.get("model") or "",
+            "choices": [choice],
+            "usage": original_response.get("usage") or {},
+        }
+
+    # Build OpenAI Responses format
+    if "/responses" in path:
+        output_items = []
+        for call in text_calls:
+            output_items.append({
+                "type": "function_call",
+                "id": f"fc_{uuid.uuid4().hex}",
+                "call_id": call.call_id,
+                "name": call.name,
+                "arguments": json.dumps(call.arguments, ensure_ascii=False),
+            })
+        return {
+            "id": original_response.get("id") or f"resp_gateway_{uuid.uuid4().hex}",
+            "object": "response",
+            "model": original_response.get("model") or "",
+            "output": output_items,
+            "usage": original_response.get("usage") or {},
+        }
+
+    return original_response
+
+
 def _detect_intent_tool_calls(path: str, response: Json, body: Json) -> list[ToolCall]:
     """Detect tool usage intent from model response text for weak models.
 
@@ -1037,7 +1126,7 @@ def _append_tool_results(path: str, body: Json, response: Json, results: list[To
                 "type": "tool_result",
                 "tool_use_id": result.call_id,
                 "content": result.content,
-                **({"is_error": True} if not result.success else {}),
+                "is_error": not result.success,
             }
             for result in results
         ]
@@ -1444,6 +1533,19 @@ def _execute_tool_call(call: ToolCall, provider: str | None = None) -> ToolResul
             max_retries = 0
         max_retries = max(0, max_retries)
     provider = provider or "unknown"
+
+    # Check tool result cache for cacheable read-only tools
+    _tool_cache = None
+    try:
+        from .gateway_cache import get_tool_result_cache
+        _tool_cache = get_tool_result_cache()
+        if tool and _tool_cache.is_cacheable(call.name):
+            cached = _tool_cache.get(call.name, call.arguments)
+            if cached is not None:
+                return ToolResult(call_id=call.call_id, name=call.name, content=cached, success=True)
+    except Exception:
+        _tool_cache = None
+
     last_exc: Exception | None = None
     last_result: ToolResult | None = None
     for attempt in range(max_retries + 1):
@@ -1496,6 +1598,12 @@ def _execute_tool_call(call: ToolCall, provider: str | None = None) -> ToolResul
                 return result
             content = tool.handler(call.arguments)
             _record_tool_stat(call.name, True)
+            # Store in tool result cache for cacheable tools
+            try:
+                if _tool_cache and _tool_cache.is_cacheable(call.name):
+                    _tool_cache.put(call.name, call.arguments, content)
+            except Exception:
+                pass
             return ToolResult(call_id=call.call_id, name=call.name, content=content, success=True)
         except (ToolExecutionError, subprocess.TimeoutExpired, Exception) as exc:
             last_exc = exc
@@ -1645,12 +1753,15 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
     gateway_cfg = _gateway_config()
     mode = str(os.environ.get("GATEWAY_TOOL_MODE") or gateway_cfg.get("tool_mode") or "orchestrate").lower()
     memory_body = _inject_recalled_memories(path, body)
-    direct_file_response = _direct_local_file_read_response(path, memory_body) if _weak_upstream_text_tools_active(mode) else None
-    direct_response = direct_file_response
-    if direct_response is None and _weak_upstream_text_tools_active(mode):
-        direct_response = _direct_local_skill_response(path, memory_body)
-    if direct_response is None and _weak_upstream_text_tools_active(mode):
-        direct_response = _direct_local_bash_response(path, memory_body)
+    # Gateway-specific tools (skills, memory, direct file reads) are executed locally.
+    # Client tools (Read, Write, Bash, etc.) are returned to downstream for execution.
+    direct_response = None
+    if _weak_upstream_text_tools_active(mode):
+        direct_response = _direct_local_file_read_response(path, memory_body)
+        if direct_response is None:
+            direct_response = _direct_local_skill_response(path, memory_body)
+        if direct_response is None:
+            direct_response = _direct_local_bash_response(path, memory_body)
     if direct_response is not None:
         _remember_conversation_turn(path, body, direct_response)
         return direct_response
@@ -1681,6 +1792,33 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
         _remember_conversation_turn(path, body, fanout_response)
         return fanout_response
     request_body = _merge_builtin_tools(path, _apply_local_planner_context(path, _maybe_compact_request_for_upstream(path, memory_body, context_cfg)))
+
+    # --- Intelligence Enhancement ---
+    # Analyze the user question and enhance the system prompt with insights.
+    # This runs before upstream conversion so the enhanced prompt flows through normally.
+    try:
+        from .gateway_intelligence import enhance_intelligence, _intelligence_config, get_intelligence_summary
+        intel_cfg = _intelligence_config(full_cfg.get("intelligence") if isinstance(full_cfg.get("intelligence"), dict) else None)
+        if intel_cfg.enabled:
+            intel_result = enhance_intelligence(request_body.get("messages", []), intel_cfg)
+            # Build system prompt enhancement
+            prompt_parts = []
+            if intel_result.system_prompt:
+                prompt_parts.append(intel_result.system_prompt)
+            if intel_result.should_reflect and intel_result.reflection_prompt:
+                prompt_parts.append(intel_result.reflection_prompt)
+            if prompt_parts:
+                enhancement = "\n\n".join(prompt_parts)
+                msgs = request_body.get("messages", [])
+                if msgs and isinstance(msgs[0], dict) and msgs[0].get("role") == "system":
+                    existing = str(msgs[0].get("content") or "")
+                    if enhancement not in existing:
+                        msgs[0]["content"] = existing + "\n\n" + enhancement
+                    request_body["messages"] = msgs
+            _logger.debug("Intelligence: %s", get_intelligence_summary(intel_result))
+    except Exception as exc:
+        _logger.debug("Intelligence enhancement skipped: %s", exc)
+
     # Convert merged request to upstream format
     upstream_path, request_body = _convert_request_to_upstream(path, request_body, upstream_protocol)
     # Override model with configured upstream model
@@ -1722,6 +1860,29 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
         if not calls:
             _remember_conversation_turn(path, body, downstream_response)
             return downstream_response
+
+        # --- Key design decision: who executes tools? ---
+        # When delegate_tools_to_downstream=true (default), text tool calls from
+        # upstream are converted to native protocol format and returned to the
+        # downstream client (Claude Code / Codex) for execution.
+        # When false, the gateway executes tools locally (legacy behavior).
+        # Auto-detect: delegate when downstream is Claude Code/Codex (path-based)
+        # and upstream doesn't support native tools. Config can override.
+        cfg_delegate = _gateway_config().get("delegate_tools_to_downstream")
+        if cfg_delegate is None:
+            # Default: delegate for coding agent clients (Anthropic/OpenAI endpoints)
+            delegate = path in ("/v1/messages", "/v1/chat/completions", "/v1/responses",
+                               "/anthropic/v1/messages")
+        else:
+            delegate = bool(cfg_delegate)
+        if text_fallback and delegate:
+            native_response = _convert_text_calls_to_downstream_response(
+                path, calls, downstream_response, upstream_protocol,
+            )
+            _remember_conversation_turn(path, body, native_response)
+            return native_response
+
+        # Execute tools locally (either native calls or delegated=false)
         results = [_execute_tool_call(call) for call in calls]
         if text_fallback:
             request_body = _append_text_tool_results(upstream_path, request_body, upstream_response, calls, results)
