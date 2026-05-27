@@ -5,15 +5,38 @@ Handles context compaction, memory system, and fanout for long conversations.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import threading
 import uuid
+from collections import OrderedDict
 from typing import Any
 
 Json = dict[str, Any]
 
-_SUMMARY_CACHE: dict[str, str] = {}
+# Thread-safe, bounded summary cache (LRU eviction)
+_SUMMARY_CACHE_MAX = 512
+_summary_cache_lock = threading.Lock()
+_SUMMARY_CACHE: OrderedDict[str, str] = OrderedDict()
+
+
+def _summary_cache_get(key: str) -> str | None:
+    with _summary_cache_lock:
+        if key in _SUMMARY_CACHE:
+            _SUMMARY_CACHE.move_to_end(key)
+            return _SUMMARY_CACHE[key]
+    return None
+
+
+def _summary_cache_put(key: str, value: str) -> None:
+    with _summary_cache_lock:
+        if key in _SUMMARY_CACHE:
+            _SUMMARY_CACHE.move_to_end(key)
+        _SUMMARY_CACHE[key] = value
+        while len(_SUMMARY_CACHE) > _SUMMARY_CACHE_MAX:
+            _SUMMARY_CACHE.popitem(last=False)
 
 
 def _approx_token_count(value: Any) -> int:
@@ -41,7 +64,9 @@ def _context_config() -> Json:
 
 
 def _context_enabled() -> bool:
-    return bool(_context_config().get("enabled"))
+    cfg = _context_config()
+    # Default to enabled unless explicitly disabled
+    return cfg.get("enabled", True)
 
 
 def _body_token_estimate(body: Json) -> int:
@@ -328,6 +353,13 @@ def _recall_conversation_memories(path: str, body: Json) -> list[Json]:
     session_key = _memory_session_key(body)
     workspace_root = _memory_workspace_key()
     user_text = _memory_extract_request_text(path, body)
+    # Use smart memory search with relevance scoring when query is available
+    if user_text.strip():
+        try:
+            return _smart_memory_search(session_key, workspace_root, user_text, limit)
+        except Exception:
+            pass
+    # Fallback to keyword-based search
     keywords = _memory_extract_keywords(user_text)
     return _sqlite_recall_memories(session_key, workspace_root, keywords, limit)
 
@@ -441,9 +473,10 @@ def _upstream_supports_native_tools() -> bool:
 
 def _summarize_via_llm(messages: list[Json], *, max_summary_tokens: int = 800) -> str | None:
     content_key = json.dumps(messages, ensure_ascii=False, sort_keys=True)
-    content_hash = str(hash(content_key) & 0xFFFFFFFF)
-    if content_hash in _SUMMARY_CACHE:
-        return _SUMMARY_CACHE[content_hash]
+    content_hash = hashlib.sha256(content_key.encode()).hexdigest()[:16]
+    cached = _summary_cache_get(content_hash)
+    if cached is not None:
+        return cached
     from .gateway_config import _upstream_config, _upstream_protocol
     from .gateway_protocol import _text_from_content, _to_openai_chat_payload
     from .gateway_logging import _record_request_stat, _write_request_log
@@ -496,7 +529,7 @@ def _summarize_via_llm(messages: list[Json], *, max_summary_tokens: int = 800) -
             for item in content:
                 if isinstance(item, dict) and item.get("type") == "text":
                     summary = str(item.get("text") or "")
-                    _SUMMARY_CACHE[content_hash] = summary
+                    _summary_cache_put(content_hash, summary)
                     return summary
         else:
             response = post_once("/v1/chat/completions", payload)
@@ -504,7 +537,7 @@ def _summarize_via_llm(messages: list[Json], *, max_summary_tokens: int = 800) -
             if choices:
                 summary = choices[0].get("message", {}).get("content")
                 if summary:
-                    _SUMMARY_CACHE[content_hash] = summary
+                    _summary_cache_put(content_hash, summary)
                 return summary
     except Exception:
         pass
