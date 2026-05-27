@@ -133,7 +133,7 @@ def _anthropic_tool_choice_to_openai(tool_choice: Any) -> Any:
     return "auto"
 
 
-def _convert_anthropic_messages_to_openai(messages: list[Json]) -> tuple[list[Json], str | None]:
+def _convert_anthropic_messages_to_openai(messages: list[Json]) -> tuple[list[Json], str | None, str | None]:
     result = []
     system_text = None
     reasoning_text = None
@@ -200,7 +200,7 @@ def _convert_anthropic_messages_to_openai(messages: list[Json]) -> tuple[list[Js
                 result.append(msg_out)
     # Return reasoning_text if present, otherwise system_text
     # System text is added separately by the caller (_to_openai_chat_payload)
-    return result, reasoning_text or system_text
+    return result, system_text, reasoning_text
 
 
 def _preserve_anthropic_fields(body: Json, payload: Json) -> None:
@@ -223,7 +223,7 @@ def _to_openai_chat_payload(path: str, body: Json, *, stream: bool | None = None
         if stream is not None:
             payload["stream"] = stream
         return payload
-    messages, system_text = _convert_anthropic_messages_to_openai(body.get("messages") or [])
+    messages, system_text, reasoning_text = _convert_anthropic_messages_to_openai(body.get("messages") or [])
     # Also check top-level "system" field (Anthropic format)
     if not system_text:
         system_text = body.get("system")
@@ -246,6 +246,10 @@ def _to_openai_chat_payload(path: str, body: Json, *, stream: bool | None = None
     tool_choice = body.get("tool_choice")
     if tool_choice:
         payload["tool_choice"] = _anthropic_tool_choice_to_openai(tool_choice)
+    # Map Anthropic stop_sequences to OpenAI stop
+    stop_sequences = body.get("stop_sequences")
+    if stop_sequences and "stop" not in payload:
+        payload["stop"] = stop_sequences
     _preserve_anthropic_fields(body, payload)
     return payload
 
@@ -472,6 +476,9 @@ def _openai_messages_to_anthropic(messages: list[Json]) -> tuple[list[Json], str
             text = msg.get("content")
             if text:
                 content_parts.append({"type": "text", "text": text})
+            reasoning = msg.get("reasoning")
+            if reasoning:
+                content_parts.append({"type": "thinking", "thinking": str(reasoning)})
             for tc in msg.get("tool_calls") or []:
                 func = tc.get("function") or {}
                 try:
@@ -495,7 +502,25 @@ def _openai_messages_to_anthropic(messages: list[Json]) -> tuple[list[Json], str
                     "content": msg.get("content", ""),
                 }],
             })
-    return result, system_text
+    # Merge consecutive same-role messages (Anthropic requires strict alternation)
+    merged = []
+    for msg in result:
+        role = msg.get("role")
+        if merged and merged[-1].get("role") == role:
+            prev = merged[-1]
+            prev_content = prev.get("content", "")
+            curr_content = msg.get("content", "")
+            if isinstance(prev_content, list) and isinstance(curr_content, list):
+                prev["content"] = prev_content + curr_content
+            elif isinstance(prev_content, str) and isinstance(curr_content, str):
+                prev["content"] = prev_content + "\n" + curr_content
+            elif isinstance(prev_content, list) and isinstance(curr_content, str):
+                prev["content"] = prev_content + [{"type": "text", "text": curr_content}]
+            elif isinstance(prev_content, str) and isinstance(curr_content, list):
+                prev["content"] = [{"type": "text", "text": prev_content}] + curr_content
+            continue
+        merged.append(msg)
+    return merged, system_text
 
 
 def _openai_chat_to_anthropic_payload(body: Json, *, stream: bool | None = None) -> Json:
@@ -527,11 +552,14 @@ def _openai_chat_to_anthropic_payload(body: Json, *, stream: bool | None = None)
 def _from_anthropic_response_to_openai(response: Json) -> Json:
     content = response.get("content") or []
     text_parts = []
+    thinking_parts = []
     tool_calls = []
     for item in content:
         if isinstance(item, dict):
             if item.get("type") == "text":
                 text_parts.append(str(item.get("text") or ""))
+            elif item.get("type") == "thinking":
+                thinking_parts.append(str(item.get("thinking") or ""))
             elif item.get("type") == "tool_use":
                 tool_calls.append({
                     "id": item.get("id", ""),
@@ -544,6 +572,8 @@ def _from_anthropic_response_to_openai(response: Json) -> Json:
     message: Json = {"role": "assistant"}
     if text_parts:
         message["content"] = "\n".join(text_parts)
+    if thinking_parts:
+        message["reasoning"] = "\n".join(thinking_parts)
     if tool_calls:
         message["tool_calls"] = tool_calls
     finish_reason = response.get("stop_reason") or "stop"
@@ -875,11 +905,17 @@ def _convert_response_to_downstream(downstream_path: str, response: Json, upstre
     if upstream_protocol == "anthropic_messages":
         if "/messages" in downstream_path:
             return response
-        return _from_anthropic_response_to_openai(response)
+        openai_chat = _from_anthropic_response_to_openai(response)
+        if "/responses" in downstream_path:
+            return _from_openai_chat_to_responses_response(openai_chat)
+        return openai_chat
     if upstream_protocol == "openai_responses":
         if "/responses" in downstream_path:
             return _ensure_openai_responses_response(response)
-        return _from_responses_response_to_openai(response)
+        openai_chat = _from_responses_response_to_openai(response)
+        if "/messages" in downstream_path:
+            return _from_openai_chat_response(downstream_path, openai_chat)
+        return openai_chat
     # upstream_protocol == "openai_chat"
     if "/messages" in downstream_path:
         return _from_openai_chat_response(downstream_path, response)
