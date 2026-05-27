@@ -2,7 +2,7 @@
 
 本工程是一个**中游 Gateway**：位于三方上游 LLM API 与下游 coding-agent / SDK 客户端之间，负责协议转换、工具能力补齐、配置管理和长上下文治理。
 
-```text
+``` text
 上游：三方 API
   - Chat API：完全不支持 tools
   - Sub API：部分支持 tools / function call
@@ -19,7 +19,7 @@
 
 原则：
 
-```text
+``` text
 可以 adapter，但不能 fake。
 可以 fallback，但 fallback 必须连接真实工具 runtime 或真实 native-tools provider。
 ```
@@ -35,7 +35,7 @@
    如果上游完全不支持 tools，或只部分支持 tools，Gateway 可以把工具定义以文本协议方式提供给上游模型，解析上游返回的文本工具调用，本地执行真实工具，再把真实结果回填继续生成。对下游来说，经过 Gateway 的请求仍然具备可编程、可工具调用的能力。
 
 3. **配置与能力声明**
-   Gateway 提供 Web UI 和配置文件，用来管理上游 profile、下游 key、上游是否支持 tools、function calls、parallel tool calls、vision/识图、streaming、JSON schema、上下文窗口、工具权限、MCP、HTTP Actions 等。Admin UI 可通过上游 `/v1/models` 自动拉取模型列表。
+   Gateway 提供 5-Tab Web UI（Dashboard / Models / Usage / Tools & Skills / Logs），管理上游 profile、下游 key、能力矩阵（tools、function calls、vision、streaming、JSON schema 等）、MCP 服务器、HTTP Actions，以及 **Skills**（从 workspace + user-global 目录扫描，支持列表和内容查看）。Admin UI 可通过上游 `/v1/models` 自动拉取模型列表。
 
 4. **长上下文 / 类无限上下文**
    Gateway 支持 token 估算、压缩、SQLite 记忆召回、超长输入 fan-out 分片与综合，让下游获得类似“无限上下文”的使用效果。
@@ -46,24 +46,28 @@
 
 | 能力 | 当前状态 | 主要模块 |
 |---|---|---|
-| OpenAI Chat / Responses / Anthropic Messages 协议互转 | 已实现并有测试 | `src/gateway_protocol.py` |
-| HTTP API 入口、认证、ACL、错误映射 | 已实现并有测试 | `src/gateway_http_handler.py`, `src/gateway_errors.py` |
-| 上游代理与路径映射 | 已实现 | `src/gateway_proxy.py`, `src/gateway_config.py` |
-| 工具调用编排、多轮执行、文本 fallback | 已实现并有测试 | `src/gateway_tool_runtime.py` |
-| 内置 coding-agent 工具 | 已实现，当前 67 个唯一工具名 | `src/gateway_builtin_tools.py` |
-| MCP / HTTP Action 扩展 | 已实现基础能力 | `src/gateway_mcp.py`, `src/gateway_http_actions.py` |
-| 流式 SSE 编排 | 已实现并有测试 | `src/gateway_streaming.py` |
-| 上下文压缩、SQLite 记忆、fan-out | 已实现并有测试 | `src/gateway_context.py` |
-| Admin UI / client config snippets / 上游模型自动获取 | 已实现并有测试 | `src/gateway_admin.py`, `src/gateway_http_handler.py` |
+| OpenAI Chat / Responses / Anthropic Messages 协议互转 | ✅ 已实现 | `src/gateway_protocol.py` |
+| HTTP API 入口、认证、ACL、错误映射 | ✅ 已实现 | `src/gateway_http_handler.py` |
+| 上游代理、连接复用、自动重试 | ✅ 已实现 | `src/gateway_proxy.py` |
+| 工具调用编排、多轮执行、文本 fallback | ✅ 已实现 | `src/gateway_tool_runtime.py` |
+| 内置 coding-agent 工具（60+） | ✅ 已实现 | `src/gateway_builtin_tools.py` |
+| MCP / HTTP Action 扩展 | ✅ 已实现 | `src/gateway_mcp.py`, `src/gateway_http_actions.py` |
+| 流式 SSE 编排 + 流式缓存 | ✅ 已实现 | `src/gateway_streaming.py` |
+| 上下文压缩、SQLite 记忆、fan-out | ✅ 已实现 | `src/gateway_context.py` |
+| 语义缓存（精确 + 相似匹配） | ✅ 已实现 | `src/gateway_cache.py` |
+| 智力提升（问题分析、反思、质量评估） | ✅ 已实现 | `src/gateway_intelligence.py` |
+| Q&A 统计（请求/工具/缓存/质量） | ✅ 已实现 | `src/gateway_stats.py` |
+| Web 配置 UI（9 Tab） | ✅ 已实现 | `src/gateway_web_config.py` |
+| Web2API（网页转结构化 API） | ✅ 已实现 | `src/gateway_web2api.py` |
+| 并发优化（连接池、负载均衡） | ✅ 已实现 | `src/gateway_concurrency.py` |
+| Claude Code 兼容层 | ✅ 已实现 | `src/gateway_claude_compat.py` |
+| Admin UI / client config / 上游模型自动获取 | ✅ 已实现 | `src/gateway_admin.py` |
 
 当前回归测试（以实际门禁输出为准）：
 
 ```bash
-python3 -m compileall -q src tests
-bash -n scripts/mimo_gateway.sh scripts/deploy.sh scripts/generate-ssl.sh scripts/claude_m1.sh scripts/install_deps.sh
-git diff --check
 python3 -m pytest -q
-# 200 passed
+# 779 passed, 2 skipped
 ```
 
 本轮真实测试上游 / Mimo 兼容结论（2026-05-25，地址只保存在本地 ignored 配置或环境变量中）：
@@ -300,9 +304,16 @@ src/
 ├── gateway_protocol.py       # 三协议请求/响应/工具格式转换
 ├── gateway_proxy.py          # 上游 HTTP 客户端
 ├── gateway_tool_runtime.py   # 工具解析、规范化、多轮编排、直接调用
-├── gateway_builtin_tools.py  # 内置工具真实实现
-├── gateway_streaming.py      # SSE 流式编排与事件转换
+├── gateway_builtin_tools.py  # 内置工具真实实现 (60+)
+├── gateway_streaming.py      # SSE 流式编排 + 流式缓存
 ├── gateway_context.py        # token 估算、压缩、记忆、fan-out
+├── gateway_cache.py          # 语义缓存 (精确/相似匹配)
+├── gateway_intelligence.py   # 智力提升 (问题分析/反思/质量评估)
+├── gateway_stats.py          # Q&A 统计 (SQLite 持久化)
+├── gateway_web_config.py     # Web 配置 UI (9 Tab)
+├── gateway_web2api.py        # Web → 结构化 API
+├── gateway_concurrency.py    # 连接池、负载均衡、多上游管理
+├── gateway_claude_compat.py  # Claude Code 兼容层
 ├── gateway_mcp.py            # MCP client / tools/list / tools/call
 ├── gateway_http_actions.py   # HTTP Action executor
 ├── gateway_logging.py        # SQLite / JSONL 日志、统计、失败记录
@@ -315,13 +326,40 @@ src/
 
 | 文档 | 用途 |
 |---|---|
+| [`CLAUDE.md`](CLAUDE.md) | 项目进度、架构设计、已实现/待实现 |
+| [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) | 功能实现状态、集成位置、配置项 |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 上游/中游/下游定位、模块边界、请求流程 |
-| [`docs/CURRENT_AUDIT.md`](docs/CURRENT_AUDIT.md) | 当前审计结论、风险点核验、已修复项 |
-| [`docs/RUNNING_AND_TESTING.md`](docs/RUNNING_AND_TESTING.md) | 部署、配置、启动、测试 |
+| [`docs/RUNNING_AND_TESTING.md`](docs/RUNNING_AND_TESTING.md) | 部署、配置、启动、测试、API 验证 |
+| [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | 生产环境部署指南 |
+| [`docs/CURRENT_AUDIT.md`](docs/CURRENT_AUDIT.md) | 审计结论、风险点、已修复项 |
 | [`docs/gateway-admin-ui-config.md`](docs/gateway-admin-ui-config.md) | Admin UI、下游 key、能力配置 |
 | [`docs/gateway-infinite-context-memory.md`](docs/gateway-infinite-context-memory.md) | 长上下文、SQLite 记忆、fan-out |
-| [`docs/full-gateway-tool-runtime-marketplace.md`](docs/full-gateway-tool-runtime-marketplace.md) | 完整 Tool Runtime / Marketplace 方案 |
+| [`docs/full-gateway-tool-runtime-marketplace.md`](docs/full-gateway-tool-runtime-marketplace.md) | Tool Runtime / Marketplace 方案 |
 | [`docs/coding-agent-builtin-tools-implementation.md`](docs/coding-agent-builtin-tools-implementation.md) | 内置 coding-agent 工具实现 |
+| [`docs/tool-format-compat-analysis.md`](docs/tool-format-compat-analysis.md) | 工具格式兼容分析 |
+| [`docs/native-tool-call-solution.md`](docs/native-tool-call-solution.md) | 原生工具调用方案 |
+
+---
+
+## 安全与敏感信息
+
+**以下文件包含真实 API 地址/密钥，已加入 `.gitignore`，不会被提交：**
+
+| 文件 | 内容 | gitignore |
+|------|------|-----------|
+| `.gateway_service.json` | 上游 API 地址、密钥、下游 key | ✅ |
+| `.case.txt` | 测试用 curl 命令（含真实 IP） | ✅ |
+| `.gateway_runtime/` | 运行时配置缓存 | ✅ |
+| `.traces/` | Claude Code 调用 trace | ✅ |
+| `.env` | 环境变量（密钥） | ✅ |
+
+**原则：真实 API 地址只放本地配置文件或环境变量，绝不写入提交代码。**
+
+```bash
+# 验证：提交代码中不应包含真实 IP
+git ls-files | xargs grep -l '47\.85\.40\.209' 2>/dev/null
+# 应无输出
+```
 
 ---
 

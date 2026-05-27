@@ -6,9 +6,30 @@
 
 下游： 各种工具调用（codex/claude code/deepseek-tui/opencode 等）
 
+------
 
 本工程就是中游的 gateway,作用：
-1. 协议转换：  上游不管是openai chat /openai response /claude 格式的，下游都支持三种 ，支持编程
-2. 对于 部分支持 tool, 完全不支持 tool 的，通过被套项目支持，对于下游只要调用 gateway 出来的都是支持编程支持工具的
+1.  协议转换：  上游不管是openai chat /openai response /claude 格式的，下游都支持三种 ，支持编程
+
+
+/v1/chat/completions
+/v1/responses
+/v1/messages
+
+
+2.  对于 部分支持 tool, 完全不支持 tool 的，通过被套项目支持，对于下游只要调用 gateway 出来的都是支持编程支持工具的
 3.  gateway 支持网页，支持配置，比如上游是否支持 tool  那个模型支持识图之类的，上下文多少等
-4. 本套工程要实现部分对话，抽象总结，实现通过 gateway 请求，支持类似无限上下文的效果
+4.  本套工程要实现部分对话，抽象总结，实现通过 gateway 请求，支持类似无限上下文的效果
+
+
+=======
+
+中转站：
+1. 收费 API-- minimax 一年套餐  -- 分成 N 多人用
+2. 用一些“稳定”api， 可以是逆向，限免等等
+
+---
+1. 部分 api 对 tool calls /function calls 不支持/部分支持
+
+
+

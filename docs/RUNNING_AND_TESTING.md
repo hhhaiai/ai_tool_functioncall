@@ -346,7 +346,41 @@ curl http://127.0.0.1:8885/v1/models \
   -H "Authorization: Bearer your-gateway-api-key"
 ```
 
-### 5.4 运行测试套件
+### 5.4 新增 API 端点验证
+
+```bash
+# Web 配置 UI
+curl -u admin:admin http://127.0.0.1:8885/ui/config
+
+# 配置 Schema
+curl -u admin:admin http://127.0.0.1:8885/api/config/schema
+
+# 统计仪表板
+curl -u admin:admin http://127.0.0.1:8885/api/stats/dashboard
+
+# 缓存统计
+curl -u admin:admin http://127.0.0.1:8885/api/cache/stats
+
+# 清除缓存
+curl -u admin:admin -X POST http://127.0.0.1:8885/api/cache/clear
+
+# 智力增强状态
+curl -u admin:admin http://127.0.0.1:8885/api/intelligence/status
+
+# Web2API 提取
+curl -H "Authorization: Bearer your-gateway-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://example.com","mode":"auto"}' \
+  http://127.0.0.1:8885/api/web2api
+
+# 更新配置
+curl -u admin:admin -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"cache":{"enabled":false}}' \
+  http://127.0.0.1:8885/api/config/update
+```
+
+### 5.5 运行测试套件
 
 ```bash
 # 运行全部测试
@@ -356,7 +390,7 @@ python3 -m pytest -q
 python3 tests/integration/smoke_gateway_tools.py
 ```
 
-### 5.5 当前稳定性 smoke（临时端口）
+### 5.6 当前稳定性 smoke（临时端口）
 
 不想影响本机 8885 服务时，可用临时配置和端口启动真实进程：
 

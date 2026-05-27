@@ -142,7 +142,33 @@ src/
 ├── gateway_mcp.py             # MCP 协议支持
 ├── gateway_http_actions.py    # HTTP Action 支持
 ├── gateway_admin.py           # Admin UI 渲染
-└── gateway_http_handler.py   # HTTP 入口处理
+├── gateway_http_handler.py    # HTTP 入口处理
+├── gateway_cache.py           # 语义缓存 ⭐
+│   ├── LocalEmbeddingProvider (字符 trigram + 词频)
+│   ├── SemanticCache (余弦相似度匹配)
+│   └── ToolResultCache (确定性工具缓存)
+├── gateway_intelligence.py    # 智力提升 ⭐
+│   ├── 问题分析 (复杂度/领域/工具需求)
+│   ├── 反思机制 (反思提示生成)
+│   └── 质量评估 (完整性/相关性/清晰度)
+├── gateway_stats.py           # Q&A 统计 ⭐
+│   ├── 请求/工具/缓存/质量统计
+│   ├── SQLite 持久化
+│   └── 仪表板/趋势/导出
+├── gateway_concurrency.py     # 并发优化
+│   ├── ConnectionPool (连接池)
+│   ├── LoadBalancer (负载均衡)
+│   └── MultiUpstreamManager (多上游管理)
+├── gateway_web2api.py         # Web → API 引擎
+│   ├── CSS 选择器提取
+│   ├── 正则提取
+│   └── 自动元数据提取
+├── gateway_web_config.py      # Web 配置 UI
+│   ├── Tab 式配置界面 (9 个标签页)
+│   └── 配置 Schema + 更新 API
+└── gateway_claude_compat.py   # Claude Code 兼容层
+    ├── 工具定义 (Read/Write/Edit/Bash/Glob/Grep/WebFetch/WebSearch)
+    └── 格式化工具 (tool_result/tool_use)
 ```
 
 ## 5. 请求流程
@@ -154,6 +180,9 @@ src/
 ┌───────────────────┐
 │ gateway_http_handler  │  ← 解析请求、认证
 └───────────────────┘
+        │
+        ├── 智力增强 (gateway_intelligence) ← 分析问题复杂度/领域，注入增强 system prompt
+        ├── 语义缓存检查 (gateway_cache)    ← 精确/相似匹配，命中则直接返回
         │
         ▼
 ┌─────────────────────┐
@@ -167,7 +196,7 @@ src/
         │
         ▼
 ┌───────────────────┐
-│ gateway_proxy     │  ← 向上游发起请求
+│ gateway_proxy     │  ← 向上游发起请求（含重试）
 └───────────────────┘
         │
    ┌────┴────┐
@@ -237,12 +266,48 @@ Token 估算 (body_token_estimate)
 {
   "context": {
     "enabled": true,
-    "max_input_tokens": 1048576,
+    "max_input_tokens": 24000,
     "keep_recent_messages": 12,
     "summary_max_chars": 6000,
     "fanout_enabled": true,
-    "fanout_chunk_tokens": 120000,
+    "fanout_chunk_tokens": 12000,
     "memory_enabled": true
+  }
+}
+```
+
+### 缓存配置
+
+```json
+{
+  "cache": {
+    "enabled": true,
+    "max_entries": 1000,
+    "similarity_threshold": 0.92,
+    "ttl_seconds": 3600
+  }
+}
+```
+
+### 智力提升配置
+
+```json
+{
+  "intelligence": {
+    "enabled": true,
+    "reflection_enabled": true,
+    "quality_threshold": 0.6
+  }
+}
+```
+
+### 统计配置
+
+```json
+{
+  "stats": {
+    "enabled": true,
+    "retention_days": 30
   }
 }
 ```
