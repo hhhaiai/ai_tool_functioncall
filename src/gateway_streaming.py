@@ -389,6 +389,31 @@ def _run_streaming_orchestration_scoped(
 
     request_body = _merge_builtin_tools(path, _maybe_compact_request_for_upstream(path, memory_body, context_cfg))
 
+    # --- Intelligence Enhancement (streaming path) ---
+    try:
+        from .gateway_intelligence import enhance_intelligence, _intelligence_config
+        from .gateway_config import load_config as _load_cfg
+        _full = _load_cfg()
+        _icfg = _intelligence_config(_full.get("intelligence") if isinstance(_full.get("intelligence"), dict) else None)
+        if _icfg.enabled:
+            _intel = enhance_intelligence(request_body.get("messages", []), _icfg)
+            # Build system prompt enhancement (matches non-streaming path)
+            _prompt_parts = []
+            if _intel.system_prompt:
+                _prompt_parts.append(_intel.system_prompt)
+            if _intel.should_reflect and _intel.reflection_prompt:
+                _prompt_parts.append(_intel.reflection_prompt)
+            if _prompt_parts:
+                _enhancement = "\n\n".join(_prompt_parts)
+                _msgs = request_body.get("messages", [])
+                if _msgs and isinstance(_msgs[0], dict) and _msgs[0].get("role") == "system":
+                    _ex = str(_msgs[0].get("content") or "")
+                    if _enhancement not in _ex:
+                        _msgs[0]["content"] = _ex + "\n\n" + _enhancement
+                    request_body["messages"] = _msgs
+    except Exception:
+        pass
+
     upstream_path, request_body = _convert_request_to_upstream(path, request_body, upstream_protocol)
     # The gateway is responsible for emitting downstream SSE in orchestrate
     # mode. Keep the upstream request non-streaming unless passthrough is used.
