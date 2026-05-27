@@ -1096,6 +1096,8 @@ def _tool_multi_tool_use_parallel(args: Json) -> str:
         results = list(executor.map(run_one, enumerate(tool_uses)))
     return json.dumps({"results": results}, ensure_ascii=False, indent=2)
 
+EXEC_SESSIONS: dict[str, subprocess.Popen] = {}
+EXEC_SESSIONS_LOCK = threading.Lock()
 AGENT_SESSIONS: dict[str, dict[str, Any]] = {}
 AGENT_SESSIONS_LOCK = threading.Lock()
 AGENT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=int(os.environ.get("GATEWAY_AGENT_SESSION_WORKERS") or "4"))
@@ -1488,7 +1490,7 @@ def _tool_skill(args: Json) -> str:
     path, content = loaded
     if not prompt:
         return json.dumps({"name": name, "path": str(path), "content": content}, ensure_ascii=False, indent=2)
-    return _tool_agent({"prompt": f"请按下面 Skill 指南完成任务。\n\n# Skill {name}\n{content}\n\n# Task\n{prompt}", "model": args.get("model")})
+    return _tool_agent({"prompt": f"Complete the task following the Skill guide below.\n\n# Skill {name}\n{content}\n\n# Task\n{prompt}", "model": args.get("model")})
 
 def _tool_connector_required(args: Json) -> str:
     name = str(args.get("_tool_name") or "tool")

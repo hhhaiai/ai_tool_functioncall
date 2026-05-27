@@ -247,6 +247,46 @@ def _default_config() -> Json:
             "enabled": True,
             "actions": [],
         },
+        "cache": {
+            "enabled": _env_bool("GATEWAY_CACHE_ENABLED", True),
+            "max_entries": _env_int("GATEWAY_CACHE_MAX_ENTRIES", 1000),
+            "similarity_threshold": _env_float("GATEWAY_CACHE_SIMILARITY_THRESHOLD", 0.92),
+            "ttl_seconds": _env_int("GATEWAY_CACHE_TTL_SECONDS", 3600),
+            "embedding_url": os.environ.get("GATEWAY_EMBEDDING_URL", ""),
+            "embedding_model": os.environ.get("GATEWAY_EMBEDDING_MODEL", "default"),
+            "embedding_api_key": os.environ.get("GATEWAY_EMBEDDING_API_KEY", ""),
+        },
+        "intelligence": {
+            "enabled": _env_bool("GATEWAY_INTELLIGENCE_ENABLED", True),
+            "reflection_enabled": _env_bool("GATEWAY_INTELLIGENCE_REFLECTION", True),
+            "decomposition_enabled": _env_bool("GATEWAY_INTELLIGENCE_DECOMPOSITION", True),
+            "quality_assessment_enabled": _env_bool("GATEWAY_INTELLIGENCE_QUALITY", True),
+            "max_reflection_tokens": _env_int("GATEWAY_INTELLIGENCE_MAX_REFLECTION_TOKENS", 500),
+            "max_decomposition_parts": _env_int("GATEWAY_INTELLIGENCE_MAX_DECOMPOSITION_PARTS", 5),
+            "quality_threshold": _env_float("GATEWAY_INTELLIGENCE_QUALITY_THRESHOLD", 0.6),
+        },
+        "concurrency": {
+            "enabled": _env_bool("GATEWAY_CONCURRENCY_ENABLED", True),
+            "max_connections": _env_int("GATEWAY_CONCURRENCY_MAX_CONNECTIONS", 100),
+            "max_connections_per_host": _env_int("GATEWAY_CONCURRENCY_MAX_CONNECTIONS_PER_HOST", 10),
+            "retry_count": _env_int("GATEWAY_CONCURRENCY_RETRY_COUNT", 2),
+            "retry_delay": _env_float("GATEWAY_CONCURRENCY_RETRY_DELAY", 1.0),
+            "load_balance_strategy": os.environ.get("GATEWAY_CONCURRENCY_STRATEGY", "round_robin"),
+        },
+        "stats": {
+            "enabled": _env_bool("GATEWAY_STATS_ENABLED", True),
+            "track_requests": True,
+            "track_tools": True,
+            "track_cache": True,
+            "track_quality": True,
+            "retention_days": _env_int("GATEWAY_STATS_RETENTION_DAYS", 30),
+        },
+        "web2api": {
+            "enabled": _env_bool("GATEWAY_WEB2API_ENABLED", True),
+            "max_concurrent": _env_int("GATEWAY_WEB2API_MAX_CONCURRENT", 5),
+            "cache_ttl_seconds": _env_int("GATEWAY_WEB2API_CACHE_TTL", 300),
+            "request_timeout": _env_int("GATEWAY_WEB2API_TIMEOUT", 30),
+        },
     }
     _ensure_client_snippet_downstream_key(cfg)
     return cfg

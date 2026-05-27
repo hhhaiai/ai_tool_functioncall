@@ -24,6 +24,10 @@ _RETRY_MAX_SECONDS = 20 * 60  # 20 minutes
 
 
 class NativeProxyClient:
+    # Shared opener pool for connection reuse across instances
+    _opener_cache: dict[str, urllib.request.OpenerDirector] = {}
+    _opener_lock = __import__("threading").Lock()
+
     def __init__(
         self,
         *,
@@ -38,6 +42,7 @@ class NativeProxyClient:
         self.model = model if model is not None else cfg.get("model", "")
         self.timeout = cfg.get("timeout_seconds", 60.0)
         self.protocol = _upstream_protocol()
+        self._opener = self._get_opener()
 
     def _headers(self) -> dict[str, str]:
         headers = {
@@ -92,9 +97,21 @@ class NativeProxyClient:
             }],
         }
 
+    @classmethod
+    def _get_opener(cls) -> urllib.request.OpenerDirector:
+        """Get or create a shared opener with connection reuse."""
+        import socket
+        key = "default"
+        with cls._opener_lock:
+            if key not in cls._opener_cache:
+                opener = urllib.request.build_opener()
+                cls._opener_cache[key] = opener
+            return cls._opener_cache[key]
+
     def _do_request_once(self, method: str, url: str, headers: dict[str, str], data: bytes | None) -> Json:
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+        resp = self._opener.open(req, timeout=self.timeout)
+        try:
             response_data = resp.read().decode("utf-8")
             content_type = resp.headers.get("content-type", "")
             if response_data:
@@ -102,6 +119,8 @@ class NativeProxyClient:
                     return self._aggregate_sse_response(response_data)
                 return json.loads(response_data)
             return {}
+        finally:
+            resp.close()
 
     def _do_request(self, method: str, path: str, body: Json | None = None) -> Json:
         url = self._url(path)

@@ -293,6 +293,71 @@ from .gateway_streaming import (
 # Re-export builtin tools
 from .gateway_builtin_tools import BUILTIN_TOOLS, GatewayTool, ToolCall, ToolResult
 
+# Re-export new modules
+from .gateway_cache import (
+    SemanticCache,
+    ToolResultCache,
+    LocalEmbeddingProvider,
+    RemoteEmbeddingProvider,
+    cosine_similarity,
+    CacheEntry,
+    get_semantic_cache,
+    get_tool_result_cache,
+    reset_caches,
+)
+from .gateway_claude_compat import (
+    CLAUDE_CODE_TOOLS,
+    get_claude_code_tool_definitions,
+    is_claude_code_tool,
+    execute_claude_code_tool,
+    format_tool_result_for_anthropic,
+    format_tool_use_for_anthropic,
+    extract_tool_uses_from_response,
+    build_tool_result_message,
+)
+from .gateway_concurrency import (
+    ConcurrencyConfig,
+    ConnectionPool,
+    LoadBalancer,
+    RequestQueue,
+    ConcurrentRequestExecutor,
+    MultiUpstreamManager,
+    create_upstream_pool,
+    get_concurrency_stats,
+)
+from .gateway_intelligence import (
+    IntelligenceConfig,
+    IntelligenceResult,
+    QuestionAnalysis,
+    enhance_intelligence,
+    refine_answer,
+    get_intelligence_summary,
+)
+from .gateway_stats import (
+    StatsConfig,
+    RequestStat,
+    record_request,
+    get_dashboard,
+    get_dashboard_json,
+    get_top_paths,
+    get_top_tools,
+    export_stats_csv,
+    cleanup_old_stats,
+    reset_stats,
+)
+from .gateway_web2api import (
+    Web2ApiEngine,
+    get_web2api_engine,
+    reset_engine,
+)
+from .gateway_web_config import (
+    ConfigField,
+    ConfigTab,
+    render_web_config_ui,
+    handle_config_post,
+    get_config_schema,
+)
+
 
 def _record_tool_failure(*args, **kwargs) -> None:
     """Backward-compatible wrapper for monolithic gateway_app callers."""
