@@ -1506,6 +1506,7 @@ class NativeGatewayTests(unittest.TestCase):
 
     def test_configured_max_tool_rounds_resolves_env_over_config_over_default(self):
         from src.gateway_config import _configured_max_tool_rounds
+        from unittest.mock import patch
 
         old_env = os.environ.get("GATEWAY_MAX_TOOL_ROUNDS")
         try:
@@ -1517,9 +1518,12 @@ class NativeGatewayTests(unittest.TestCase):
             os.environ.pop("GATEWAY_MAX_TOOL_ROUNDS", None)
             self.assertEqual(_configured_max_tool_rounds({"max_tool_rounds": 7}), 7)
 
-            # default 5 when neither env nor config
+            # default 5 when neither env nor config (explicit empty dict)
             self.assertEqual(_configured_max_tool_rounds({}), 5)
-            self.assertEqual(_configured_max_tool_rounds(None), 5)
+
+            # default 5 when None passed and config has no max_tool_rounds
+            with patch("src.gateway_config._gateway_config", return_value={}):
+                self.assertEqual(_configured_max_tool_rounds(None), 5)
 
             # invalid env var falls back to default
             os.environ["GATEWAY_MAX_TOOL_ROUNDS"] = "not-a-number"
@@ -1667,6 +1671,7 @@ class NativeGatewayTests(unittest.TestCase):
             try:
                 cfg = gateway._default_config()
                 cfg["gateway"]["text_tool_call_fallback_enabled"] = True
+                cfg["gateway"]["delegate_tools_to_downstream"] = False
                 gateway.save_config(cfg)
                 pathlib.Path(td, "a.py").write_text("print('a')\n", encoding="utf-8")
                 pathlib.Path(td, "README.md").write_text("# demo\n", encoding="utf-8")
@@ -1715,6 +1720,7 @@ class NativeGatewayTests(unittest.TestCase):
                 cfg["upstream"]["capabilities"]["supports_tools"] = False
                 cfg["upstream"]["capabilities"]["supports_function_calls"] = False
                 cfg["gateway"]["text_tool_call_fallback_enabled"] = True
+                cfg["gateway"]["delegate_tools_to_downstream"] = False
                 gateway.save_config(cfg)
                 pathlib.Path(td, "x.py").write_text("print('x')\n", encoding="utf-8")
                 client = FakeClient(
@@ -2050,13 +2056,13 @@ class NativeGatewayTests(unittest.TestCase):
                     timeout=5,
                 ).read().decode("utf-8")
                 self.assertIn("Gateway Control Center", page)
-                self.assertIn("上游模型与 API 设置", page)
+                self.assertIn("上游模型列表", page)
                 self.assertIn("chat-only", page)
-                self.assertIn("Fetch Models /v1/models", page)
-                self.assertIn("Capability Matrix / 能力矩阵", page)
+                self.assertIn("Fetch Models", page)
+                self.assertIn("能力声明", page)
                 self.assertIn('name="cap_supports_tools"', page)
                 self.assertIn('name="cap_supports_vision"', page)
-                self.assertIn('name="text_tool_adapter_compact_token_limit"', page)
+                self.assertIn("上下文管理", page)
                 self.assertIn("/admin/upstream-models.json", page)
                 self.assertIn("/anthropic", page)
                 self.assertIn("claude_mnative()", page)
@@ -5302,7 +5308,7 @@ class ProtocolConversionTests(unittest.TestCase):
             {"role": "user", "content": "Hello"},
             {"role": "assistant", "content": "Hi there"},
         ]
-        result, reasoning = _convert_anthropic_messages_to_openai(messages)
+        result, system, reasoning = _convert_anthropic_messages_to_openai(messages)
         self.assertEqual(len(result), 2)
         self.assertEqual(result[0]["role"], "user")
         self.assertEqual(result[0]["content"], "Hello")
@@ -5326,7 +5332,7 @@ class ProtocolConversionTests(unittest.TestCase):
                 ],
             }
         ]
-        result, reasoning = _convert_anthropic_messages_to_openai(messages)
+        result, system, reasoning = _convert_anthropic_messages_to_openai(messages)
         self.assertEqual(len(result), 1)
         msg = result[0]
         self.assertEqual(msg["role"], "assistant")
@@ -5353,7 +5359,7 @@ class ProtocolConversionTests(unittest.TestCase):
                 ],
             }
         ]
-        result, reasoning = _convert_anthropic_messages_to_openai(messages)
+        result, system, reasoning = _convert_anthropic_messages_to_openai(messages)
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["role"], "tool")
         self.assertEqual(result[0]["tool_call_id"], "toolu_123")
@@ -5376,7 +5382,7 @@ class ProtocolConversionTests(unittest.TestCase):
                 ],
             }
         ]
-        result, _ = _convert_anthropic_messages_to_openai(messages)
+        result, _, _ = _convert_anthropic_messages_to_openai(messages)
         self.assertEqual(len(result), 1)
         self.assertIn("line 1", result[0]["content"])
         self.assertIn("line 2", result[0]["content"])
@@ -5392,7 +5398,7 @@ class ProtocolConversionTests(unittest.TestCase):
                 ],
             }
         ]
-        result, reasoning = _convert_anthropic_messages_to_openai(messages)
+        result, system, reasoning = _convert_anthropic_messages_to_openai(messages)
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["content"], "The answer is 42.")
         self.assertEqual(reasoning, "Let me reason about this...")
@@ -5409,7 +5415,7 @@ class ProtocolConversionTests(unittest.TestCase):
                 ],
             }
         ]
-        result, _ = _convert_anthropic_messages_to_openai(messages)
+        result, _, _ = _convert_anthropic_messages_to_openai(messages)
         self.assertEqual(len(result[0]["tool_calls"]), 2)
         self.assertEqual(result[0]["tool_calls"][0]["function"]["name"], "read")
         self.assertEqual(result[0]["tool_calls"][1]["function"]["name"], "write")
@@ -5425,7 +5431,7 @@ class ProtocolConversionTests(unittest.TestCase):
                 ],
             }
         ]
-        result, _ = _convert_anthropic_messages_to_openai(messages)
+        result, _, _ = _convert_anthropic_messages_to_openai(messages)
         self.assertEqual(len(result), 2)
         self.assertEqual(result[0]["role"], "user")
         self.assertEqual(result[0]["content"], "Here's the result:")
@@ -5435,7 +5441,7 @@ class ProtocolConversionTests(unittest.TestCase):
     def test_convert_skips_non_dict_messages(self):
         from src.gateway_app import _convert_anthropic_messages_to_openai
         messages = [None, "not a dict", {"role": "user", "content": "ok"}]
-        result, _ = _convert_anthropic_messages_to_openai(messages)
+        result, _, _ = _convert_anthropic_messages_to_openai(messages)
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["content"], "ok")
 
@@ -5542,6 +5548,93 @@ class ProtocolConversionTests(unittest.TestCase):
         self.assertNotIn("thinking", payload)
         self.assertNotIn("context_management", payload)
 
+    def test_round_trip_anthropic_to_openai_chat(self):
+        """Anthropic request -> OpenAI Chat payload preserves message content."""
+        from src.gateway_app import _to_openai_chat_payload
+        body = {
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 1024,
+            "system": "You are helpful.",
+            "messages": [
+                {"role": "user", "content": "What is 2+2?"},
+                {"role": "assistant", "content": "4"},
+                {"role": "user", "content": "Why?"},
+            ],
+        }
+        payload = _to_openai_chat_payload("/v1/messages", body)
+        msgs = payload["messages"]
+        # System message should be first
+        self.assertEqual(msgs[0]["role"], "system")
+        self.assertIn("helpful", msgs[0]["content"])
+        # User messages preserved
+        self.assertEqual(msgs[1]["role"], "user")
+        self.assertEqual(msgs[1]["content"], "What is 2+2?")
+        self.assertEqual(msgs[2]["role"], "assistant")
+        self.assertEqual(msgs[2]["content"], "4")
+        self.assertEqual(msgs[3]["role"], "user")
+        self.assertEqual(msgs[3]["content"], "Why?")
+
+    def test_round_trip_thinking_not_leaked_to_system(self):
+        """Thinking blocks should NOT become system prompt."""
+        from src.gateway_app import _convert_anthropic_messages_to_openai
+        messages = [
+            {"role": "system", "content": "Real system prompt"},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "Let me think..."},
+                {"type": "text", "text": "Hi!"},
+            ]},
+        ]
+        result, system_text, reasoning = _convert_anthropic_messages_to_openai(messages)
+        # System prompt should be preserved, not replaced by thinking
+        self.assertEqual(system_text, "Real system prompt")
+        # Reasoning should be separate
+        self.assertEqual(reasoning, "Let me think...")
+        # Assistant message should have text content
+        assistant = [m for m in result if m["role"] == "assistant"]
+        self.assertEqual(len(assistant), 1)
+        self.assertEqual(assistant[0]["content"], "Hi!")
+
+    def test_convert_response_cross_protocol_anthropic_to_responses(self):
+        """Anthropic upstream response -> Responses downstream format."""
+        from src.gateway_protocol import _convert_response_to_downstream
+        anthropic_response = {
+            "id": "msg_123",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-20250514",
+            "content": [{"type": "text", "text": "Hello!"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+        }
+        result = _convert_response_to_downstream("/v1/responses", anthropic_response, "anthropic_messages")
+        # Should be in Responses format, not Chat format
+        self.assertIn("output", result)
+        self.assertNotIn("choices", result)
+
+    def test_convert_response_cross_protocol_responses_to_anthropic(self):
+        """Responses upstream response -> Anthropic downstream format."""
+        from src.gateway_protocol import _convert_response_to_downstream
+        responses_response = {
+            "id": "resp_123",
+            "object": "response",
+            "model": "gpt-4",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Hi there!"}],
+                }
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+        }
+        result = _convert_response_to_downstream("/v1/messages", responses_response, "openai_responses")
+        # Should be in Anthropic format
+        self.assertIn("content", result)
+        self.assertNotIn("choices", result)
+        # Content should be a list of blocks
+        self.assertIsInstance(result["content"], list)
+
 
 class ContextSummarizationTests(unittest.TestCase):
     """Tests for LLM-based context summarization."""
@@ -5581,13 +5674,12 @@ class ContextSummarizationTests(unittest.TestCase):
 
     def test_summary_cache_hit(self):
         """Same messages should return cached summary."""
-        from src.gateway_app import _SUMMARY_CACHE, _summarize_via_llm
+        from src.gateway_context import _summary_cache_put, _summarize_via_llm
+        import hashlib
         # Pre-populate cache
         test_msgs = [{"role": "user", "content": "test"}]
         content_key = json.dumps(test_msgs, ensure_ascii=False, sort_keys=True)
-        content_hash = str(hash(content_key) & 0xFFFFFFFF)
-        _SUMMARY_CACHE[content_hash] = "cached summary"
+        content_hash = hashlib.sha256(content_key.encode()).hexdigest()[:16]
+        _summary_cache_put(content_hash, "cached summary")
         result = _summarize_via_llm(test_msgs)
         self.assertEqual(result, "cached summary")
-        # Cleanup
-        del _SUMMARY_CACHE[content_hash]
