@@ -777,12 +777,124 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         from .gateway_streaming import run_streaming_orchestration
                         run_streaming_orchestration(self, path, body)
                     else:
-                        from .gateway_tool_runtime import run_tool_orchestration
-                        response = run_tool_orchestration(path, body)
-                        from .gateway_logging import _record_request_stat, _write_request_log
-                        _record_request_stat(path, 200)
-                        _write_request_log(path, body, 200, response, downstream_key)
-                        _json_response(self, 200, response)
+                        # Check semantic cache for non-streaming requests
+                        cache_hit = None
+                        query_text = ""
+                        try:
+                            from .gateway_cache import get_semantic_cache
+                            from .gateway_protocol import _last_user_text
+                            cache = get_semantic_cache()
+                            query_text = _last_user_text(path, body)
+                            if query_text:
+                                cache_hit = cache.get(query_text)
+                        except Exception:
+                            cache_hit = None
+
+                        if cache_hit is not None:
+                            from .gateway_logging import _record_request_stat, _write_request_log
+                            _record_request_stat(path, 200)
+                            _write_request_log(path, body, 200, cache_hit, downstream_key)
+                            _json_response(self, 200, cache_hit)
+                        else:
+                            from .gateway_tool_runtime import run_tool_orchestration
+                            response = run_tool_orchestration(path, body)
+                            # Store in semantic cache if eligible
+                            try:
+                                if query_text and cache_hit is None:
+                                    cache.put(query_text, response)
+                            except Exception:
+                                pass
+                            from .gateway_logging import _record_request_stat, _write_request_log
+                            _record_request_stat(path, 200)
+                            _write_request_log(path, body, 200, response, downstream_key)
+                            _json_response(self, 200, response)
+                return
+            # --- Skill Create ---
+            if path == "/admin/skill-create":
+                if not _check_admin(self):
+                    return
+                import pathlib
+                form = _read_form(self)
+                skill_name = form.get("skill_name", "").strip()
+                skill_content = form.get("skill_content", "").strip()
+                if not skill_name or not skill_content:
+                    _json_response(self, 400, {"error": "skill_name and skill_content required"})
+                    return
+                safe_name = __import__("re").sub(r"[^A-Za-z0-9_.-]+", "-", skill_name).strip("-")
+                skills_dir = pathlib.Path.cwd() / "skills" / safe_name
+                skills_dir.mkdir(parents=True, exist_ok=True)
+                (skills_dir / "SKILL.md").write_text(skill_content, encoding="utf-8")
+                _redirect(self, "/ui#skills")
+                return
+            # --- Skill Install from Marketplace ---
+            if path == "/admin/skill-install.json":
+                if not _check_admin(self):
+                    return
+                body = _read_json(self)
+                skill_id = body.get("id", "").strip()
+                if not skill_id:
+                    _json_response(self, 400, {"error": "id required"})
+                    return
+                try:
+                    from marketplace import get_skill_by_id
+                    skill = get_skill_by_id(skill_id)
+                    if not skill:
+                        _json_response(self, 404, {"error": f"skill not found: {skill_id}"})
+                        return
+                    import pathlib
+                    skills_dir = pathlib.Path.cwd() / "skills" / skill_id
+                    skills_dir.mkdir(parents=True, exist_ok=True)
+                    content = "# " + skill["name"] + "\n\n" + skill.get("description", "") + "\n"
+                    (skills_dir / "SKILL.md").write_text(content, encoding="utf-8")
+                    _json_response(self, 200, {"ok": True, "name": skill_id})
+                except Exception as exc:
+                    _json_response(self, 500, {"error": str(exc)})
+                return
+            # --- Skill Delete ---
+            if path == "/admin/skill-delete.json":
+                if not _check_admin(self):
+                    return
+                body = _read_json(self)
+                skill_name = body.get("name", "").strip()
+                if not skill_name:
+                    _json_response(self, 400, {"error": "name required"})
+                    return
+                import pathlib, shutil
+                skills_dir = pathlib.Path.cwd() / "skills" / skill_name
+                if skills_dir.is_dir():
+                    shutil.rmtree(skills_dir)
+                    _json_response(self, 200, {"ok": True})
+                else:
+                    _json_response(self, 404, {"error": "skill not found"})
+                return
+            # --- MCP Install from Marketplace ---
+            if path == "/admin/mcp-install.json":
+                if not _check_admin(self):
+                    return
+                body = _read_json(self)
+                mcp_id = body.get("id", "").strip()
+                if not mcp_id:
+                    _json_response(self, 400, {"error": "id required"})
+                    return
+                try:
+                    from marketplace import get_mcp_server_by_id
+                    server = get_mcp_server_by_id(mcp_id)
+                    if not server:
+                        _json_response(self, 404, {"error": f"MCP server not found: {mcp_id}"})
+                        return
+                    from .gateway_config import load_config, save_config
+                    cfg = load_config()
+                    mcp_cfg = cfg.setdefault("mcp", {})
+                    servers = mcp_cfg.setdefault("servers", [])
+                    if any(s.get("name") == mcp_id for s in servers):
+                        _json_response(self, 200, {"ok": True, "message": "already installed"})
+                        return
+                    cmd_parts = server.get("install_command", "").split()
+                    servers.append({"name": mcp_id, "command": cmd_parts[0] if cmd_parts else "npx", "args": cmd_parts[1:] if len(cmd_parts) > 1 else [], "enabled": True})
+                    save_config(cfg)
+                    _json_response(self, 200, {"ok": True, "name": mcp_id})
+                except Exception as exc:
+                    _json_response(self, 500, {"error": str(exc)})
                 return
             _json_response(self, 404, _error_payload("not found"))
         except Exception as exc:
