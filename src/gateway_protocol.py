@@ -207,8 +207,15 @@ def _preserve_anthropic_fields(body: Json, payload: Json) -> None:
     for field in ("metadata", "stop_sequences", "stream"):
         if field in body and field not in payload:
             payload[field] = body[field]
-    # Preserve Anthropic-specific fields in gateway_context
+    # Preserve existing gateway_context from the body (e.g. local_planner,
+    # planner_evidence_chars) so that downstream conversion stages can still
+    # detect gateway-local planner activity.
+    existing_ctx = body.get("gateway_context") if isinstance(body.get("gateway_context"), dict) else {}
     gateway_context = payload.setdefault("gateway_context", {})
+    for k, v in existing_ctx.items():
+        if k not in gateway_context:
+            gateway_context[k] = v
+    # Preserve Anthropic-specific fields in gateway_context
     if "thinking" in body:
         gateway_context["anthropic_thinking"] = body["thinking"]
     if "context_management" in body:
@@ -985,6 +992,9 @@ def _responses_to_chat_payload(body: Json) -> Json:
                     },
                 })
         payload["tools"] = chat_tools
+    # Preserve gateway_context (e.g. local_planner) through protocol conversion
+    if isinstance(body.get("gateway_context"), dict):
+        payload["gateway_context"] = body["gateway_context"]
     return payload
 
 

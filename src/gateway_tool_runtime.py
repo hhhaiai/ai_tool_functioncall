@@ -1708,6 +1708,127 @@ def token_count_response(body: Json) -> Json:
     return {"input_tokens": _body_token_estimate(body)}
 
 
+
+def _build_tool_round_response(path: str, calls: list[ToolCall], results: list[ToolResult], fallback_response: Json) -> Json:
+    model = fallback_response.get("model") or _config_env("UPSTREAM_MODEL", "")
+    usage = fallback_response.get("usage") or {"input_tokens": 0, "output_tokens": 0}
+    if "/messages" in path:
+        content: list[dict] = []
+        for call, result in zip(calls, results):
+            content.append({"type": "tool_use", "id": call.call_id, "name": call.name, "input": call.arguments})
+        text = _response_text(path, fallback_response)
+        if text:
+            content.append({"type": "text", "text": text})
+        # Match native tool path: assistant contains tool_use blocks only,
+        # stop_reason "tool_use" signals the client to send tool_result back.
+        # tool_result blocks belong in the user message, not the assistant message.
+        has_tool_use = any(b.get("type") == "tool_use" for b in content)
+        return {
+            "id": fallback_response.get("id") or f"msg_gateway_{uuid.uuid4().hex}",
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": content,
+            "stop_reason": "tool_use" if has_tool_use else "end_turn",
+            "stop_sequence": None,
+            "usage": usage,
+            "gateway_context": {"strategy": "gateway_local_planner_tool_round"},
+        }
+    if "/responses" in path:
+        output_items: list[dict] = []
+        for call in calls:
+            output_items.append({
+                "type": "function_call",
+                "id": f"fc_{uuid.uuid4().hex}",
+                "call_id": call.call_id,
+                "name": call.name,
+                "arguments": json.dumps(call.arguments, ensure_ascii=False),
+            })
+        for result in results:
+            output_items.append({"type": "function_call_output", "call_id": result.call_id, "output": result.content})
+        text = _response_text(path, fallback_response)
+        if text:
+            output_items.append({"type": "message", "content": [{"type": "output_text", "text": text}]})
+        return {
+            "id": fallback_response.get("id") or f"resp_gateway_{uuid.uuid4().hex}",
+            "object": "response",
+            "model": model,
+            "output": output_items,
+            "status": "completed",
+            "usage": usage,
+            "gateway_context": {"strategy": "gateway_local_planner_tool_round"},
+        }
+    tool_calls = []
+    for call in calls:
+        tool_calls.append({
+            "id": call.call_id,
+            "type": "function",
+            "function": {"name": call.name, "arguments": json.dumps(call.arguments, ensure_ascii=False)},
+        })
+    choice = {"index": 0, "message": {"role": "assistant", "content": None, "tool_calls": tool_calls}, "finish_reason": "tool_calls"}
+    return {
+        "id": fallback_response.get("id") or f"chatcmpl_gateway_{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "model": model,
+        "choices": [choice],
+        "usage": usage,
+        "gateway_context": {"strategy": "gateway_local_planner_tool_round"},
+    }
+
+
+def _collect_synthetic_upstream_calls(path: str, response: Json) -> tuple[list[ToolCall], list[ToolResult]]:
+    calls = _extract_tool_calls(path, response) or _extract_text_tool_calls(path, response)
+    return calls, []
+
+
+def _has_tool_result_in_messages(path: str, body: Json) -> bool:
+    """Return True if the request already contains tool_result blocks,
+    meaning the client (e.g. Claude Code) already processed tool_use and
+    sent back results.  In that case the gateway must NOT re-surface
+    planner tool rounds to avoid an infinite loop."""
+    messages = body.get("messages") or body.get("input") or []
+    if not isinstance(messages, list):
+        return False
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") in ("tool_result", "function_call_output"):
+                    return True
+        # Also check for tool role messages (OpenAI chat format)
+        if msg.get("role") == "tool":
+            return True
+    return False
+
+
+def _collect_local_planner_tool_rounds(path: str, body: Json) -> tuple[list[ToolCall], list[ToolResult]]:
+    ctx = body.get("gateway_context") if isinstance(body.get("gateway_context"), dict) else {}
+    if not ctx.get("local_planner"):
+        return [], []
+    # If the client already sent back tool_result blocks, the tools were
+    # already surfaced in a previous turn — do not surface again.
+    if _has_tool_result_in_messages(path, body):
+        return [], []
+    user_text = _last_user_text(path, body)
+    if not user_text:
+        return [], []
+    calls: list[ToolCall] = []
+    results: list[ToolResult] = []
+    def run(name: str, arguments: dict) -> None:
+        call = ToolCall(f"planner_surfaced_{uuid.uuid4().hex}", name, arguments, {"gateway_local_planner_surface": True})
+        result = _execute_tool_call(call, provider="local_planner_surface")
+        if result.success:
+            calls.append(call)
+            results.append(result)
+    run("Tree", {"path": ".", "max_depth": 3, "max_entries": 300})
+    files = _select_local_planner_files(user_text, max(1, min(int(_gateway_config().get("local_planner_max_files") or 24), 12)))
+    if files:
+        run("ReadManyFiles", {"paths": files, "max_files": len(files), "max_bytes_per_file": max(2000, min(int(_gateway_config().get("local_planner_max_bytes_per_file") or 24000), 48000))})
+    return calls, results
+
+
 def run_tool_orchestration(path: str, body: Json, client: NativeProxyClient | None = None) -> Json:
     with _workspace_scope(_request_workspace_root(body)):
         return _run_tool_orchestration_scoped(path, body, client)
@@ -1858,6 +1979,19 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
             calls = _detect_intent_tool_calls(path, downstream_response, body)
             text_fallback = bool(calls)
         if not calls:
+            # If the gateway already executed local planner tools, surface those
+            # results to the downstream client as explicit tool rounds instead of
+            # returning a plain assistant text response.  Weak upstreams often
+            # ignore injected evidence and answer "I will read the file" even
+            # though the gateway already executed the read.
+            planner_calls, planner_results = _collect_local_planner_tool_rounds(path, request_body)
+            if planner_calls and planner_results:
+                synthetic_calls, synthetic_results = _collect_synthetic_upstream_calls(path, downstream_response)
+                all_calls = planner_calls + synthetic_calls
+                all_results = planner_results + synthetic_results
+                response = _build_tool_round_response(path, all_calls, all_results, downstream_response)
+                _remember_conversation_turn(path, body, response)
+                return response
             _remember_conversation_turn(path, body, downstream_response)
             return downstream_response
 
@@ -1870,9 +2004,20 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
         # and upstream doesn't support native tools. Config can override.
         cfg_delegate = _gateway_config().get("delegate_tools_to_downstream")
         if cfg_delegate is None:
-            # Default: delegate for coding agent clients (Anthropic/OpenAI endpoints)
-            delegate = path in ("/v1/messages", "/v1/chat/completions", "/v1/responses",
-                               "/anthropic/v1/messages")
+            # Default: delegate for downstream coding-agent endpoints, but only when
+            # the upstream already produced native protocol-level tool calls.
+            # For weak upstreams the gateway must run tools locally, otherwise
+            # Claude Code / Codex receives an unexecuted tool_use/tool_calls response.
+            _upstream_cfg_delegate = _upstream_config()
+            _upstream_caps_delegate = _upstream_cfg_delegate.get("capabilities") if isinstance(_upstream_cfg_delegate.get("capabilities"), dict) else {}
+            _native_capable_delegate = (
+                bool(_upstream_caps_delegate.get("supports_tools", _upstream_cfg_delegate.get("supports_tools", True)))
+                and bool(_upstream_caps_delegate.get("supports_function_calls", _upstream_cfg_delegate.get("supports_function_calls", True)))
+            )
+            delegate = (
+                path in ("/v1/messages", "/v1/chat/completions", "/v1/responses", "/anthropic/v1/messages")
+                and (not text_fallback or _native_capable_delegate)
+            )
         else:
             delegate = bool(cfg_delegate)
         if text_fallback and delegate:
