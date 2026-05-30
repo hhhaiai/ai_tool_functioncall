@@ -266,6 +266,7 @@ start_launchd() {
   echo
 }
 
+
 wait_health() {
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     if curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1; then return 0; fi
@@ -329,6 +330,7 @@ start_background() {
   curl -fsS "http://127.0.0.1:${PORT}/healthz" || true
   echo
 }
+
 
 stop_service() {
   if command -v launchctl >/dev/null 2>&1; then
