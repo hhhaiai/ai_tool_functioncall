@@ -5683,3 +5683,137 @@ class ContextSummarizationTests(unittest.TestCase):
         _summary_cache_put(content_hash, "cached summary")
         result = _summarize_via_llm(test_msgs)
         self.assertEqual(result, "cached summary")
+
+
+class WeakUpstreamToolRoundSurfacingTests(unittest.TestCase):
+    """Regression: weak upstreams that return no tool calls must still surface
+    gateway-local planner tool rounds to the downstream client across all
+    three protocol paths (/v1/chat/completions, /v1/messages, /v1/responses)."""
+
+    def _setup_workspace(self):
+        td = tempfile.mkdtemp()
+        readme = pathlib.Path(td) / "README.md"
+        readme.write_text("# TestProject\n\nThis is a test.\n", encoding="utf-8")
+        return td
+
+    def _run(self, path, body, upstream_protocol="openai_chat"):
+        """Run orchestration with a FakeClient that returns plain text (no tool calls)."""
+        from src.gateway_config import save_config
+        td = self._setup_workspace()
+        old_config = gateway.CONFIG_PATH
+        old_cwd = os.getcwd()
+        old_ws = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+        try:
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            cfg = gateway._default_config()
+            cfg["gateway"]["workspace_root"] = td
+            cfg["gateway"]["tool_mode"] = "orchestrate"
+            cfg["gateway"]["local_planner_enabled"] = True
+            cfg["upstream"]["tools_enabled"] = "adapter"
+            cfg["upstream"]["protocol"] = upstream_protocol
+            cfg["upstream"]["capabilities"] = {
+                "supports_tools": False,
+                "supports_function_calls": False,
+            }
+            gateway.save_config(cfg)
+            os.chdir(td)
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = td
+
+            # Weak upstream returns plain assistant text, no tool calls
+            if upstream_protocol == "anthropic_messages":
+                weak_resp = {"id": "m1", "type": "message", "role": "assistant", "model": "weak",
+                             "content": [{"type": "text", "text": "我来读取文件"}],
+                             "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}}
+            elif upstream_protocol == "openai_responses":
+                weak_resp = {"id": "r1", "object": "response", "model": "weak", "status": "completed",
+                             "output": [{"type": "message", "content": [{"type": "output_text", "text": "我来读取文件"}]}],
+                             "usage": {"input_tokens": 1, "output_tokens": 1}}
+            else:
+                weak_resp = {"id": "c1", "choices": [{"message": {"role": "assistant", "content": "我来读取文件"},
+                                                       "finish_reason": "stop"}],
+                             "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+
+            client = FakeClient([weak_resp])
+            result = run_tool_orchestration(path, body, client)
+            return result
+        finally:
+            gateway.CONFIG_PATH = old_config
+            os.chdir(old_cwd)
+            if old_ws is None:
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+            else:
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = old_ws
+
+    def test_chat_completions_surfaces_tool_rounds(self):
+        result = self._run("/v1/chat/completions", {
+            "model": "weak",
+            "messages": [{"role": "user", "content": "分析这套项目 README.md"}],
+            "tools": [{"type": "function", "function": {"name": "Read", "description": "read",
+                       "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}],
+        })
+        choice = (result.get("choices") or [{}])[0]
+        msg = choice.get("message") or {}
+        self.assertTrue(bool(msg.get("tool_calls")), "should have tool_calls")
+        self.assertEqual(choice.get("finish_reason"), "tool_calls")
+        self.assertEqual((result.get("gateway_context") or {}).get("strategy"), "gateway_local_planner_tool_round")
+
+    def test_messages_surfaces_tool_use_blocks(self):
+        result = self._run("/v1/messages", {
+            "model": "weak",
+            "messages": [{"role": "user", "content": "分析这套项目 README.md"}],
+            "max_tokens": 4096,
+        })
+        content = result.get("content") or []
+        tool_use = [b for b in content if b.get("type") == "tool_use"]
+        self.assertTrue(bool(tool_use), "should have tool_use blocks")
+        # tool_result blocks must NOT be in assistant message (protocol violation)
+        tool_result = [b for b in content if b.get("type") == "tool_result"]
+        self.assertFalse(tool_result, "tool_result should not be in assistant message")
+        # stop_reason must be tool_use to signal client to send tool_result back
+        self.assertEqual(result.get("stop_reason"), "tool_use")
+        self.assertEqual((result.get("gateway_context") or {}).get("strategy"), "gateway_local_planner_tool_round")
+
+    def test_responses_surfaces_function_call_items(self):
+        result = self._run("/v1/responses", {
+            "model": "weak",
+            "input": "分析这套项目 README.md",
+        })
+        output = result.get("output") or []
+        fc = [o for o in output if o.get("type") == "function_call"]
+        fco = [o for o in output if o.get("type") == "function_call_output"]
+        self.assertTrue(bool(fc), "should have function_call items")
+        self.assertTrue(bool(fco), "should have function_call_output items")
+        self.assertEqual((result.get("gateway_context") or {}).get("strategy"), "gateway_local_planner_tool_round")
+
+    def test_direct_read_preserves_context_through_protocol_conversion(self):
+        """When direct_read fires, gateway_context.local_planner must survive
+        _to_openai_chat_payload for the /v1/messages path."""
+        result = self._run("/v1/messages", {
+            "model": "weak",
+            "messages": [{"role": "user", "content": "读取 README.md"}],
+            "max_tokens": 4096,
+        })
+        self.assertEqual((result.get("gateway_context") or {}).get("strategy"), "gateway_local_planner_tool_round",
+                         "direct_read planner must survive protocol conversion")
+
+    def test_tool_result_in_request_prevents_re_surfacing(self):
+        """When Claude Code sends back tool_result blocks (from a previous
+        tool_use turn), the gateway must NOT re-surface planner tool rounds
+        to avoid an infinite loop."""
+        result = self._run("/v1/messages", {
+            "model": "weak",
+            "messages": [
+                {"role": "user", "content": "分析这套项目 README.md"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_1", "name": "Tree", "input": {"path": "."}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_1", "content": "tree output"},
+                ]},
+            ],
+            "max_tokens": 4096,
+        })
+        # Should return upstream's plain text, NOT re-surface tool rounds
+        self.assertNotEqual((result.get("gateway_context") or {}).get("strategy"),
+                            "gateway_local_planner_tool_round",
+                            "must not re-surface tool rounds when tool_result is present")
