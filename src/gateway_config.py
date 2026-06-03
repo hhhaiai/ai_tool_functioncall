@@ -456,16 +456,41 @@ def _normalize_upstream_profile(profile: Json, *, fallback_name: str = "default"
 
 
 def _sync_active_upstream(config: Json) -> Json:
+    """Reconcile ``upstream`` with ``upstream_profiles`` and write back.
+
+    The Admin UI edits the single ``upstream`` object, but older sessions also
+    keep a per-profile list (``upstream_profiles``).  When the two diverge the
+    stale profile wins, silently reverting the user's last edit (e.g. switching
+    the active protocol or capability flags).  To avoid that, the active
+    profile is rebuilt from the user-edited top-level ``upstream`` with env
+    defaults only filling in fields the user did not set.
+    """
+    main = config.get("upstream") if isinstance(config.get("upstream"), dict) else {}
+    env_default = _default_config()["upstream"]
     profiles = config.get("upstream_profiles")
     if not isinstance(profiles, list) or not profiles:
-        base = copy.deepcopy(config.get("upstream", {}) if isinstance(config.get("upstream"), dict) else {})
+        base = copy.deepcopy(main)
         base.setdefault("name", "default")
         base.setdefault("id", "default")
         profiles = [base]
+    main_id = str(main.get("id") or "") if isinstance(main, dict) else ""
+
     normalized: list[Json] = []
     seen: set[str] = set()
     for index, item in enumerate(profiles):
         prof = _normalize_upstream_profile(item, fallback_name=f"profile-{index}")
+        is_active = bool(main_id) and str(prof.get("id") or "") == main_id
+        if is_active and isinstance(main, dict) and main:
+            # Rebuild from the user-edited top-level upstream; only fall back to
+            # env defaults for keys the user never set.
+            rebuilt = copy.deepcopy(env_default)
+            _deep_update(rebuilt, copy.deepcopy(main))
+            # Preserve the profile's id/name if main did not override them
+            rebuilt.setdefault("id", prof.get("id") or "default")
+            rebuilt["name"] = str(
+                main.get("name") or prof.get("name") or rebuilt.get("id") or "default"
+            )
+            prof = rebuilt
         pid = prof["id"]
         if pid in seen:
             pid = f"{pid}-{index}"
@@ -473,7 +498,7 @@ def _sync_active_upstream(config: Json) -> Json:
         seen.add(pid)
         normalized.append(prof)
     config["upstream_profiles"] = normalized
-    active_id = str(config.get("active_upstream_id") or "")
+    active_id = str(config.get("active_upstream_id") or "") or main_id
     if not active_id or active_id not in seen:
         active_id = normalized[0]["id"]
     config["active_upstream_id"] = active_id
@@ -626,6 +651,29 @@ def _upstream_config() -> Json:
 
 def _gateway_config() -> Json:
     return load_config().get("gateway", {})
+
+
+def _headroom_max_input_tokens() -> int:
+    """Token budget the headroom compressor should target for the upstream body.
+
+    Defaults to the upstream profile's ``max_input_tokens`` if set, else
+    ``GATEWAY_HEADROOM_MAX_INPUT_TOKENS`` env override, else a safe 16K
+    (≈ 48 KB raw, well under typical weak-relay caps around 50-100 KB).
+    """
+    try:
+        env_value = int(os.environ.get("GATEWAY_HEADROOM_MAX_INPUT_TOKENS") or 0)
+    except (TypeError, ValueError):
+        env_value = 0
+    if env_value > 0:
+        return env_value
+    cfg = _upstream_config()
+    try:
+        upstream_value = int(cfg.get("max_input_tokens") or 0)
+    except (TypeError, ValueError):
+        upstream_value = 0
+    if upstream_value > 0:
+        return upstream_value
+    return 16000
 
 
 def _configured_upstream_path(path: str) -> str:

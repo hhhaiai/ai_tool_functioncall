@@ -161,11 +161,21 @@ class NativeProxyClient:
         return self._do_request("POST", path, body)
 
     def forward(self, path: str, body: Json) -> Json:
-        from .gateway_config import _force_upstream_stream_aggregate
+        from .gateway_config import _force_upstream_stream_aggregate, _headroom_max_input_tokens
         from .gateway_protocol import _convert_request_to_upstream, _convert_response_to_downstream
+        from .gateway_headroom import headroom_compress
         upstream_path, upstream_body = _convert_request_to_upstream(path, body, self.protocol)
         if _force_upstream_stream_aggregate():
             upstream_body = dict(upstream_body)
             upstream_body["stream"] = True
+        # Headroom-style progressive compression: weak upstream relays (e.g.
+        # anthropic -> openai -> mimo chains) cap request size well below the
+        # advertised window.  If the body exceeds the configured per-request
+        # cap, layer transforms (tool result crushing, history trim, system
+        # prompt marker) until we fit.  This keeps the request alive instead
+        # of the upstream returning a generic ``text too long`` refusal.
+        max_tokens = _headroom_max_input_tokens()
+        if max_tokens > 0:
+            upstream_body = headroom_compress(upstream_body, target_tokens=max_tokens)
         response = self.post(upstream_path, upstream_body)
         return _convert_response_to_downstream(path, response, self.protocol)
