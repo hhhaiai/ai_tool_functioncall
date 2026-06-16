@@ -109,18 +109,75 @@ class NativeProxyClient:
             return cls._opener_cache[key]
 
     def _do_request_once(self, method: str, url: str, headers: dict[str, str], data: bytes | None) -> Json:
-        req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        resp = self._opener.open(req, timeout=self.timeout)
+        # Use curl subprocess for better compatibility with non-standard servers
+        import subprocess
+        import tempfile
+
+        # Build curl command
+        cmd = ["curl", "-s", "-X", method, url, "-w", "\n__HTTP_CODE__%{http_code}"]
+        for key, value in headers.items():
+            cmd.extend(["-H", f"{key}: {value}"])
+
+        if data:
+            # Write data to temp file for large payloads
+            with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.json') as f:
+                f.write(data)
+                temp_file = f.name
+            cmd.extend(["--data-binary", f"@{temp_file}"])
+
         try:
-            response_data = resp.read().decode("utf-8")
-            content_type = resp.headers.get("content-type", "")
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=self.timeout,
+                check=False
+            )
+
+            if data:
+                try:
+                    os.unlink(temp_file)
+                except:
+                    pass
+
+            output = result.stdout.decode('utf-8')
+
+            # Extract HTTP status code
+            if "\n__HTTP_CODE__" in output:
+                response_data, status_line = output.rsplit("\n__HTTP_CODE__", 1)
+                status_code = int(status_line.strip())
+            else:
+                response_data = output
+                status_code = 200
+
+            if status_code >= 400:
+                from .gateway_errors import UpstreamHTTPError
+                try:
+                    error_detail = json.loads(response_data) if response_data else {}
+                except:
+                    error_detail = {"raw": response_data}
+                raise UpstreamHTTPError(
+                    f"upstream returned {status_code}",
+                    upstream_status=status_code,
+                    detail=error_detail
+                )
+
             if response_data:
-                if "text/event-stream" in content_type or response_data.lstrip().startswith("data:"):
+                if response_data.lstrip().startswith("data:"):
                     return self._aggregate_sse_response(response_data)
-                return json.loads(response_data)
+                try:
+                    return json.loads(response_data)
+                except json.JSONDecodeError:
+                    return {"text": response_data}
             return {}
-        finally:
-            resp.close()
+
+        except subprocess.TimeoutExpired:
+            from .gateway_errors import GatewayError
+            raise GatewayError(f"upstream request timeout after {self.timeout}s")
+        except Exception as e:
+            if "UpstreamHTTPError" in type(e).__name__ or "GatewayError" in type(e).__name__:
+                raise
+            from .gateway_errors import GatewayError
+            raise GatewayError(f"upstream request failed: {e}") from e
 
     def _do_request(self, method: str, path: str, body: Json | None = None) -> Json:
         url = self._url(path)

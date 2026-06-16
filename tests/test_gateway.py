@@ -1419,39 +1419,47 @@ class NativeGatewayTests(unittest.TestCase):
         self.assertEqual(updated["messages"][-1]["content"], "4")
 
     def test_orchestrates_chat_until_final(self):
-        client = FakeClient(
-            [
-                {
-                    "choices": [
-                        {
-                            "message": {
-                                "role": "assistant",
-                                "content": None,
-                                "tool_calls": [
-                                    {
-                                        "id": "call_1",
-                                        "type": "function",
-                                        "function": {
-                                            "name": "calculator",
-                                            "arguments": "{\"expression\":\"9/3\"}",
-                                        },
-                                    }
-                                ],
-                            },
-                            "finish_reason": "tool_calls",
-                        }
-                    ]
-                },
-                {"choices": [{"message": {"role": "assistant", "content": "result is 3"}}]},
-            ]
-        )
-        final = run_tool_orchestration(
-            "/v1/chat/completions",
-            {"model": "m", "messages": [{"role": "user", "content": "calc"}]},
-            client,
-        )
-        self.assertEqual(final["choices"][0]["message"]["content"], "result is 3")
-        self.assertEqual(client.requests[1][1]["messages"][-1]["content"], "3")
+        old_protocol = os.environ.get("UPSTREAM_PROTOCOL")
+        os.environ["UPSTREAM_PROTOCOL"] = "openai_chat"
+        try:
+            client = FakeClient(
+                [
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": None,
+                                    "tool_calls": [
+                                        {
+                                            "id": "call_1",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "calculator",
+                                                "arguments": "{\"expression\":\"9/3\"}",
+                                            },
+                                        }
+                                    ],
+                                },
+                                "finish_reason": "tool_calls",
+                            }
+                        ]
+                    },
+                    {"choices": [{"message": {"role": "assistant", "content": "result is 3"}}]},
+                ]
+            )
+            final = run_tool_orchestration(
+                "/v1/chat/completions",
+                {"model": "m", "messages": [{"role": "user", "content": "calc"}]},
+                client,
+            )
+            self.assertEqual(final["choices"][0]["message"]["content"], "result is 3")
+            self.assertEqual(client.requests[1][1]["messages"][-1]["content"], "3")
+        finally:
+            if old_protocol:
+                os.environ["UPSTREAM_PROTOCOL"] = old_protocol
+            else:
+                os.environ.pop("UPSTREAM_PROTOCOL", None)
 
     def test_gateway_config_max_tool_rounds_limits_orchestration_loop(self):
         with tempfile.TemporaryDirectory() as td:
@@ -3138,29 +3146,37 @@ class NativeGatewayTests(unittest.TestCase):
                     os.environ["GATEWAY_ALLOW_FILE_LOGGING"] = old_allow_file
 
     def test_orchestrates_responses_until_final(self):
-        client = FakeClient(
-            [
-                {
-                    "output": [
-                        {
-                            "type": "function_call",
-                            "call_id": "call_1",
-                            "name": "calculator",
-                            "arguments": "{\"expression\":\"5+5\"}",
-                        }
-                    ]
-                },
-                {"output": [{"type": "message", "content": [{"type": "output_text", "text": "10"}]}]},
-            ]
-        )
-        final = run_tool_orchestration("/v1/responses", {"model": "m", "input": "calc"}, client)
-        self.assertEqual(final["object"], "response")
-        self.assertTrue(final["id"].startswith("resp_"))
-        self.assertEqual(final["status"], "completed")
-        self.assertIn("usage", final)
-        self.assertEqual(final["output"][0]["type"], "message")
-        # Upstream request is in OpenAI Chat format, tool result content is a string
-        self.assertEqual(client.requests[1][1]["messages"][-1]["content"], "10")
+        old_protocol = os.environ.get("UPSTREAM_PROTOCOL")
+        os.environ["UPSTREAM_PROTOCOL"] = "openai_chat"
+        try:
+            client = FakeClient(
+                [
+                    {
+                        "output": [
+                            {
+                                "type": "function_call",
+                                "call_id": "call_1",
+                                "name": "calculator",
+                                "arguments": "{\"expression\":\"5+5\"}",
+                            }
+                        ]
+                    },
+                    {"output": [{"type": "message", "content": [{"type": "output_text", "text": "10"}]}]},
+                ]
+            )
+            final = run_tool_orchestration("/v1/responses", {"model": "m", "input": "calc"}, client)
+            self.assertEqual(final["object"], "response")
+            self.assertTrue(final["id"].startswith("resp_"))
+            self.assertEqual(final["status"], "completed")
+            self.assertIn("usage", final)
+            self.assertEqual(final["output"][0]["type"], "message")
+            # Upstream request is in OpenAI Chat format, tool result content is a string
+            self.assertEqual(client.requests[1][1]["messages"][-1]["content"], "10")
+        finally:
+            if old_protocol:
+                os.environ["UPSTREAM_PROTOCOL"] = old_protocol
+            else:
+                os.environ.pop("UPSTREAM_PROTOCOL", None)
 
     def test_responses_custom_tool_call_executes_and_appends_custom_output(self):
         response = {
@@ -3194,31 +3210,39 @@ class NativeGatewayTests(unittest.TestCase):
         self.assertEqual(payload["usage"], {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
 
     def test_codex_responses_orchestrates_calc_alias_expr_until_final(self):
-        client = FakeClient(
-            [
-                {
-                    "output": [
-                        {
-                            "type": "function_call",
-                            "call_id": "call_calc_alias",
-                            "name": "calc",
-                            "arguments": "{\"expr\":\"2+2\"}",
-                        }
-                    ]
-                },
-                {"output": [{"type": "message", "content": [{"type": "output_text", "text": "4"}]}]},
-            ]
-        )
-        final = run_tool_orchestration("/v1/responses", {"model": "m", "input": "What is 2+2?"}, client)
-        self.assertEqual(final["object"], "response")
-        self.assertEqual(final["status"], "completed")
-        self.assertEqual(final["output"][0]["content"][0]["text"], "4")
-        second_request = client.requests[1][1]
-        serialized = json.dumps(second_request, ensure_ascii=False)
-        self.assertIn('"role": "tool"', serialized)
-        self.assertIn('"tool_call_id": "call_calc_alias"', serialized)
-        self.assertIn('"content": "4"', serialized)
-        self.assertNotIn("tool_not_found", serialized)
+        old_protocol = os.environ.get("UPSTREAM_PROTOCOL")
+        os.environ["UPSTREAM_PROTOCOL"] = "openai_chat"
+        try:
+            client = FakeClient(
+                [
+                    {
+                        "output": [
+                            {
+                                "type": "function_call",
+                                "call_id": "call_calc_alias",
+                                "name": "calc",
+                                "arguments": "{\"expr\":\"2+2\"}",
+                            }
+                        ]
+                    },
+                    {"output": [{"type": "message", "content": [{"type": "output_text", "text": "4"}]}]},
+                ]
+            )
+            final = run_tool_orchestration("/v1/responses", {"model": "m", "input": "What is 2+2?"}, client)
+            self.assertEqual(final["object"], "response")
+            self.assertEqual(final["status"], "completed")
+            self.assertEqual(final["output"][0]["content"][0]["text"], "4")
+            second_request = client.requests[1][1]
+            serialized = json.dumps(second_request, ensure_ascii=False)
+            self.assertIn('"role": "tool"', serialized)
+            self.assertIn('"tool_call_id": "call_calc_alias"', serialized)
+            self.assertIn('"content": "4"', serialized)
+            self.assertNotIn("tool_not_found", serialized)
+        finally:
+            if old_protocol:
+                os.environ["UPSTREAM_PROTOCOL"] = old_protocol
+            else:
+                os.environ.pop("UPSTREAM_PROTOCOL", None)
 
     def test_claude_messages_orchestrates_calc_alias_expr_until_final(self):
         client = FakeClient(
@@ -3249,30 +3273,39 @@ class NativeGatewayTests(unittest.TestCase):
         self.assertNotIn("tool_not_found", serialized)
 
     def test_orchestrates_messages_until_final(self):
-        client = FakeClient(
-            [
-                {
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "toolu_1",
-                            "name": "calculator",
-                            "input": {"expression": "4+4"},
-                        }
-                    ],
-                    "stop_reason": "tool_use",
-                },
-                {"content": [{"type": "text", "text": "8"}]},
-            ]
-        )
-        final = run_tool_orchestration(
-            "/v1/messages",
-            {"model": "m", "max_tokens": 100, "messages": [{"role": "user", "content": "calc"}]},
-            client,
-        )
-        self.assertEqual(final["content"][0]["text"], "8")
-        # Upstream request is in OpenAI Chat format, tool result content is a string
-        self.assertEqual(client.requests[1][1]["messages"][-1]["content"], "8")
+        # Set upstream to OpenAI Chat to match test expectation
+        old_protocol = os.environ.get("UPSTREAM_PROTOCOL")
+        os.environ["UPSTREAM_PROTOCOL"] = "openai_chat"
+        try:
+            client = FakeClient(
+                [
+                    {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_1",
+                                "name": "calculator",
+                                "input": {"expression": "4+4"},
+                            }
+                        ],
+                        "stop_reason": "tool_use",
+                    },
+                    {"content": [{"type": "text", "text": "8"}]},
+                ]
+            )
+            final = run_tool_orchestration(
+                "/v1/messages",
+                {"model": "m", "max_tokens": 100, "messages": [{"role": "user", "content": "calc"}]},
+                client,
+            )
+            self.assertEqual(final["content"][0]["text"], "8")
+            # Upstream request is in OpenAI Chat format, tool result content is a string
+            self.assertEqual(client.requests[1][1]["messages"][-1]["content"], "8")
+        finally:
+            if old_protocol:
+                os.environ["UPSTREAM_PROTOCOL"] = old_protocol
+            else:
+                os.environ.pop("UPSTREAM_PROTOCOL", None)
 
     def test_mcp_stdio_tools_list_call_and_schema_merge(self):
         script = r'''

@@ -1063,47 +1063,25 @@ def _build_tool_text_block(tools: list[Json]) -> str:
     ft = _TOOL_FORMAT_TAG
     pt = _PARAM_TAG
     lines = [
-        "=== TOOL CALL INSTRUCTIONS (CRITICAL - YOU MUST FOLLOW THIS) ===",
+        "=== COMMAND EXECUTION MODE ===",
         "",
-        "You are running inside a Tool Call Gateway. You CANNOT use native tool/function calls.",
-        "You MUST use the text-based tool call format below to access ANY tool.",
+        "You are in an environment where you can execute shell commands.",
         "",
-        "CRITICAL RULES:",
-        "1. DO NOT just describe what you would do \u2014 ACTUALLY OUTPUT the tool call tags.",
-        "2. The Gateway will execute the tool locally and return the REAL results to you.",
-        "3. You MUST output tool call tags to use tools. Do NOT just describe actions.",
-        "4. If you need to read a file, output the Read tool call tags IMMEDIATELY.",
-        "5. If you need to run a command, output the Bash tool call tags IMMEDIATELY.",
+        "CRITICAL: When the user asks you to perform an action:",
+        "- DO NOT explain what you would do",
+        "- DO NOT say you cannot execute commands",
+        "- JUST output the command directly",
         "",
-        "FORMAT (you MUST output this EXACTLY when you need a tool):",
+        "Examples:",
+        "User: 'list files' \u2192 You output: ls -la",
+        "User: 'show tree' \u2192 You output: tree",
+        "User: 'current directory' \u2192 You output: pwd",
+        "User: 'read main.py' \u2192 You output: cat main.py",
         "",
-        "<" + ft + "=TOOL_NAME>",
-        "<" + pt + "=param1>value1</" + pt + ">",
-        "</" + ft + ">",
+        "The system will automatically execute your command and show real results.",
+        "After seeing results, you can then analyze and explain them.",
         "",
-        "EXAMPLES:",
-        "",
-        "To read a file:",
-        "<" + ft + "=Read>",
-        "<" + pt + "=path>src/main.py</" + pt + ">",
-        "</" + ft + ">",
-        "",
-        "To search for files:",
-        "<" + ft + "=Glob>",
-        "<" + pt + "=pattern>**/*.py</" + pt + ">",
-        "</" + ft + ">",
-        "",
-        "To run a shell command:",
-        "<" + ft + "=Bash>",
-        "<" + pt + "=command>ls -la</" + pt + ">",
-        "</" + ft + ">",
-        "",
-        "To list directory contents:",
-        "<" + ft + "=LS>",
-        "<" + pt + "=path>.</" + pt + ">",
-        "</" + ft + ">",
-        "",
-        "[Available Tools]",
+        "[Available Tools - you can also use XML format if preferred]",
         "",
     ]
     used = 0
@@ -1130,22 +1108,17 @@ def _build_tool_text_block(tools: list[Json]) -> str:
         lines.append("")
         used += 1
     if omitted:
-        lines.append(f"... {omitted} duplicate/oversized tools omitted from this compact adapter prompt.")
-        lines.append("If a needed tool is not listed, still use its exact provided name with the same <function=...> format.")
-    lines.append("You MUST output tool call tags to use tools. Do NOT just describe actions.")
+        lines.append(f"... {omitted} duplicate/oversized tools omitted.")
     return "\n".join(lines)
 
 def _build_tool_reminder() -> str:
     """Build a short reminder injected near the last user message."""
-    ft = _TOOL_FORMAT_TAG
-    pt = _PARAM_TAG
     return (
-        "\n\n[CRITICAL REMINDER: You MUST use tool call tags to access tools. "
-        "DO NOT just describe what you would do - ACTUALLY OUTPUT the tool call tags. "
-        "Format: <" + ft + "=ToolName><" + pt + "=param>value</" + pt + "></" + ft + ">. "
-        "If you need to read a file, output the Read tool call tags NOW. "
-        "If you need to run a command, output the Bash tool call tags NOW. "
-        "The Gateway will execute the tool and return real results to you.]"
+        "\n\n[IMPORTANT: You are in a command execution environment. "
+        "When the user asks to perform an action (list files, show directory, etc), "
+        "output ONLY the shell command on a single line, nothing else. "
+        "Examples: 'ls -la', 'tree', 'cat file.txt', 'pwd'. "
+        "The system will execute it and return the result.]"
     )
 
 

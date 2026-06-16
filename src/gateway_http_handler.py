@@ -582,7 +582,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     if invalid_field is not None:
                         _json_response(self, 400, _error_payload(f"invalid numeric field: {invalid_field}"))
                         return
-                    gateway_cfg["workspace_root"] = form.get("workspace_root", gateway_cfg.get("workspace_root", ""))
+                    # Note: workspace_root is NOT saved - it's a runtime field determined per-request from client metadata
                     gateway_cfg["allow_write_tools"] = form.get("allow_write_tools", "") != ""
                     gateway_cfg["allow_shell_tools"] = form.get("allow_shell_tools", "") != ""
                     gateway_cfg["request_logging"] = form.get("request_logging", "") != ""
@@ -756,6 +756,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 from .gateway_tool_runtime import _request_slot_scope
                 with _request_slot_scope():
                     body = _read_json(self)
+
                     if path in TOKEN_COUNT_PATHS:
                         from .gateway_tool_runtime import token_count_response
                         response = token_count_response(body)

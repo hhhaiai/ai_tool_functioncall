@@ -73,14 +73,33 @@ class ToolCall:
     raw: Json
 
 def _workspace_root():
+    """Get the workspace root.
+
+    SECURITY: Returns client-provided workspace or isolated anonymous space.
+    Never returns Gateway server directories.
+    """
+    import sys
     override = _WORKSPACE_ROOT_OVERRIDE.get()
+    print(f"[DEBUG] _workspace_root called, override={override}", file=sys.stderr, flush=True)
     if override is not None:
-        return pathlib.Path(override).resolve()
+        result = pathlib.Path(override).resolve()
+        print(f"[DEBUG] _workspace_root returning override: {result}", file=sys.stderr, flush=True)
+        return result
+
+    # Only allow explicit env var (for testing)
     env_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
     if env_root:
-        return pathlib.Path(env_root).resolve()
-    from .gateway_config import _gateway_config
-    return pathlib.Path(_gateway_config().get("workspace_root") or os.getcwd()).resolve()
+        result = pathlib.Path(env_root).resolve()
+        print(f"[DEBUG] _workspace_root returning env: {result}", file=sys.stderr, flush=True)
+        return result
+
+    # This should never happen as _request_workspace_root always provides a path
+    # (either client workspace or anonymous space), but fail safely if it does
+    print(f"[DEBUG] _workspace_root: NO WORKSPACE AVAILABLE!", file=sys.stderr, flush=True)
+    raise ToolExecutionError(
+        "No workspace context available. Internal error.",
+        failure_type="internal_error"
+    )
 
 def _resolve_workspace_path(value: str | None, *, default: str = ".") -> pathlib.Path:
     root = _workspace_root().resolve()

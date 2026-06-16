@@ -891,7 +891,7 @@ def _render_html(**kw):
 <h3>添加 Key</h3><form method="POST" action="/admin/downstream-key" class="form-row"><input type="hidden" name="action" value="add"><label class="field"><span>名称</span><input name="name" required></label><label class="field"><span>Key</span><input name="key" required></label><div class="field"><button type="submit">Add</button></div></form></div>
 <div class="card"><h2>网关设置</h2><form method="POST" action="/admin/config" class="form-row">
 <label class="field"><span>工具模式</span><select name="tool_mode"><option value="orchestrate"{S(gateway_cfg.get("tool_mode"),"orchestrate")}>Orchestrate</option><option value="passthrough"{S(gateway_cfg.get("tool_mode"),"passthrough")}>Passthrough</option></select></label>
-<label class="field"><span>工作目录</span><input name="workspace_root" value="{E(gateway_cfg.get("workspace_root",""))}"></label>
+<label class="field"><span>工作目录 (运行时)</span><input name="workspace_root_display" value="{E(gateway_cfg.get("workspace_root",""))}" readonly title="此字段从客户端请求动态提取，不可编辑" style="background:#f5f5f5;cursor:not-allowed;"></label>
 <label class="field"><span>最大轮数</span><input name="max_tool_rounds" type="number" value="{E(gateway_cfg.get("max_tool_rounds",10))}"></label>
 <label class="field"><span>并发</span><input name="max_concurrent_requests" type="number" value="{E(gateway_cfg.get("max_concurrent_requests",32))}"></label>
 <label class="field"><span>超时</span><input name="tool_execution_timeout_seconds" type="number" value="{E(gateway_cfg.get("tool_execution_timeout_seconds",60))}"></label>

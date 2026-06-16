@@ -176,13 +176,13 @@ def _default_config() -> Json:
             },
             "capabilities": {
                 "supports_streaming": _env_bool("UPSTREAM_SUPPORTS_STREAMING", True),
-                "supports_tools": _env_bool("UPSTREAM_SUPPORTS_TOOLS", True),
-                "supports_function_calls": _env_bool("UPSTREAM_SUPPORTS_FUNCTION_CALLS", True),
-                "supports_parallel_tool_calls": _env_bool("UPSTREAM_SUPPORTS_PARALLEL_TOOL_CALLS", True),
+                "supports_tools": _env_bool("UPSTREAM_SUPPORTS_TOOLS", False),
+                "supports_function_calls": _env_bool("UPSTREAM_SUPPORTS_FUNCTION_CALLS", False),
+                "supports_parallel_tool_calls": _env_bool("UPSTREAM_SUPPORTS_PARALLEL_TOOL_CALLS", False),
                 "supports_vision": _env_bool("UPSTREAM_SUPPORTS_VISION", False),
                 "supports_network": _env_bool("UPSTREAM_SUPPORTS_NETWORK", False),
                 "supports_web_search": _env_bool("UPSTREAM_SUPPORTS_WEB_SEARCH", False),
-                "supports_json_schema": _env_bool("UPSTREAM_SUPPORTS_JSON_SCHEMA", True),
+                "supports_json_schema": _env_bool("UPSTREAM_SUPPORTS_JSON_SCHEMA", False),
             },
         },
         "gateway": {
@@ -319,6 +319,10 @@ def save_config(config: Json) -> None:
     normalized = copy.deepcopy(config)
     _normalize_admin_credentials(normalized)
     _ensure_client_snippet_downstream_key(normalized)
+    # Remove runtime-only fields that should not be persisted
+    # workspace_root is dynamically determined per-request from client metadata
+    if "gateway" in normalized and isinstance(normalized["gateway"], dict):
+        normalized["gateway"].pop("workspace_root", None)
     CONFIG_PATH.write_text(json.dumps(_sync_active_upstream(normalized), ensure_ascii=False, indent=2), encoding="utf-8")
 
 

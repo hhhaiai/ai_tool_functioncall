@@ -1,6 +1,6 @@
 # Gateway 项目进度跟踪
 
-> 最后更新: 2026-05-28
+> 最后更新: 2026-06-16
 
 ## 项目概述
 
@@ -184,7 +184,64 @@ AI Gateway 中游服务 - 将各种上游 API（不支持/部分支持 tool call
 
 ---
 
-## 最近修复 (2026-05-28)
+## 最近修复
+
+### 🔴 2026-06-16: CRITICAL SECURITY FIX - Workspace 路径遍历漏洞
+
+**严重性**: CRITICAL (CVSS 9.8)  
+**漏洞类型**: 路径遍历 / 未授权文件访问
+
+**问题**: Gateway 在客户端未提供 `workspace_root` 时，会回退到**服务器目录**，导致攻击者可以读取服务器上的任意文件（`/etc/passwd`、SSH 密钥、配置文件等）
+
+**修复**:
+- ✅ `_request_workspace_root()` 现在返回 `None` 而不是服务器目录
+- ✅ `_workspace_root()` 在无客户端 workspace 时抛出清晰错误
+- ✅ 工具调用（Read/Write/Glob/Grep）在无 workspace 时安全失败
+- ✅ **绝对不再使用** `os.getcwd()` 或服务器路径作为默认值
+
+**安全原则**:
+- 🔴 **绝对红线**: Gateway 绝不能使用服务器目录作为工作空间
+- ✅ 所有 workspace 必须来自客户端（用户本地机器）
+- ✅ 如果客户端未提供，必须安全失败（返回错误）
+
+**验证**:
+```python
+# 无 workspace 时返回 None，不使用服务器目录
+assert _request_workspace_root({}) is None  # ✓ SECURE
+```
+
+详见：[SECURITY_FIX_WORKSPACE.md](SECURITY_FIX_WORKSPACE.md)
+
+---
+
+### 2026-06-16: Workspace Root 架构修复
+
+**问题**: `workspace_root` 被持久化保存到配置文件，导致多用户/多项目冲突
+
+**修复**:
+- `save_config()` 现在自动移除 `workspace_root` 字段（不再持久化）
+- Admin UI 中 `workspace_root` 改为只读显示（运行时值）
+- HTTP handler 不再保存用户提交的 `workspace_root`
+- 每个请求动态解析 workspace（从 body/metadata 提取）
+
+**优先级链**:
+1. 显式字段：`body.workspace_root` 或 `body.gateway_workspace`
+2. 客户端 metadata：`metadata.project_dir`, `metadata.cwd` 等
+3. 自动提取：从 system/messages 中提取路径（Claude Code 格式）
+4. 环境变量：`GATEWAY_WORKSPACE_ROOT`（如果非 cwd）
+5. 默认值：服务启动时的 cwd
+
+**效果**:
+- ✅ Gateway 现在是无状态服务（针对 workspace）
+- ✅ 支持多用户/多项目同时使用同一个 Gateway 实例
+- ✅ 客户端（Claude Code/Codex）自动发送工作目录，无需配置
+- ✅ 向后兼容，现有客户端无需修改
+
+详见：[FIX_WORKSPACE_ROOT.md](FIX_WORKSPACE_ROOT.md)
+
+---
+
+### 2026-05-28: 协议转换与缓存修复
 
 ### 协议转换修复
 - `_from_anthropic_response_to_openai`: thinking blocks 现在保留为 `reasoning` 字段

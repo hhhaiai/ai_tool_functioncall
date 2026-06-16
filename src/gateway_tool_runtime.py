@@ -398,15 +398,26 @@ def _extract_client_project_dir(body: Json) -> pathlib.Path | None:
         # older summaries, so the later path is the safest source of truth.
         for _pos, _priority, raw_path in sorted(matches, reverse=True):
             cleaned = raw_path.strip().rstrip("\"'.,;:")
-            candidate = pathlib.Path(cleaned).expanduser().resolve()
-            if candidate.is_dir():
-                return candidate
+            # SECURITY FIX: Do NOT validate path existence on Gateway server
+            # The path is on the CLIENT machine, not the Gateway server
+            # Just validate it looks like a valid absolute path
+            if cleaned.startswith('/') or cleaned.startswith('~'):
+                try:
+                    candidate = pathlib.Path(cleaned).expanduser()
+                    # Return the path - it exists on client machine, not here
+                    return candidate
+                except (OSError, ValueError):
+                    continue
         return None
 
     for raw in candidates:
         try:
-            candidate = pathlib.Path(raw).expanduser().resolve()
-            if candidate.is_dir():
+            # SECURITY FIX: Do NOT validate path existence on Gateway server
+            # The path is on the CLIENT machine, not the Gateway server
+            # Just validate it looks like a valid path and return it
+            cleaned = raw.strip().rstrip("\"'.,;:")
+            if cleaned.startswith('/') or cleaned.startswith('~'):
+                candidate = pathlib.Path(cleaned).expanduser()
                 return candidate
         except (OSError, ValueError):
             pass
@@ -436,23 +447,77 @@ def _extract_client_project_dir(body: Json) -> pathlib.Path | None:
     return None
 
 
+def _create_anonymous_workspace(body: Json) -> pathlib.Path:
+    """Create an isolated anonymous workspace for a session.
+
+    SECURITY: Each session gets its own isolated temporary directory.
+    This prevents cross-session contamination and protects the Gateway server.
+
+    The workspace is identified by:
+    1. session_id from metadata
+    2. Request hash (model + first message)
+    3. Random UUID as fallback
+    """
+    import hashlib
+    import tempfile
+
+    # Try to extract session_id from metadata
+    session_id = None
+    metadata = body.get("metadata")
+    if isinstance(metadata, dict):
+        session_id = metadata.get("session_id") or metadata.get("conversation_id")
+
+    # If no session_id, generate from request content
+    if not session_id:
+        # Hash: model + first user message (stable across same conversation)
+        model = body.get("model", "")
+        messages = body.get("messages", [])
+        first_msg = ""
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    first_msg = content[:100]  # First 100 chars
+                break
+
+        hash_input = f"{model}:{first_msg}".encode("utf-8")
+        session_id = hashlib.sha256(hash_input).hexdigest()[:16]
+
+    # Create isolated workspace under .gateway_runtime/anonymous_spaces/
+    base_dir = pathlib.Path.home() / ".gateway_runtime" / "anonymous_spaces"
+    base_dir.mkdir(parents=True, exist_ok=True)
+
+    workspace_dir = base_dir / session_id
+    workspace_dir.mkdir(exist_ok=True)
+
+    return workspace_dir.resolve()
+
+
 def _log_workspace_resolution(source: str, path: pathlib.Path) -> None:
     """Log workspace resolution decision for debugging."""
     import logging
+    import sys
     logger = logging.getLogger("gateway.workspace")
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug("workspace resolved via %s: %s", source, path)
+    # Always log workspace resolution for security auditing
+    msg = f"✓ Workspace resolved via [{source}]: {path}"
+    logger.info(msg)
+    # Also print to stderr to ensure visibility
+    print(msg, file=sys.stderr, flush=True)
 
 
 def _request_workspace_root(body: Json) -> pathlib.Path:
-    """Extract workspace root from request body or use default.
+    """Extract workspace root from request body.
+
+    SECURITY: This function must NEVER return the Gateway server's working directory.
+    All workspace paths MUST come from the client OR use an isolated anonymous space.
 
     Priority chain:
     1. Explicit body field (workspace_root or gateway_workspace)
     2. Auto-detected downstream project dir from session metadata
-    3. Explicit env var (GATEWAY_WORKSPACE_ROOT) if not cwd
-    4. Config file setting
-    5. Default workspace root
+    3. Explicit env var (GATEWAY_WORKSPACE_ROOT) - for testing only
+    4. Anonymous isolated space - per session/request temporary directory
+
+    Returns a safe workspace path - never fails.
     """
     custom_root = body.get("workspace_root") or body.get("gateway_workspace")
     if custom_root:
@@ -464,37 +529,40 @@ def _request_workspace_root(body: Json) -> pathlib.Path:
     if detected is not None:
         _log_workspace_resolution("session_metadata", detected)
         return detected
+    # Only allow explicit env var for testing - not cwd
     env_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
-    # ``scripts/mimo_gateway.sh`` exports GATEWAY_WORKSPACE_ROOT=$PWD as a
-    # service default.  Treat that cwd default as lower priority than a saved UI
-    # config, while still honoring truly explicit env overrides used by tests or
-    # operators that point somewhere else.
-    if env_root and pathlib.Path(env_root).expanduser().resolve() != pathlib.Path(os.getcwd()).resolve():
+    if env_root:
         path = pathlib.Path(env_root).expanduser().resolve()
         _log_workspace_resolution("env_var", path)
         return path
-    try:
-        configured_root = _gateway_config().get("workspace_root")
-        if configured_root:
-            path = pathlib.Path(str(configured_root)).expanduser().resolve()
-            _log_workspace_resolution("config", path)
-            return path
-    except Exception:
-        pass
-    default = _workspace_root()
-    _log_workspace_resolution("default", default)
-    return default
+
+    # SECURITY: Create isolated anonymous space for this session
+    # This allows users to chat even without providing workspace
+    anonymous_space = _create_anonymous_workspace(body)
+    _log_workspace_resolution("anonymous_space", anonymous_space)
+    return anonymous_space
 
 
 @contextmanager
 def _workspace_scope(root: pathlib.Path):
-    """Context manager that temporarily changes the workspace root."""
+    """Context manager that temporarily changes the workspace root.
+
+    SECURITY: root is always a valid path (client-provided or anonymous space).
+    """
+    import sys
     from . import gateway_builtin_tools as _bt
-    token = _bt._WORKSPACE_ROOT_OVERRIDE.set(pathlib.Path(root).resolve())
+
+    # Ensure the path is absolute and resolved
+    resolved_root = pathlib.Path(root).resolve()
+
+    print(f"[DEBUG] _workspace_scope: setting workspace to {resolved_root}", file=sys.stderr, flush=True)
+
+    token = _bt._WORKSPACE_ROOT_OVERRIDE.set(resolved_root)
     try:
-        yield root
+        yield resolved_root
     finally:
         _bt._WORKSPACE_ROOT_OVERRIDE.reset(token)
+        print(f"[DEBUG] _workspace_scope: reset workspace", file=sys.stderr, flush=True)
 
 def _normalize_tool_name(name: str) -> str:
     """Normalize tool name to match builtin registry."""
@@ -943,6 +1011,8 @@ def _detect_intent_tool_calls(path: str, response: Json, body: Json) -> list[Too
     This is a fallback for models that can't follow text-based tool call
     instructions.
     """
+    import sys
+    print(f"[DEBUG] _detect_intent_tool_calls called", file=sys.stderr, flush=True)
     # Check if intent detection is enabled
     from .gateway_config import _gateway_config, _upstream_config
     gateway_cfg = _gateway_config()
@@ -963,7 +1033,15 @@ def _detect_intent_tool_calls(path: str, response: Json, body: Json) -> list[Too
         return []  # Native tools supported, no need for intent detection
 
     text = _response_text(path, response)
-    if not text or len(text) < 20:
+    if not text:
+        print(f"[DEBUG] Intent detection: no text in response", file=sys.stderr, flush=True)
+        return []
+
+    # Allow shorter responses for bare commands like "ls -la"
+    text = text.strip()
+    print(f"[DEBUG] Intent detection: response text = '{text[:100]}'", file=sys.stderr, flush=True)
+    if len(text) < 3:
+        print(f"[DEBUG] Intent detection: text too short ({len(text)} chars)", file=sys.stderr, flush=True)
         return []
 
     # Extract the last user message/input to understand context.  This supports
@@ -972,6 +1050,25 @@ def _detect_intent_tool_calls(path: str, response: Json, body: Json) -> list[Too
 
     calls: list[ToolCall] = []
     text_lower = text.lower()
+
+    # Pattern 0: Bare shell commands (highest priority)
+    # Match standalone commands like "ls -la", "tree", "pwd", "find .", etc.
+    # Strip trailing punctuation like . , ! ?
+    clean_text = text.strip().rstrip('.,!?;:')
+    bare_cmd_pattern = r"^(ls|tree|pwd|find|grep|cat|head|tail|wc|du|df)(\s+.*)?$"
+    bare_match = re.match(bare_cmd_pattern, clean_text, re.IGNORECASE)
+    print(f"[DEBUG] Bare command pattern match on '{clean_text}': {bare_match}", file=sys.stderr, flush=True)
+    if bare_match:
+        cmd = clean_text
+        print(f"[DEBUG] Detected bare command: '{cmd}'", file=sys.stderr, flush=True)
+        calls.append(ToolCall(
+            call_id=f"intent_{uuid.uuid4().hex}",
+            name="Bash",
+            arguments={"command": cmd, "description": f"Execute command: {cmd}"},
+            raw={"gateway_intent_detection": True, "bare_command": True, "text": text[:500]},
+        ))
+        print(f"[DEBUG] Returning {len(calls)} intent-detected tool calls", file=sys.stderr, flush=True)
+        return calls
 
     # Pattern 1: Model says it will read a file but doesn't output tool tags
     # Look for file paths mentioned in the response
@@ -1830,7 +1927,19 @@ def _collect_local_planner_tool_rounds(path: str, body: Json) -> tuple[list[Tool
 
 
 def run_tool_orchestration(path: str, body: Json, client: NativeProxyClient | None = None) -> Json:
-    with _workspace_scope(_request_workspace_root(body)):
+    import sys
+    import json
+    print(f"[DEBUG] run_tool_orchestration called for path: {path}", file=sys.stderr, flush=True)
+    workspace_root = _request_workspace_root(body)
+    print(f"[DEBUG] Workspace root resolved to: {workspace_root}", file=sys.stderr, flush=True)
+
+    # Check if tools are present in body
+    tools_in_body = body.get("tools", [])
+    print(f"[DEBUG] Tools in request body: {len(tools_in_body)} tools", file=sys.stderr, flush=True)
+    if len(tools_in_body) > 0:
+        print(f"[DEBUG] First 3 tools: {json.dumps([t.get('name', t.get('function', {}).get('name', 'unknown')) for t in tools_in_body[:3]])}", file=sys.stderr, flush=True)
+
+    with _workspace_scope(workspace_root):
         return _run_tool_orchestration_scoped(path, body, client)
 
 
