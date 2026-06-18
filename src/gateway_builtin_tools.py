@@ -15,6 +15,7 @@ import datetime as _dt
 import glob
 import html
 import json
+import logging
 import math
 import os
 import pathlib
@@ -49,6 +50,8 @@ from .gateway_mcp import (
 )
 from .gateway_config import _config_env
 
+_logger = logging.getLogger(__name__)
+
 Json = dict[str, Any]
 
 _WORKSPACE_ROOT_OVERRIDE: contextvars.ContextVar[pathlib.Path | None] = contextvars.ContextVar(
@@ -78,24 +81,23 @@ def _workspace_root():
     SECURITY: Returns client-provided workspace or isolated anonymous space.
     Never returns Gateway server directories.
     """
-    import sys
     override = _WORKSPACE_ROOT_OVERRIDE.get()
-    print(f"[DEBUG] _workspace_root called, override={override}", file=sys.stderr, flush=True)
+    _logger.debug("_workspace_root called, override=%s", override)
     if override is not None:
         result = pathlib.Path(override).resolve()
-        print(f"[DEBUG] _workspace_root returning override: {result}", file=sys.stderr, flush=True)
+        _logger.debug("_workspace_root returning override: %s", result)
         return result
 
     # Only allow explicit env var (for testing)
     env_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
     if env_root:
         result = pathlib.Path(env_root).resolve()
-        print(f"[DEBUG] _workspace_root returning env: {result}", file=sys.stderr, flush=True)
+        _logger.debug("_workspace_root returning env: %s", result)
         return result
 
     # This should never happen as _request_workspace_root always provides a path
     # (either client workspace or anonymous space), but fail safely if it does
-    print(f"[DEBUG] _workspace_root: NO WORKSPACE AVAILABLE!", file=sys.stderr, flush=True)
+    _logger.debug("_workspace_root: NO WORKSPACE AVAILABLE!")
     raise ToolExecutionError(
         "No workspace context available. Internal error.",
         failure_type="internal_error"
@@ -1078,7 +1080,10 @@ def _tool_multi_tool_use_parallel(args: Json) -> str:
     tool_uses = args.get("tool_uses") or args.get("calls") or []
     if not isinstance(tool_uses, list):
         raise ToolExecutionError("tool_uses must be a list", failure_type="invalid_input")
-    workspace = _workspace_root()
+    try:
+        workspace = _workspace_root()
+    except ToolExecutionError:
+        workspace = None
 
     def run_one(index_and_item: tuple[int, Any]) -> Json:
         token = _WORKSPACE_ROOT_OVERRIDE.set(workspace)

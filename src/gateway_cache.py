@@ -2,6 +2,8 @@
 
 Provides caching of responses based on semantic similarity of queries,
 reducing upstream costs and latency for repeated or similar requests.
+
+Now supports optional SQLite persistence via gateway_persistence module.
 """
 from __future__ import annotations
 
@@ -17,6 +19,19 @@ from typing import Any, Optional
 _logger = logging.getLogger(__name__)
 
 Json = dict[str, Any]
+
+# Optional persistence support - try both relative and absolute imports
+_PERSISTENCE_AVAILABLE = False
+try:
+    from . import gateway_persistence as gp
+    _PERSISTENCE_AVAILABLE = True
+except ImportError:
+    try:
+        import gateway_persistence as gp
+        _PERSISTENCE_AVAILABLE = True
+    except ImportError:
+        gp = None
+        _logger.warning("gateway_persistence not available, caches will be memory-only")
 
 
 class EmbeddingProvider:
@@ -156,6 +171,8 @@ class SemanticCache:
 
     Stores responses indexed by semantic embeddings of queries,
     allowing cache hits for semantically similar requests.
+
+    Now supports optional SQLite persistence.
     """
 
     def __init__(
@@ -165,17 +182,74 @@ class SemanticCache:
         similarity_threshold: float = 0.92,
         ttl_seconds: int = 3600,
         enabled: bool = True,
+        persistent: bool = False,
     ):
         self.embedding_provider = embedding_provider or LocalEmbeddingProvider()
         self.max_entries = max_entries
         self.similarity_threshold = similarity_threshold
         self.ttl_seconds = ttl_seconds
         self.enabled = enabled
+        self.persistent = persistent and _PERSISTENCE_AVAILABLE
 
         self._entries: dict[str, CacheEntry] = {}
         self._lock = threading.Lock()
         self._hits = 0
         self._misses = 0
+        self._loaded_from_db = False
+
+        # Load from database on initialization if persistent
+        if self.persistent:
+            self._load_from_db()
+
+    def _load_from_db(self):
+        """Load cache entries from database."""
+        if not self.persistent or self._loaded_from_db:
+            return
+
+        try:
+            entries = gp.load_semantic_cache_entries(max_age_seconds=self.ttl_seconds * 2)
+            loaded_count = 0
+
+            for entry_data in entries:
+                # Reconstruct CacheEntry
+                entry = CacheEntry(
+                    query=entry_data["query"],
+                    response=entry_data["response"],
+                    embedding=entry_data["embedding"],
+                    ttl_seconds=entry_data["ttl_seconds"],
+                )
+                entry.created_at = entry_data["created_at"]
+                entry.last_accessed = entry_data["last_accessed"]
+                entry.access_count = entry_data["access_count"]
+
+                # Skip expired entries
+                if not entry.is_expired:
+                    cache_key = entry_data["cache_key"]
+                    self._entries[cache_key] = entry
+                    loaded_count += 1
+
+            self._loaded_from_db = True
+            if loaded_count > 0:
+                _logger.info(f"Loaded {loaded_count} semantic cache entries from database")
+
+        except Exception as exc:
+            _logger.error(f"Failed to load semantic cache from database: {exc}")
+
+    def _save_to_db(self, cache_key: str, entry: CacheEntry):
+        """Save a cache entry to database."""
+        if not self.persistent:
+            return
+
+        try:
+            gp.save_semantic_cache_entry(
+                cache_key=cache_key,
+                query=entry.query,
+                embedding=entry.embedding,
+                response=entry.response,
+                ttl_seconds=entry.ttl_seconds,
+            )
+        except Exception as exc:
+            _logger.error(f"Failed to save semantic cache entry to database: {exc}")
 
     @property
     def stats(self) -> dict[str, Any]:
@@ -242,6 +316,12 @@ class SemanticCache:
                 if not entry.is_expired:
                     entry.touch()
                     self._hits += 1
+                    # Update access stats in DB (non-blocking, best-effort)
+                    if self.persistent:
+                        try:
+                            gp.touch_semantic_cache_entry(key)
+                        except Exception:
+                            pass
                     return entry.response
 
         # Slow path: compute embedding OUTSIDE the lock
@@ -282,14 +362,19 @@ class SemanticCache:
         with self._lock:
             self._evict_expired()
 
-            self._entries[key] = CacheEntry(
+            entry = CacheEntry(
                 query=query,
                 response=response,
                 embedding=embedding,
                 ttl_seconds=self.ttl_seconds,
             )
+            self._entries[key] = entry
 
             self._evict_lru()
+
+        # Save to database OUTSIDE the lock
+        if self.persistent:
+            self._save_to_db(key, entry)
 
     def invalidate(self, pattern: str | None = None) -> int:
         """Invalidate cache entries matching a pattern.
@@ -326,6 +411,8 @@ class ToolResultCache:
 
     Caches results of read-only tools (Read, Glob, Grep, etc.)
     by tool name and arguments hash.
+
+    Now supports optional SQLite persistence.
     """
 
     # Tools that are safe to cache (deterministic, read-only)
@@ -342,9 +429,15 @@ class ToolResultCache:
         "WebSearch", "web_search",
     })
 
-    def __init__(self, ttl_seconds: int = 30, max_entries: int = 500):
+    def __init__(
+        self,
+        ttl_seconds: int = 30,
+        max_entries: int = 500,
+        persistent: bool = False,
+    ):
         self.ttl_seconds = ttl_seconds
         self.max_entries = max_entries
+        self.persistent = persistent and _PERSISTENCE_AVAILABLE
         self._cache: dict[str, tuple[float, str, str, dict]] = {}  # key -> (timestamp, result, tool_name, arguments)
         self._lock = threading.Lock()
         self._hits = 0
@@ -365,6 +458,18 @@ class ToolResultCache:
         if not self.is_cacheable(tool_name):
             return None
 
+        # Try persistent cache first if enabled
+        if self.persistent:
+            args_hash = self._make_key(tool_name, arguments)
+            try:
+                entry = gp.load_tool_cache_entry(tool_name, args_hash)
+                if entry and entry["success"]:
+                    self._hits += 1
+                    return entry["result"]
+            except Exception as exc:
+                _logger.warning(f"Failed to load tool cache from database: {exc}")
+
+        # Fall back to memory cache
         with self._lock:
             key = self._make_key(tool_name, arguments)
             if key in self._cache:
@@ -383,6 +488,21 @@ class ToolResultCache:
         if not self.is_cacheable(tool_name):
             return
 
+        # Save to persistent cache if enabled
+        if self.persistent:
+            args_hash = self._make_key(tool_name, arguments)
+            try:
+                gp.save_tool_cache_entry(
+                    tool_name=tool_name,
+                    arguments_hash=args_hash,
+                    result=result,
+                    success=True,
+                    ttl_seconds=self.ttl_seconds,
+                )
+            except Exception as exc:
+                _logger.warning(f"Failed to save tool cache to database: {exc}")
+
+        # Also save to memory cache for fast access
         with self._lock:
             key = self._make_key(tool_name, arguments)
             self._cache[key] = (time.time(), result, tool_name, arguments)
@@ -466,6 +586,7 @@ def get_semantic_cache() -> SemanticCache:
                 from .gateway_config import load_config
                 config = load_config()
                 cache_config = config.get("cache", {})
+                persistence_config = config.get("persistence", {})
 
                 # Determine embedding provider
                 embedding_url = cache_config.get("embedding_url", "")
@@ -487,6 +608,7 @@ def get_semantic_cache() -> SemanticCache:
                     similarity_threshold=cache_config.get("similarity_threshold", default_threshold),
                     ttl_seconds=cache_config.get("ttl_seconds", 3600),
                     enabled=cache_config.get("enabled", True),
+                    persistent=persistence_config.get("enabled", True),
                 )
 
     return _semantic_cache
@@ -498,9 +620,14 @@ def get_tool_result_cache() -> ToolResultCache:
     if _tool_result_cache is None:
         with _cache_lock:
             if _tool_result_cache is None:
+                from .gateway_config import load_config
+                config = load_config()
+                persistence_config = config.get("persistence", {})
+
                 _tool_result_cache = ToolResultCache(
                     ttl_seconds=30,
                     max_entries=500,
+                    persistent=persistence_config.get("enabled", True),
                 )
 
     return _tool_result_cache

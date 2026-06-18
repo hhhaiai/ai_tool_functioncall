@@ -308,6 +308,14 @@ def load_config() -> Json:
             f"invalid gateway config: {CONFIG_PATH}",
             detail=f"{exc.__class__.__name__}: {exc}",
         ) from exc
+
+    # Decrypt sensitive fields if encrypted
+    try:
+        from . import gateway_encryption as ge
+        loaded = ge.decrypt_config(loaded, in_place=True)
+    except Exception:
+        pass  # Encryption module not available or decryption failed
+
     cfg = _default_config()
     _normalize_admin_credentials(loaded)
     _deep_update(cfg, loaded)
@@ -323,6 +331,14 @@ def save_config(config: Json) -> None:
     # workspace_root is dynamically determined per-request from client metadata
     if "gateway" in normalized and isinstance(normalized["gateway"], dict):
         normalized["gateway"].pop("workspace_root", None)
+
+    # Encrypt sensitive fields before saving
+    try:
+        from . import gateway_encryption as ge
+        normalized = ge.encrypt_config(normalized, in_place=True)
+    except Exception:
+        pass  # Encryption module not available
+
     CONFIG_PATH.write_text(json.dumps(_sync_active_upstream(normalized), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -578,9 +594,9 @@ def _profile_from_admin_form(form: dict[str, str], existing: Json | None = None)
     else:
         profile["capabilities"] = {
             "supports_streaming": bool(existing_caps.get("supports_streaming", True)),
-            "supports_tools": bool(existing_caps.get("supports_tools", True)),
-            "supports_function_calls": bool(existing_caps.get("supports_function_calls", True)),
-            "supports_parallel_tool_calls": bool(existing_caps.get("supports_parallel_tool_calls", True)),
+            "supports_tools": bool(existing_caps.get("supports_tools", False)),
+            "supports_function_calls": bool(existing_caps.get("supports_function_calls", False)),
+            "supports_parallel_tool_calls": bool(existing_caps.get("supports_parallel_tool_calls", False)),
             "supports_vision": bool(existing_caps.get("supports_vision", False)),
             "supports_network": bool(existing_caps.get("supports_network", False)),
             "supports_web_search": bool(existing_caps.get("supports_web_search", False)),

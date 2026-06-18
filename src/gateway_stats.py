@@ -60,11 +60,21 @@ def _get_db() -> sqlite3.Connection:
     if _db_conn is None:
         with _db_lock:
             if _db_conn is None:
+                # Use persistent database file instead of :memory:
+                from pathlib import Path
+                db_path = Path(".gateway_runtime/stats.db")
+                db_path.parent.mkdir(parents=True, exist_ok=True)
+
                 _db_conn = sqlite3.connect(
-                    ":memory:",
+                    str(db_path),
                     check_same_thread=False,
                 )
                 _db_conn.row_factory = sqlite3.Row
+
+                # Configure for performance
+                _db_conn.execute("PRAGMA journal_mode = WAL")
+                _db_conn.execute("PRAGMA synchronous = NORMAL")
+
                 _init_tables(_db_conn)
     return _db_conn
 

@@ -53,6 +53,7 @@ from .gateway_mcp import _mcp_call_tool, _mcp_parse_public_name, _mcp_server_by_
 from .gateway_protocol import (
     _convert_request_to_upstream,
     _convert_response_to_downstream,
+    _forced_tool_name_from_choice,
     _from_openai_chat_response,
     _last_user_text,
     _replace_last_user_text,
@@ -549,20 +550,19 @@ def _workspace_scope(root: pathlib.Path):
 
     SECURITY: root is always a valid path (client-provided or anonymous space).
     """
-    import sys
     from . import gateway_builtin_tools as _bt
 
     # Ensure the path is absolute and resolved
     resolved_root = pathlib.Path(root).resolve()
 
-    print(f"[DEBUG] _workspace_scope: setting workspace to {resolved_root}", file=sys.stderr, flush=True)
+    _logger.debug("_workspace_scope: setting workspace to %s", resolved_root)
 
     token = _bt._WORKSPACE_ROOT_OVERRIDE.set(resolved_root)
     try:
         yield resolved_root
     finally:
         _bt._WORKSPACE_ROOT_OVERRIDE.reset(token)
-        print(f"[DEBUG] _workspace_scope: reset workspace", file=sys.stderr, flush=True)
+        _logger.debug("_workspace_scope: reset workspace")
 
 def _normalize_tool_name(name: str) -> str:
     """Normalize tool name to match builtin registry."""
@@ -772,10 +772,143 @@ def _repair_shell_command_spacing(command: str) -> str:
     cmd = re.sub(r"\s+", " ", cmd).strip()
     return cmd
 
-def _parse_text_tool_calls(text: str) -> list[ToolCall]:
-    """Parse common text-only tool-call fallbacks emitted by weak native-tool providers."""
 
-    if not text or ("<function=" not in text and "<parameter=" not in text):
+def _parse_json_tool_calls_from_text(text: str) -> list[ToolCall]:
+    """Parse JSON-formatted tool calls from text responses.
+
+    Supports: {"name": "X", "arguments": {...}}, {"tool": "X", "args": {...}},
+    {"function": {"name": "X", "arguments": {...}}}, arrays thereof,
+    and JSON inside ```json / ```functioncall code blocks.
+    """
+    if not text:
+        return []
+    calls: list[ToolCall] = []
+
+    def _try(obj: dict) -> ToolCall | None:
+        if not isinstance(obj, dict):
+            return None
+        name = obj.get("name") or obj.get("tool") or obj.get("function_name")
+        args = obj.get("arguments") or obj.get("args") or obj.get("parameters") or obj.get("input")
+        if not name and isinstance(obj.get("function"), dict):
+            fn = obj["function"]
+            name = fn.get("name")
+            args = args or fn.get("arguments")
+        if not name and isinstance(obj.get("tool_calls"), list):
+            for tc in obj["tool_calls"]:
+                if isinstance(tc, dict):
+                    fn = tc.get("function") or tc
+                    if fn.get("name"):
+                        name = fn["name"]
+                        args = args or fn.get("arguments")
+                        break
+        if not name:
+            return None
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {"raw": args}
+        if not isinstance(args, dict):
+            args = {"value": args}
+        n = _normalize_tool_name(str(name))
+        return ToolCall(
+            call_id=f"textjson_{uuid.uuid4().hex}", name=n,
+            arguments=_normalize_tool_args(n, args),
+            raw={"gateway_text_tool_call_fallback": True, "format": "json", "text": text[:2000]},
+        )
+
+    # JSON in code blocks first
+    code_block_re = re.compile(r"```(?:json|functioncall|tool_call|toolcall)?\s*\n(.*?)```", re.S | re.I)
+    for m in code_block_re.finditer(text):
+        block = m.group(1).strip()
+        try:
+            parsed = json.loads(block)
+            items = parsed if isinstance(parsed, list) else [parsed]
+            for item in items:
+                c = _try(item)
+                if c:
+                    calls.append(c)
+            if calls:
+                return calls
+        except json.JSONDecodeError:
+            for line in block.splitlines():
+                line = line.strip()
+                if not line or line.startswith(("#", "//")):
+                    continue
+                try:
+                    c = _try(json.loads(line))
+                    if c:
+                        calls.append(c)
+                except json.JSONDecodeError:
+                    pass
+    if calls:
+        return calls
+
+    # Raw JSON objects in text
+    if '"name"' in text or '"tool"' in text:
+        for m in re.finditer(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text):
+            try:
+                parsed = json.loads(m.group(0))
+                if isinstance(parsed, dict) and (parsed.get("name") or parsed.get("tool") or parsed.get("function")):
+                    c = _try(parsed)
+                    if c:
+                        calls.append(c)
+            except json.JSONDecodeError:
+                pass
+    return calls
+
+
+def _parse_markdown_tool_calls(text: str) -> list[ToolCall]:
+    """Parse ```tool ...``` blocks and Python-style ToolName(key="value") calls."""
+    if not text:
+        return []
+    calls: list[ToolCall] = []
+
+    # ```tool ... ``` blocks
+    for m in re.finditer(r"```(?:tool|tools|tool_call|toolcall)\s*\n(.*?)```", text, re.S | re.I):
+        for line in m.group(1).strip().splitlines():
+            line = line.strip()
+            if not line or line.startswith(("#", "//")):
+                continue
+            parts = line.split(None, 1)
+            if not parts:
+                continue
+            name = parts[0]
+            args: Json = {}
+            if len(parts) > 1:
+                for kv in re.finditer(r'(\w+)=(?:"([^"]*)"|\'([^\']*)\'|(\S+))', parts[1]):
+                    args[kv.group(1)] = kv.group(2) or kv.group(3) or kv.group(4) or ""
+                if not args:
+                    args = {"input": parts[1]}
+            n = _normalize_tool_name(name)
+            calls.append(ToolCall(
+                call_id=f"textmd_{uuid.uuid4().hex}", name=n,
+                arguments=_normalize_tool_args(n, args),
+                raw={"gateway_text_tool_call_fallback": True, "format": "markdown", "text": text[:2000]},
+            ))
+    if calls:
+        return calls
+
+    # Python-style: ToolName(key="value")
+    for m in re.finditer(r'([A-Z][A-Za-z0-9_]*)\s*\(([^)]*)\)', text):
+        name = m.group(1)
+        n = _normalize_tool_name(name)
+        if n not in BUILTIN_TOOLS and name not in BUILTIN_TOOLS:
+            continue
+        args: Json = {}
+        for kv in re.finditer(r'(\w+)\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|(\S+))', m.group(2)):
+            args[kv.group(1)] = kv.group(2) or kv.group(3) or kv.group(4) or ""
+        calls.append(ToolCall(
+            call_id=f"textpy_{uuid.uuid4().hex}", name=n,
+            arguments=_normalize_tool_args(n, args),
+            raw={"gateway_text_tool_call_fallback": True, "format": "python_call", "text": text[:2000]},
+        ))
+    return calls
+
+
+def _parse_xml_tool_calls(text: str) -> list[ToolCall]:
+    """Parse XML-format tool calls with function/parameter tags."""
+    if "<function=" not in text and "<parameter=" not in text:
         return []
     calls: list[ToolCall] = []
     function_re = re.compile(r"<function=([A-Za-z0-9_.:-]+)>\s*(.*?)(?=<function=[A-Za-z0-9_.:-]+>|\Z)", re.S)
@@ -783,12 +916,13 @@ def _parse_text_tool_calls(text: str) -> list[ToolCall]:
     def append_call(name: str, args: Json, raw_text: str) -> None:
         if not name:
             return
+        n = _normalize_tool_name(name)
         calls.append(
             ToolCall(
                 call_id=f"textcall_{uuid.uuid4().hex}",
-                name=name,
-                arguments=args,
-                raw={"gateway_text_tool_call_fallback": True, "text": raw_text[:2000]},
+                name=n,
+                arguments=_normalize_tool_args(n, args),
+                raw={"gateway_text_tool_call_fallback": True, "format": "xml", "text": raw_text[:2000]},
             )
         )
 
@@ -845,6 +979,59 @@ def _parse_text_tool_calls(text: str) -> list[ToolCall]:
                 current[key] = value
         if current and current.get("command"):
             append_call("Bash", current, text)
+    return calls
+
+
+def _parse_text_tool_calls(text: str) -> list[ToolCall]:
+    """Parse text-based tool-call fallbacks from weak upstream models.
+
+    Supports multiple formats (tried in order):
+    1. XML: function/parameter tags
+    2. JSON: {"name": "ToolName", "arguments": {...}}
+    3. Markdown: ```tool blocks or Python-style calls
+    4. Bare parameter blocks
+    """
+    if not text:
+        return []
+
+    # Try XML format first
+    calls = _parse_xml_tool_calls(text)
+    if calls:
+        return calls
+
+    # Try JSON format
+    calls = _parse_json_tool_calls_from_text(text)
+    if calls:
+        return calls
+
+    # Try markdown/python-style format
+    calls = _parse_markdown_tool_calls(text)
+    if calls:
+        return calls
+
+    # Fallback: bare parameter blocks
+    if "<parameter=" in text:
+        current: Json | None = None
+        for key, value in _parse_parameter_blocks(text):
+            if key in {"command", "cmd", "shell"}:
+                if current and current.get("command"):
+                    calls.append(ToolCall(
+                        call_id=f"textcall_{uuid.uuid4().hex}",
+                        name="Bash",
+                        arguments=_normalize_tool_args("Bash", current),
+                        raw={"gateway_text_tool_call_fallback": True, "format": "bare_param", "text": text[:2000]},
+                    ))
+                current = {"command": _repair_shell_command_spacing(value)}
+            elif current is not None:
+                current[key] = value
+        if current and current.get("command"):
+            calls.append(ToolCall(
+                call_id=f"textcall_{uuid.uuid4().hex}",
+                name="Bash",
+                arguments=_normalize_tool_args("Bash", current),
+                raw={"gateway_text_tool_call_fallback": True, "format": "bare_param", "text": text[:2000]},
+            ))
+
     return calls
 
 
@@ -906,7 +1093,18 @@ def _extract_tool_calls(path: str, response: Json) -> list[ToolCall]:
 
 
 def _text_tool_call_fallback_enabled() -> bool:
-    return bool(_gateway_config().get("text_tool_call_fallback_enabled", True))
+    gateway = _gateway_config()
+    upstream = _upstream_config()
+    tools_enabled = str(upstream.get("tools_enabled", "auto") or "auto").strip().lower()
+    if tools_enabled in {"off", "disabled", "false", "0", "none"}:
+        return False
+    capabilities = upstream.get("capabilities") if isinstance(upstream.get("capabilities"), dict) else {}
+    native_capable = bool(capabilities.get("supports_tools", False)) and bool(capabilities.get("supports_function_calls", False))
+    if tools_enabled in {"adapter", "text_only", "prompt"}:
+        return True
+    if tools_enabled == "auto" and not native_capable:
+        return True
+    return bool(gateway.get("text_tool_call_fallback_enabled", True))
 
 
 def _extract_text_tool_calls(path: str, response: Json) -> list[ToolCall]:
@@ -1011,8 +1209,7 @@ def _detect_intent_tool_calls(path: str, response: Json, body: Json) -> list[Too
     This is a fallback for models that can't follow text-based tool call
     instructions.
     """
-    import sys
-    print(f"[DEBUG] _detect_intent_tool_calls called", file=sys.stderr, flush=True)
+    _logger.debug("_detect_intent_tool_calls called")
     # Check if intent detection is enabled
     from .gateway_config import _gateway_config, _upstream_config
     gateway_cfg = _gateway_config()
@@ -1025,31 +1222,32 @@ def _detect_intent_tool_calls(path: str, response: Json, body: Json) -> list[Too
     upstream_cfg = _upstream_config()
     capabilities = upstream_cfg.get("capabilities") if isinstance(upstream_cfg.get("capabilities"), dict) else {}
     native_capable = (
-        bool(capabilities.get("supports_tools", upstream_cfg.get("supports_tools", True)))
-        and bool(capabilities.get("supports_function_calls", upstream_cfg.get("supports_function_calls", True)))
+        bool(capabilities.get("supports_tools", upstream_cfg.get("supports_tools", False)))
+        and bool(capabilities.get("supports_function_calls", upstream_cfg.get("supports_function_calls", False)))
     )
     tools_enabled = str(upstream_cfg.get("tools_enabled", "auto") or "auto").strip().lower()
+    if tools_enabled in {"off", "disabled", "false", "0", "none"}:
+        return []
     if native_capable and tools_enabled not in {"off", "disabled", "false", "0", "none", "text_only", "adapter"}:
         return []  # Native tools supported, no need for intent detection
 
     text = _response_text(path, response)
     if not text:
-        print(f"[DEBUG] Intent detection: no text in response", file=sys.stderr, flush=True)
+        _logger.debug("Intent detection: no text in response")
         return []
 
     # Allow shorter responses for bare commands like "ls -la"
     text = text.strip()
-    print(f"[DEBUG] Intent detection: response text = '{text[:100]}'", file=sys.stderr, flush=True)
+    _logger.debug("Intent detection: response text = '%s'", text[:100])
     if len(text) < 3:
-        print(f"[DEBUG] Intent detection: text too short ({len(text)} chars)", file=sys.stderr, flush=True)
+        _logger.debug("Intent detection: text too short (%d chars)", len(text))
         return []
 
     # Extract the last user message/input to understand context.  This supports
     # both Claude Code Anthropic Messages and Codex Responses payloads.
-    last_user_text = _last_user_text(path, body)[:2000]
+    _last_user_text(path, body)
 
     calls: list[ToolCall] = []
-    text_lower = text.lower()
 
     # Pattern 0: Bare shell commands (highest priority)
     # Match standalone commands like "ls -la", "tree", "pwd", "find .", etc.
@@ -1057,17 +1255,17 @@ def _detect_intent_tool_calls(path: str, response: Json, body: Json) -> list[Too
     clean_text = text.strip().rstrip('.,!?;:')
     bare_cmd_pattern = r"^(ls|tree|pwd|find|grep|cat|head|tail|wc|du|df)(\s+.*)?$"
     bare_match = re.match(bare_cmd_pattern, clean_text, re.IGNORECASE)
-    print(f"[DEBUG] Bare command pattern match on '{clean_text}': {bare_match}", file=sys.stderr, flush=True)
+    _logger.debug("Bare command pattern match on '%s': %s", clean_text, bare_match)
     if bare_match:
         cmd = clean_text
-        print(f"[DEBUG] Detected bare command: '{cmd}'", file=sys.stderr, flush=True)
+        _logger.debug("Detected bare command: '%s'", cmd)
         calls.append(ToolCall(
             call_id=f"intent_{uuid.uuid4().hex}",
             name="Bash",
             arguments={"command": cmd, "description": f"Execute command: {cmd}"},
             raw={"gateway_intent_detection": True, "bare_command": True, "text": text[:500]},
         ))
-        print(f"[DEBUG] Returning {len(calls)} intent-detected tool calls", file=sys.stderr, flush=True)
+        _logger.debug("Returning %d intent-detected tool calls", len(calls))
         return calls
 
     # Pattern 1: Model says it will read a file but doesn't output tool tags
@@ -1478,8 +1676,8 @@ def _weak_upstream_text_tools_active(gateway_mode: str) -> bool:
     upstream = _upstream_config()
     tools_enabled = str(upstream.get("tools_enabled", "auto") or "auto").strip().lower()
     capabilities = upstream.get("capabilities") if isinstance(upstream.get("capabilities"), dict) else {}
-    native_capable = bool(capabilities.get("supports_tools", True)) and bool(capabilities.get("supports_function_calls", True))
-    if tools_enabled in {"off", "disabled", "false", "0", "none", "text_only", "adapter"}:
+    native_capable = bool(capabilities.get("supports_tools", False)) and bool(capabilities.get("supports_function_calls", False))
+    if tools_enabled in {"text_only", "adapter", "prompt"}:
         return True
     if tools_enabled == "auto" and not native_capable:
         return True
@@ -1613,11 +1811,36 @@ def _apply_local_planner_context(path: str, body: Json) -> Json:
 
 
 
-def _execute_tool_call(call: ToolCall, provider: str | None = None) -> ToolResult:
+def _execute_tool_call(call: ToolCall, provider: str | None = None, client_id: str | None = None) -> ToolResult:
     import time as _time
     _start = _time.time()
     original_name = call.name
     call = _normalize_tool_call(call)
+
+    # Permission check: verify tool execution is allowed for this client
+    try:
+        from .gateway_permissions import check_tool_permission
+        allowed, reason = check_tool_permission(call.name, client_id, log=True)
+        if not allowed:
+            return ToolResult(
+                call_id=call.call_id,
+                name=call.name,
+                content=f"Permission denied: {reason}",
+                success=False,
+                failure_type="permission_denied",
+            )
+    except ImportError:
+        _logger.debug("Permission module unavailable, allowing execution")
+    except Exception as exc:
+        _logger.warning(f"Permission check failed for {call.name}: {exc}")
+        return ToolResult(
+            call_id=call.call_id,
+            name=call.name,
+            content=f"Permission check error: {exc}",
+            success=False,
+            failure_type="permission_denied",
+        )
+
     tool = BUILTIN_TOOLS.get(call.name)
     mcp_target = None if tool else _mcp_parse_public_name(call.name)
     http_action = None if tool or mcp_target else (_http_action_by_name(call.name) or _http_action_by_name(original_name))
@@ -1702,7 +1925,7 @@ def _execute_tool_call(call: ToolCall, provider: str | None = None) -> ToolResul
             except Exception:
                 pass
             return ToolResult(call_id=call.call_id, name=call.name, content=content, success=True)
-        except (ToolExecutionError, subprocess.TimeoutExpired, Exception) as exc:
+        except (ToolExecutionError, subprocess.TimeoutExpired) as exc:
             last_exc = exc
             if isinstance(exc, subprocess.TimeoutExpired):
                 last_result = ToolResult(
@@ -1716,12 +1939,14 @@ def _execute_tool_call(call: ToolCall, provider: str | None = None) -> ToolResul
                     content=f"{exc.failure_type}: {exc}",
                     success=False, failure_type=exc.failure_type,
                 )
-            else:
-                last_result = ToolResult(
-                    call_id=call.call_id, name=call.name,
-                    content=f"execution_failed: {exc}",
-                    success=False, failure_type="execution_failed",
-                )
+        except Exception as exc:
+            # Non-transient error — do not retry
+            _logger.warning("Tool %s failed with non-transient error: %s", call.name, exc)
+            return ToolResult(
+                call_id=call.call_id, name=call.name,
+                content=f"execution_failed: {exc}",
+                success=False, failure_type="execution_failed",
+            )
             # transient failure — retry if attempts remain
     # All attempts exhausted
     failure_type = getattr(last_exc, "failure_type", "execution_failed") if last_exc and isinstance(last_exc, ToolExecutionError) else getattr(last_result, "failure_type", "execution_failed") if last_result else "execution_failed"
@@ -1889,6 +2114,8 @@ def _has_tool_result_in_messages(path: str, body: Json) -> bool:
     for msg in messages:
         if not isinstance(msg, dict):
             continue
+        if msg.get("type") in ("tool_result", "function_call_output", "custom_tool_call_output"):
+            return True
         content = msg.get("content")
         if isinstance(content, list):
             for block in content:
@@ -1926,21 +2153,160 @@ def _collect_local_planner_tool_rounds(path: str, body: Json) -> tuple[list[Tool
     return calls, results
 
 
-def run_tool_orchestration(path: str, body: Json, client: NativeProxyClient | None = None) -> Json:
-    import sys
-    import json
-    print(f"[DEBUG] run_tool_orchestration called for path: {path}", file=sys.stderr, flush=True)
+def _tool_schema_name_local(tool: Json) -> str:
+    if not isinstance(tool, dict):
+        return ""
+    func = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+    return str(func.get("name") or tool.get("name") or "").strip()
+
+
+def _tool_schema_required_local(tool: Json) -> list[str]:
+    if not isinstance(tool, dict):
+        return []
+    func = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+    params = func.get("parameters") or func.get("input_schema") or tool.get("parameters") or tool.get("input_schema") or {}
+    if not isinstance(params, dict):
+        return []
+    return [str(item) for item in (params.get("required") or []) if isinstance(item, str)]
+
+
+def _forced_request_tool_name(body: Json) -> str:
+    forced = _forced_tool_name_from_choice(body.get("tool_choice"))
+    if forced:
+        return forced
+    tool_choice = body.get("tool_choice")
+    if isinstance(tool_choice, str) and tool_choice in {"required", "any"}:
+        tools = [tool for tool in (body.get("tools") or []) if isinstance(tool, dict)]
+        names = [_tool_schema_name_local(tool) for tool in tools]
+        names = [name for name in names if name]
+        if len(names) == 1:
+            return names[0]
+    return ""
+
+
+def _infer_forced_tool_arguments(path: str, name: str, body: Json) -> Json:
+    user_text = _last_user_text(path, body)
+    normalized = _normalize_tool_name(name)
+    if normalized in {"calculator", "calc", "gateway__calculator"}:
+        expr = ""
+        code_match = re.search(r"`([^`]+)`", user_text)
+        if code_match:
+            expr = code_match.group(1).strip()
+        if not expr:
+            matches = re.findall(r"[-+*/%(). 0-9]+", user_text)
+            matches = [m.strip() for m in matches if re.search(r"\d", m) and re.search(r"[+*/%-]", m)]
+            if matches:
+                expr = max(matches, key=len).strip()
+        return {"expression": expr or user_text.strip()}
+    if normalized in {"get_current_time", "current_time"}:
+        tz_match = re.search(r"\b[A-Za-z_]+/[A-Za-z_]+(?:/[A-Za-z_]+)?\b", user_text)
+        if tz_match:
+            return {"timezone": tz_match.group(0)}
+        if any(token in user_text for token in ("上海", "中国", "北京时间", "Asia/Shanghai")):
+            return {"timezone": "Asia/Shanghai"}
+        return {}
+    if normalized in {"Read", "FileInfo", "LS", "Tree", "Glob", "Grep"}:
+        paths = _extract_mentioned_paths(user_text)
+        if normalized == "Glob":
+            return {"pattern": paths[-1] if paths else "*"}
+        if normalized == "Grep":
+            quoted = re.findall(r"`([^`]+)`|['\"]([^'\"]+)['\"]", user_text)
+            pattern = next((a or b for a, b in quoted if (a or b)), "")
+            return {"pattern": pattern or user_text.strip(), "path": paths[-1] if paths else "."}
+        return {"path": paths[-1] if paths else "."}
+    if normalized in {"Bash", "exec_command", "shell", "shell_command"}:
+        return {"command": _extract_explicit_shell_command_request(user_text) or user_text.strip()}
+    if normalized == "echo_probe":
+        match = re.search(r"(?:value|echo|probe)\s+[`'\"]?([A-Za-z0-9_.:-]+)", user_text, flags=re.I)
+        return {"value": match.group(1) if match else user_text.strip()}
+
+    tool = next((tool for tool in (body.get("tools") or []) if _tool_schema_name_local(tool) == name), None)
+    required = _tool_schema_required_local(tool or {})
+    if len(required) == 1:
+        return {required[0]: user_text.strip()}
+    return {}
+
+
+def _synthetic_tool_response(path: str, call: ToolCall, model: str = "") -> Json:
+    if "/messages" in path:
+        return {
+            "id": f"msg_gateway_{uuid.uuid4().hex}",
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [{"type": "tool_use", "id": call.call_id, "name": call.name, "input": call.arguments}],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }
+    if "/responses" in path:
+        return {
+            "id": f"resp_gateway_{uuid.uuid4().hex}",
+            "object": "response",
+            "model": model,
+            "output": [{
+                "type": "function_call",
+                "id": f"fc_{uuid.uuid4().hex}",
+                "call_id": call.call_id,
+                "name": call.name,
+                "arguments": json.dumps(call.arguments, ensure_ascii=False),
+            }],
+            "status": "completed",
+            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        }
+    return {
+        "id": f"chatcmpl_gateway_{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": call.call_id,
+                    "type": "function",
+                    "function": {"name": call.name, "arguments": json.dumps(call.arguments, ensure_ascii=False)},
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+    }
+
+
+def _forced_gateway_tool_round(path: str, body: Json) -> tuple[ToolCall | None, ToolResult | None, Json | None]:
+    if _has_tool_result_in_messages(path, body):
+        return None, None, None
+    name = _forced_request_tool_name(body)
+    if not name:
+        return None, None, None
+    call = _normalize_tool_call(ToolCall(
+        call_id=f"gateway_forced_{uuid.uuid4().hex}",
+        name=name,
+        arguments=_infer_forced_tool_arguments(path, name, body),
+        raw={"gateway_forced_tool_choice": True},
+    ))
+    if call.name in BUILTIN_TOOLS or _mcp_parse_public_name(call.name) or _http_action_by_name(call.name):
+        return call, _execute_tool_call(call, provider="gateway_forced_tool_choice"), None
+    # Gateway cannot execute caller-private custom functions.  For forced
+    # tool_choice, surface the required protocol-level call to the downstream
+    # client instead of pretending the upstream supports native tools.
+    return call, None, _synthetic_tool_response(path, call, str(body.get("model") or _config_env("UPSTREAM_MODEL", "")))
+
+
+def run_tool_orchestration(path: str, body: Json, client: NativeProxyClient | None = None, client_id: str | None = None) -> Json:
+    _logger.debug("run_tool_orchestration called for path: %s", path)
     workspace_root = _request_workspace_root(body)
-    print(f"[DEBUG] Workspace root resolved to: {workspace_root}", file=sys.stderr, flush=True)
+    _logger.debug("Workspace root resolved to: %s", workspace_root)
 
     # Check if tools are present in body
     tools_in_body = body.get("tools", [])
-    print(f"[DEBUG] Tools in request body: {len(tools_in_body)} tools", file=sys.stderr, flush=True)
+    _logger.debug("Tools in request body: %d tools", len(tools_in_body))
     if len(tools_in_body) > 0:
-        print(f"[DEBUG] First 3 tools: {json.dumps([t.get('name', t.get('function', {}).get('name', 'unknown')) for t in tools_in_body[:3]])}", file=sys.stderr, flush=True)
+        _logger.debug("First 3 tools: %s", [t.get('name', t.get('function', {}).get('name', 'unknown')) for t in tools_in_body[:3]])
 
     with _workspace_scope(workspace_root):
-        return _run_tool_orchestration_scoped(path, body, client)
+        return _run_tool_orchestration_scoped(path, body, client, client_id)
 
 
 def _convert_response_to_path(target_path: str, response: Json) -> Json:
@@ -1979,7 +2345,7 @@ def _convert_response_to_path(target_path: str, response: Json) -> Json:
     return response
 
 
-def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyClient | None = None) -> Json:
+def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyClient | None = None, client_id: str | None = None) -> Json:
     gateway_cfg = _gateway_config()
     mode = str(os.environ.get("GATEWAY_TOOL_MODE") or gateway_cfg.get("tool_mode") or "orchestrate").lower()
     memory_body = _inject_recalled_memories(path, body)
@@ -2021,6 +2387,12 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
     if fanout_response is not None:
         _remember_conversation_turn(path, body, fanout_response)
         return fanout_response
+    forced_call, forced_result, forced_response = (None, None, None)
+    if _weak_upstream_text_tools_active(mode):
+        forced_call, forced_result, forced_response = _forced_gateway_tool_round(path, memory_body)
+    if forced_response is not None:
+        _remember_conversation_turn(path, body, forced_response)
+        return forced_response
     request_body = _merge_builtin_tools(path, _apply_local_planner_context(path, _maybe_compact_request_for_upstream(path, memory_body, context_cfg)))
 
     # --- Intelligence Enhancement ---
@@ -2055,6 +2427,7 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
     if upstream_model and "model" in request_body:
         request_body["model"] = upstream_model
     tools_stripped = False
+    original_tools = list(request_body.get("tools") or [])
     for _round in range(max_rounds):
         try:
             response = upstream.forward(upstream_path, request_body)
@@ -2063,7 +2436,7 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
             if exc.upstream_status == 400 and not tools_stripped and request_body.get("tools"):
                 from .gateway_protocol import _inject_tools_as_text_prompt
                 request_body = _without_tools(request_body)
-                request_body = _inject_tools_as_text_prompt(request_body, [])
+                request_body = _inject_tools_as_text_prompt(request_body, original_tools)
                 tools_stripped = True
                 continue
             raise
@@ -2077,17 +2450,26 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
             if forced_fanout is not None:
                 _remember_conversation_turn(path, body, forced_fanout)
                 return forced_fanout
-        _verify_native_if_forced(path, request_body, downstream_response)
+        if forced_call is None:
+            _verify_native_if_forced(path, request_body, downstream_response)
         calls = _extract_tool_calls(path, downstream_response)
         text_fallback = False
         if not calls:
             calls = _extract_text_tool_calls(path, downstream_response)
             text_fallback = bool(calls)
         # Intent detection fallback for weak models that can't generate tool calls
-        if not calls and _round == 0:
+        if not calls:
             calls = _detect_intent_tool_calls(path, downstream_response, body)
             text_fallback = bool(calls)
         if not calls:
+            if forced_call is not None and forced_result is not None:
+                calls = [forced_call]
+                results = [forced_result]
+                if text_fallback:
+                    request_body = _append_text_tool_results(upstream_path, request_body, upstream_response, calls, results)
+                else:
+                    request_body = _append_tool_results(upstream_path, request_body, upstream_response, results)
+                continue
             # If the gateway already executed local planner tools, surface those
             # results to the downstream client as explicit tool rounds instead of
             # returning a plain assistant text response.  Weak upstreams often
@@ -2120,8 +2502,8 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
             _upstream_cfg_delegate = _upstream_config()
             _upstream_caps_delegate = _upstream_cfg_delegate.get("capabilities") if isinstance(_upstream_cfg_delegate.get("capabilities"), dict) else {}
             _native_capable_delegate = (
-                bool(_upstream_caps_delegate.get("supports_tools", _upstream_cfg_delegate.get("supports_tools", True)))
-                and bool(_upstream_caps_delegate.get("supports_function_calls", _upstream_cfg_delegate.get("supports_function_calls", True)))
+                bool(_upstream_caps_delegate.get("supports_tools", _upstream_cfg_delegate.get("supports_tools", False)))
+                and bool(_upstream_caps_delegate.get("supports_function_calls", _upstream_cfg_delegate.get("supports_function_calls", False)))
             )
             delegate = (
                 path in ("/v1/messages", "/v1/chat/completions", "/v1/responses", "/anthropic/v1/messages")
@@ -2137,7 +2519,7 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
             return native_response
 
         # Execute tools locally (either native calls or delegated=false)
-        results = [_execute_tool_call(call) for call in calls]
+        results = [_execute_tool_call(call, client_id=client_id) for call in calls]
         if text_fallback:
             request_body = _append_text_tool_results(upstream_path, request_body, upstream_response, calls, results)
         else:

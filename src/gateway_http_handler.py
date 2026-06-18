@@ -798,7 +798,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                             _json_response(self, 200, cache_hit)
                         else:
                             from .gateway_tool_runtime import run_tool_orchestration
-                            response = run_tool_orchestration(path, body)
+                            # Pass client_id for permission checking (use downstream_key as client identifier)
+                            response = run_tool_orchestration(path, body, client_id=downstream_key)
                             # Store in semantic cache if eligible
                             try:
                                 if query_text and cache_hit is None:

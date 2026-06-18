@@ -1953,7 +1953,7 @@ class NativeGatewayTests(unittest.TestCase):
             try:
                 cfg = gateway._default_config()
                 self.assertIn("capabilities", cfg["upstream"])
-                self.assertTrue(cfg["upstream"]["capabilities"]["supports_tools"])
+                self.assertFalse(cfg["upstream"]["capabilities"]["supports_tools"])
                 self.assertEqual(cfg["context"]["fanout_max_chunks"], 0)
                 gateway.save_config(cfg)
                 token = base64.b64encode(b"admin:admin").decode("ascii")
@@ -3351,23 +3351,22 @@ while True:
             gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
             os.environ["GATEWAY_WORKSPACE_ROOT"] = td
             try:
-                gateway.save_config(
-                    {
-                        **gateway._default_config(),
-                        "mcp": {
+                cfg = gateway._default_config()
+                cfg["mcp"] = {
+                    "enabled": True,
+                    "servers": [
+                        {
+                            "name": "test",
+                            "command": sys.executable,
+                            "args": [str(script_path)],
+                            "cwd": td,
                             "enabled": True,
-                            "servers": [
-                                {
-                                    "name": "test",
-                                    "command": sys.executable,
-                                    "args": [str(script_path)],
-                                    "cwd": td,
-                                    "enabled": True,
-                                }
-                            ],
-                        },
-                    }
-                )
+                        }
+                    ],
+                }
+                cfg["upstream"]["capabilities"]["supports_tools"] = True
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = True
+                gateway.save_config(cfg)
                 server = gateway.load_config()["mcp"]["servers"][0]
                 tools = _mcp_list_server_tools(server)
                 self.assertEqual(tools[0]["name"], "echo_mcp")
@@ -3386,7 +3385,7 @@ while True:
                 merged = _merge_builtin_tools("/v1/chat/completions", {"messages": []})
                 names = [
                     t.get("function", {}).get("name")
-                    for t in merged["tools"]
+                    for t in merged.get("tools", [])
                     if isinstance(t, dict) and isinstance(t.get("function"), dict)
                 ]
                 self.assertIn(public_name, names)
@@ -4150,6 +4149,8 @@ while True:
                 cfg["upstream"]["base_url"] = f"http://127.0.0.1:{upstream.server_address[1]}"
                 cfg["upstream"]["model"] = "m-chat-only"
                 cfg["upstream"]["protocol"] = "openai_chat"
+                cfg["upstream"]["capabilities"]["supports_tools"] = True
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = True
                 cfg["upstream"]["paths"] = {
                     "models": "/v1/models",
                     "chat_completions": "/v1/chat/completions",
@@ -5850,3 +5851,135 @@ class WeakUpstreamToolRoundSurfacingTests(unittest.TestCase):
         self.assertNotEqual((result.get("gateway_context") or {}).get("strategy"),
                             "gateway_local_planner_tool_round",
                             "must not re-surface tool rounds when tool_result is present")
+
+
+class ToolCallDefaultTests(unittest.TestCase):
+    """Tests that upstream APIs default to NOT supporting native tools.
+
+    The gateway must default to text-tool-adapter mode for unknown upstreams,
+    so that ANY API (even those without native tool support) can be used with
+    tool-calling clients like Claude Code / Codex.
+    """
+
+    def setUp(self):
+        self._old_config = gateway.CONFIG_PATH
+        self._td = tempfile.TemporaryDirectory()
+        gateway.CONFIG_PATH = pathlib.Path(self._td.name) / "config.json"
+        cfg = gateway._default_config()
+        gateway.save_config(cfg)
+
+    def tearDown(self):
+        gateway.CONFIG_PATH = self._old_config
+        self._td.cleanup()
+
+    def test_upstream_native_tools_capable_defaults_false(self):
+        from src.gateway_streaming import _upstream_native_tools_capable
+        self.assertFalse(_upstream_native_tools_capable(),
+                         "Default _upstream_native_tools_capable must be False")
+
+    def test_upstream_supports_native_tools_defaults_false(self):
+        from src.gateway_context import _upstream_supports_native_tools
+        self.assertFalse(_upstream_supports_native_tools(),
+                         "Default _upstream_supports_native_tools must be False")
+
+    def test_should_use_text_tool_adapter_defaults_true(self):
+        from src.gateway_streaming import _should_use_text_tool_adapter, _tools_enabled_for_upstream, _upstream_native_tools_capable
+        tools_enabled = _tools_enabled_for_upstream()
+        native_capable = _upstream_native_tools_capable()
+        self.assertEqual(tools_enabled, "auto")
+        self.assertFalse(native_capable)
+        self.assertTrue(_should_use_text_tool_adapter(tools_enabled, native_capable),
+                        "Text tool adapter must be the default when upstream doesn't support native tools")
+
+    def test_native_tools_capable_true_when_explicitly_configured(self):
+        cfg = gateway.load_config()
+        upstream = dict(cfg.get("upstream", {}))
+        upstream["capabilities"] = {"supports_tools": True, "supports_function_calls": True}
+        cfg["upstream"] = upstream
+        gateway.save_config(cfg)
+
+        from src.gateway_streaming import _upstream_native_tools_capable, _should_use_text_tool_adapter
+        self.assertTrue(_upstream_native_tools_capable(),
+                        "Must be True when explicitly configured")
+        self.assertFalse(_should_use_text_tool_adapter("auto", True),
+                         "Text adapter must not activate when native tools are configured")
+
+    def test_text_tool_adapter_strips_tools_and_injects_prompt(self):
+        """When upstream doesn't support native tools, _merge_builtin_tools strips
+        native 'tools' from the body and injects them as text in the system prompt."""
+        from src.gateway_streaming import _merge_builtin_tools
+
+        body = {
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Read the README.md file"},
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "Read", "parameters": {"type": "object", "properties": {"file_path": {"type": "string"}}}}},
+            ],
+            "max_tokens": 100,
+        }
+
+        result = _merge_builtin_tools("/v1/chat/completions", body)
+
+        # Tools should be stripped from wire format (text adapter mode)
+        self.assertNotIn("tools", result,
+                         "Native tools must be stripped in text adapter mode")
+
+        # System message must contain the tool adapter instructions
+        system_content = str(result["messages"][0].get("content", ""))
+        self.assertIn("Tool Call Gateway adapter", system_content,
+                      "System prompt must contain tool adapter instructions")
+
+        # User message must contain the reminder
+        user_content = str(result["messages"][1].get("content", ""))
+        self.assertIn("[IMPORTANT: Tool Call Gateway adapter is active", user_content,
+                      "User message must contain adapter reminder")
+
+    def test_text_tool_adapter_roundtrip_extracts_and_executes_text_tool_calls(self):
+        """End-to-end: request with tools → text adapter → upstream text with
+        tool calls → extract → execute → return results."""
+        from src.gateway_streaming import _merge_builtin_tools
+        from src.gateway_tool_runtime import _extract_text_tool_calls, _extract_tool_calls
+
+        body = {
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": "What files are in the current directory?"},
+            ],
+            "max_tokens": 100,
+        }
+
+        merged = _merge_builtin_tools("/v1/chat/completions", body)
+        # Verify text adapter activated (no native tools in body)
+        self.assertNotIn("tools", merged)
+
+        # Simulate upstream response with text tool call
+        response = {
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": (
+                        "Let me list the files.\n\n"
+                        "<function=Bash>\n"
+                        "<parameter=command>ls -la</parameter>\n"
+                        "</function>\n"
+                    ),
+                },
+                "finish_reason": "stop",
+            }],
+        }
+
+        # Native extraction should find nothing
+        native_calls = _extract_tool_calls("/v1/chat/completions", response)
+        self.assertEqual(len(native_calls), 0,
+                         "No native tool calls expected from text-only response")
+
+        # Text extraction should find the Bash call
+        text_calls = _extract_text_tool_calls("/v1/chat/completions", response)
+        self.assertGreater(len(text_calls), 0,
+                           "Text tool call extraction must find <function=Bash> in response")
+        self.assertEqual(text_calls[0].name, "Bash")
+        self.assertIn("cmd", text_calls[0].arguments)

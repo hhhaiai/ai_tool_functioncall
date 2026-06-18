@@ -468,7 +468,7 @@ def _upstream_supports_native_tools() -> bool:
     from .gateway_config import _upstream_config
     cfg = _upstream_config()
     capabilities = cfg.get("capabilities", {})
-    return capabilities.get("supports_tools", True)
+    return capabilities.get("supports_tools", False)
 
 
 def _summarize_via_llm(messages: list[Json], *, max_summary_tokens: int = 800) -> str | None:

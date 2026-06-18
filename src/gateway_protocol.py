@@ -182,7 +182,9 @@ def _convert_anthropic_messages_to_openai(messages: list[Json]) -> tuple[list[Js
                         if item.get("type") == "text":
                             text_parts.append(str(item.get("text") or ""))
                         elif item.get("type") == "thinking":
-                            reasoning_text = str(item.get("thinking") or "")
+                            thinking_part = str(item.get("thinking") or "")
+                            if thinking_part:
+                                reasoning_text = (reasoning_text + "\n" + thinking_part).strip() if reasoning_text else thinking_part
                         elif item.get("type") == "tool_use":
                             tool_calls.append({
                                 "id": item.get("id", ""),
@@ -584,9 +586,30 @@ def _from_anthropic_response_to_openai(response: Json) -> Json:
     if tool_calls:
         message["tool_calls"] = tool_calls
     finish_reason = response.get("stop_reason") or "stop"
-    return {
+    # Map Anthropic stop_reason to OpenAI finish_reason
+    _anthropic_to_openai_finish = {
+        "tool_use": "tool_calls",
+        "end_turn": "stop",
+        "stop_sequence": "stop",
+        "max_tokens": "length",
+        "pause_turn": "stop",
+        "refusal": "stop",
+    }
+    finish_reason = _anthropic_to_openai_finish.get(finish_reason, finish_reason)
+    result: Json = {
         "choices": [{"message": message, "finish_reason": finish_reason}],
     }
+    # Map usage from Anthropic to OpenAI format
+    anthropic_usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+    if anthropic_usage:
+        prompt_tokens = int(anthropic_usage.get("input_tokens") or 0)
+        completion_tokens = int(anthropic_usage.get("output_tokens") or 0)
+        result["usage"] = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+    return result
 
 
 # =============================================================================
@@ -1057,33 +1080,52 @@ def _compact_tool_schemas_for_text(tools: list[Json]) -> tuple[list[Json], int]:
     return compacted, omitted
 
 
-def _build_tool_text_block(tools: list[Json]) -> str:
+def _forced_tool_name_from_choice(tool_choice: Any) -> str:
+    if isinstance(tool_choice, dict):
+        if isinstance(tool_choice.get("function"), dict) and tool_choice["function"].get("name"):
+            return str(tool_choice["function"]["name"])
+        if tool_choice.get("name"):
+            return str(tool_choice["name"])
+    return ""
+
+
+def _build_tool_text_block(tools: list[Json], *, forced_tool_name: str = "") -> str:
     """Build a text block describing available tools for injection into system prompt."""
     compacted_tools, omitted = _compact_tool_schemas_for_text(tools)
+    if forced_tool_name:
+        compacted_tools.sort(key=lambda tool: 0 if str(tool.get("name") or "").lower() == forced_tool_name.lower() else 1)
     ft = _TOOL_FORMAT_TAG
     pt = _PARAM_TAG
     lines = [
-        "=== COMMAND EXECUTION MODE ===",
+        "=== Tool Call Gateway adapter ===",
         "",
-        "You are in an environment where you can execute shell commands.",
+        "You have access to real tools via this Gateway. When you need to use a tool,",
+        "OUTPUT THE TOOL CALL DIRECTLY in one of the formats below. Do NOT describe what",
+        "you would do - actually output the tool call so the Gateway can execute it.",
         "",
-        "CRITICAL: When the user asks you to perform an action:",
-        "- DO NOT explain what you would do",
-        "- DO NOT say you cannot execute commands",
-        "- JUST output the command directly",
+        "FORMAT 1 (XML - recommended):",
+        f"<{ft}=ToolName>",
+        f"<{pt}=param_name>value</{pt}>",
+        f"</{ft}>",
         "",
-        "Examples:",
-        "User: 'list files' \u2192 You output: ls -la",
-        "User: 'show tree' \u2192 You output: tree",
-        "User: 'current directory' \u2192 You output: pwd",
-        "User: 'read main.py' \u2192 You output: cat main.py",
+        'FORMAT 2 (JSON):',
+        '```json',
+        '{"name": "ToolName", "arguments": {"param_name": "value"}}',
+        '```',
         "",
-        "The system will automatically execute your command and show real results.",
-        "After seeing results, you can then analyze and explain them.",
+        "FORMAT 3 (bare command for shell tools):",
+        "ls -la",
         "",
-        "[Available Tools - you can also use XML format if preferred]",
+        "You may emit multiple tool calls. After the Gateway returns real tool results, continue with the final answer.",
+        "",
+        "[Available tools]",
         "",
     ]
+    if forced_tool_name:
+        lines.extend([
+            f"Forced tool_choice: you must call `{forced_tool_name}`.",
+            "",
+        ])
     used = 0
     for tool in compacted_tools:
         name = tool.get("name", "")
@@ -1111,18 +1153,49 @@ def _build_tool_text_block(tools: list[Json]) -> str:
         lines.append(f"... {omitted} duplicate/oversized tools omitted.")
     return "\n".join(lines)
 
-def _build_tool_reminder() -> str:
+def _build_tool_reminder(forced_tool_name: str = "") -> str:
     """Build a short reminder injected near the last user message."""
+    forced = f" Required tool: `{forced_tool_name}`." if forced_tool_name else ""
     return (
-        "\n\n[IMPORTANT: You are in a command execution environment. "
-        "When the user asks to perform an action (list files, show directory, etc), "
-        "output ONLY the shell command on a single line, nothing else. "
-        "Examples: 'ls -la', 'tree', 'cat file.txt', 'pwd'. "
-        "The system will execute it and return the result.]"
+        "\n\n[IMPORTANT: Tool Call Gateway adapter is active."
+        f"{forced} If a tool is needed, output `<function=ToolName>` with "
+        "`<parameter=name>value</parameter>` blocks only; the Gateway will execute it and return real results.]"
     )
 
 
-def _inject_tools_as_text_prompt(body: Json, tools: list[Json]) -> Json:
+def _append_text_adapter_reminder_to_responses_input(raw_input: Any, reminder: str) -> Any:
+    if isinstance(raw_input, str):
+        return raw_input + reminder
+    if isinstance(raw_input, list):
+        items = copy.deepcopy(raw_input)
+        for i in range(len(items) - 1, -1, -1):
+            item = items[i]
+            if isinstance(item, str):
+                items[i] = item + reminder
+                return items
+            if not isinstance(item, dict):
+                continue
+            role = item.get("role")
+            if role and role != "user":
+                continue
+            content = item.get("content")
+            if isinstance(content, str):
+                item["content"] = content + reminder
+                return items
+            if isinstance(content, list):
+                item["content"] = list(content) + [{"type": "input_text", "text": reminder}]
+                return items
+            text = item.get("text") or item.get("input")
+            if isinstance(text, str):
+                key = "text" if "text" in item else "input"
+                item[key] = text + reminder
+                return items
+        items.append({"role": "user", "content": reminder.strip()})
+        return items
+    return raw_input
+
+
+def _inject_tools_as_text_prompt(body: Json, tools: list[Json], *, forced_tool_name: str = "") -> Json:
     """Inject tool definitions and format instructions into the system/user prompt.
 
     Strategy: prepend the full tool block to the system message AND append a
@@ -1132,8 +1205,16 @@ def _inject_tools_as_text_prompt(body: Json, tools: list[Json]) -> Json:
     body = copy.deepcopy(body)
     if not tools:
         return body
-    tool_text = _build_tool_text_block(tools)
-    reminder = _build_tool_reminder()
+    forced_tool_name = forced_tool_name or _forced_tool_name_from_choice(body.get("tool_choice"))
+    tool_text = _build_tool_text_block(tools, forced_tool_name=forced_tool_name)
+    reminder = _build_tool_reminder(forced_tool_name)
+
+    if "input" in body and not body.get("messages"):
+        existing = str(body.get("instructions") or "")
+        body["instructions"] = tool_text + ("\n\n" + existing if existing else "")
+        body["input"] = _append_text_adapter_reminder_to_responses_input(body.get("input"), reminder)
+        return body
+
     messages = body.get("messages") or []
     if not messages:
         return body

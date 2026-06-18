@@ -410,10 +410,51 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8885)
     args = parser.parse_args()
+
+    # Load configuration
+    config = load_config()
+
+    # Initialize persistence layer
+    try:
+        from . import gateway_persistence as gp
+        persistence_config = config.get("persistence", {})
+        gp_config = gp.PersistenceConfig(
+            enabled=persistence_config.get("enabled", True),
+            db_path=persistence_config.get("db_path", ".gateway_runtime/gateway.db"),
+        )
+        gp.init_persistence(gp_config)
+        print(f"Persistence initialized: {gp_config.db_path}", flush=True)
+    except Exception as exc:
+        print(f"Warning: Failed to initialize persistence: {exc}", flush=True)
+
+    # Initialize permission system
+    try:
+        from . import gateway_permissions as gpm
+        gpm.init_permissions(config)
+        perm_config = config.get("permissions", {})
+        if perm_config.get("enabled", False):
+            print(f"Tool permissions enabled (default_allow={perm_config.get('default_allow', True)})", flush=True)
+        else:
+            print("Tool permissions disabled", flush=True)
+    except Exception as exc:
+        print(f"Warning: Failed to initialize permissions: {exc}", flush=True)
+
     httpd = ThreadingHTTPServer((args.host, args.port), GatewayHandler)
     print(f"native tool runtime gateway listening on http://{args.host}:{args.port}", flush=True)
     print("fake prompt tools: disabled", flush=True)
-    httpd.serve_forever()
+
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down...", flush=True)
+    finally:
+        # Clean shutdown
+        try:
+            from . import gateway_persistence as gp
+            gp.close_persistence()
+            print("Persistence closed cleanly", flush=True)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

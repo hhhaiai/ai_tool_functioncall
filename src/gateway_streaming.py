@@ -6,11 +6,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import time
 import uuid
 from typing import TYPE_CHECKING, Any
+
+_logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .gateway_app import ToolResult
@@ -320,26 +323,33 @@ def run_streaming_orchestration(
 
     _send_sse_headers(handler)
 
-    gateway_cfg = _gateway_config()
-    mode = str(os.environ.get("GATEWAY_TOOL_MODE") or gateway_cfg.get("tool_mode") or "orchestrate").lower()
-    upstream_protocol = _upstream_protocol()
+    try:
+        gateway_cfg = _gateway_config()
+        mode = str(os.environ.get("GATEWAY_TOOL_MODE") or gateway_cfg.get("tool_mode") or "orchestrate").lower()
+        upstream_protocol = _upstream_protocol()
 
-    if mode in {"passthrough", "native_passthrough", "proxy"}:
-        _stream_upstream_passthrough(handler, path, body)
-        return
+        if mode in {"passthrough", "native_passthrough", "proxy"}:
+            _stream_upstream_passthrough(handler, path, body)
+            return
 
-    with _workspace_scope(_request_workspace_root(body)):
-        _run_streaming_orchestration_scoped(
-            handler,
-            path,
-            body,
-            mode=mode,
-            upstream_protocol=upstream_protocol,
-            gateway_cfg=gateway_cfg,
-            max_rounds=_configured_max_tool_rounds(gateway_cfg),
-            upstream=NativeProxyClient(),
-            context_cfg=_context_config(),
-        )
+        with _workspace_scope(_request_workspace_root(body)):
+            _run_streaming_orchestration_scoped(
+                handler,
+                path,
+                body,
+                mode=mode,
+                upstream_protocol=upstream_protocol,
+                gateway_cfg=gateway_cfg,
+                max_rounds=_configured_max_tool_rounds(gateway_cfg),
+                upstream=NativeProxyClient(),
+                context_cfg=_context_config(),
+            )
+    except Exception as exc:
+        try:
+            _write_sse(handler, {"error": str(exc)}, event="error")
+            _write_sse(handler, "[DONE]", event="done")
+        except Exception:
+            pass
 
 
 def _run_streaming_orchestration_scoped(
@@ -411,8 +421,8 @@ def _run_streaming_orchestration_scoped(
                     if _enhancement not in _ex:
                         _msgs[0]["content"] = _ex + "\n\n" + _enhancement
                     request_body["messages"] = _msgs
-    except Exception:
-        pass
+    except Exception as _exc:
+        _logger.debug("Intelligence enhancement skipped: %s", _exc)
 
     upstream_path, request_body = _convert_request_to_upstream(path, request_body, upstream_protocol)
     # The gateway is responsible for emitting downstream SSE in orchestrate
@@ -421,6 +431,7 @@ def _run_streaming_orchestration_scoped(
     request_body["stream"] = False
 
     tools_stripped = False
+    original_tools = list(request_body.get("tools") or [])
     for _round in range(max_rounds):
         try:
             response = upstream.forward(upstream_path, request_body)
@@ -429,7 +440,7 @@ def _run_streaming_orchestration_scoped(
             if isinstance(exc, UpstreamHTTPError) and exc.upstream_status == 400 and not tools_stripped and request_body.get("tools"):
                 from .gateway_protocol import _inject_tools_as_text_prompt, _without_tools
                 request_body = _without_tools(request_body)
-                request_body = _inject_tools_as_text_prompt(request_body, [])
+                request_body = _inject_tools_as_text_prompt(request_body, original_tools)
                 tools_stripped = True
                 continue
             _write_sse(handler, {"error": str(exc)}, event="error")
@@ -491,7 +502,7 @@ def _upstream_native_tools_capable() -> bool:
     from .gateway_config import _upstream_config
     cfg = _upstream_config()
     capabilities = cfg.get("capabilities") if isinstance(cfg.get("capabilities"), dict) else {}
-    return bool(capabilities.get("supports_tools", True)) and bool(capabilities.get("supports_function_calls", True))
+    return bool(capabilities.get("supports_tools", False)) and bool(capabilities.get("supports_function_calls", False))
 
 
 def _should_use_text_tool_adapter(tools_enabled: str, native_capable: bool) -> bool:
@@ -502,7 +513,7 @@ def _should_use_text_tool_adapter(tools_enabled: str, native_capable: bool) -> b
     schemas upstream. Use the local gateway adapter instead so weak model APIs
     do not reject the request or hallucinate unsupported protocol objects.
     """
-    if tools_enabled in {"off", "disabled", "false", "0", "none", "text_only", "adapter"}:
+    if tools_enabled in {"text_only", "adapter", "prompt"}:
         return True
     if tools_enabled == "auto" and not native_capable:
         return True
@@ -560,6 +571,10 @@ def _merge_builtin_tools(path: str, body: dict) -> dict:
     if tools_enabled == "native_only" and not native_capable:
         from .gateway_errors import GatewayError
         raise GatewayError("upstream profile is configured as native_only but capabilities disable native tools/function calls")
+    if tools_enabled in {"off", "disabled", "false", "0", "none"}:
+        body.pop("tools", None)
+        body.pop("tool_choice", None)
+        return body
 
     # Get existing tools
     tools = body.get("tools", [])
@@ -583,10 +598,12 @@ def _merge_builtin_tools(path: str, body: dict) -> dict:
         # Strip native tools and inject as compact text prompt.  Compact first so
         # Claude Code/Codex harness metadata plus adapter instructions stay under
         # weak upstream request-size limits.
+        from .gateway_protocol import _forced_tool_name_from_choice
+        forced_tool_name = _forced_tool_name_from_choice(body.get("tool_choice"))
         body = _maybe_compact_for_text_tool_adapter(path, body)
         body.pop("tools", None)
         body.pop("tool_choice", None)
-        body = _inject_tools_as_text_prompt(body, tools)
+        body = _inject_tools_as_text_prompt(body, tools, forced_tool_name=forced_tool_name)
         return body
 
     body["tools"] = tools

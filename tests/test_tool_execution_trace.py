@@ -158,7 +158,7 @@ class TestExecuteToolCallTiming(unittest.TestCase):
         """Builtin tool that raises ToolExecutionError records execution_ms + retry_count + provider."""
 
         def bad_handler(args):
-            raise ToolExecutionError("intentional error", "execution_failed")
+            raise ToolExecutionError("intentional error", failure_type="execution_failed")
 
         orig = gateway.BUILTIN_TOOLS.get("echo")
         gateway.BUILTIN_TOOLS["_test_trace"] = gateway.GatewayTool(
@@ -223,7 +223,7 @@ class TestExecuteToolCallRetry(unittest.TestCase):
         def flaky_handler(args):
             attempts["count"] += 1
             if attempts["count"] < 3:
-                raise ToolExecutionError("transient", "execution_failed")
+                raise ToolExecutionError("transient", failure_type="execution_failed")
             return "ok"
 
         gateway.BUILTIN_TOOLS["_test_flaky"] = gateway.GatewayTool(
@@ -259,7 +259,7 @@ class TestExecuteToolCallRetry(unittest.TestCase):
 
         def always_fail(args):
             attempts["count"] += 1
-            raise ToolExecutionError("permanent", "execution_failed")
+            raise ToolExecutionError("permanent", failure_type="execution_failed")
 
         gateway.BUILTIN_TOOLS["_test_perm"] = gateway.GatewayTool(
             name="_test_perm",
@@ -307,7 +307,7 @@ class TestDirectToolCallProvider(unittest.TestCase):
         """Direct tool invocation must record provider='direct'."""
 
         def bad_handler(args):
-            raise ToolExecutionError("fail", "execution_failed")
+            raise ToolExecutionError("fail", failure_type="execution_failed")
 
         gateway.BUILTIN_TOOLS["_test_direct"] = gateway.GatewayTool(
             name="_test_direct",
