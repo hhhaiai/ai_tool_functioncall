@@ -188,7 +188,11 @@ def _default_config() -> Json:
         "gateway": {
             "tool_mode": os.environ.get("GATEWAY_TOOL_MODE", "orchestrate"),
             "max_tool_rounds": int(os.environ.get("GATEWAY_MAX_TOOL_ROUNDS") or 5),
-            "workspace_root": os.environ.get("GATEWAY_WORKSPACE_ROOT") or os.getcwd(),
+            # Runtime workspace is request-scoped.  Keep the default empty so
+            # missing client workspace metadata never falls back to the Gateway
+            # service checkout.  An explicit env/config root is still accepted
+            # as a testing/admin fallback by the tool runtime.
+            "workspace_root": os.environ.get("GATEWAY_WORKSPACE_ROOT", ""),
             "allow_write_tools": os.environ.get("GATEWAY_ALLOW_WRITE_TOOLS", "0") in {"1", "true", "yes"},
             "allow_shell_tools": os.environ.get("GATEWAY_ALLOW_SHELL_TOOLS", "0") in {"1", "true", "yes"},
             "request_logging": True,
@@ -202,6 +206,7 @@ def _default_config() -> Json:
             "record_unsupported_tools": _env_bool("GATEWAY_RECORD_UNSUPPORTED_TOOLS", True),
             "text_tool_call_fallback_enabled": _env_bool("GATEWAY_TEXT_TOOL_CALL_FALLBACK", True),
             "text_tool_adapter_compact_token_limit": _env_int("GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT", 48000),
+            "execute_user_side_tools_in_gateway": _env_bool("GATEWAY_EXECUTE_USER_SIDE_TOOLS", False),
             "intent_detection_enabled": _env_bool("GATEWAY_INTENT_DETECTION_ENABLED", True),
             "local_planner_enabled": _env_bool("GATEWAY_LOCAL_PLANNER_ENABLED", True),
             "local_planner_max_files": _env_int("GATEWAY_LOCAL_PLANNER_MAX_FILES", 24),
@@ -327,10 +332,19 @@ def save_config(config: Json) -> None:
     normalized = copy.deepcopy(config)
     _normalize_admin_credentials(normalized)
     _ensure_client_snippet_downstream_key(normalized)
-    # Remove runtime-only fields that should not be persisted
-    # workspace_root is dynamically determined per-request from client metadata
+    # Remove implicit runtime-only roots that would point at the Gateway service
+    # checkout.  Explicit non-empty workspace_root values are preserved as an
+    # admin/testing fallback, but the default empty value is not persisted.
     if "gateway" in normalized and isinstance(normalized["gateway"], dict):
-        normalized["gateway"].pop("workspace_root", None)
+        root = str(normalized["gateway"].get("workspace_root") or "").strip()
+        if not root:
+            normalized["gateway"].pop("workspace_root", None)
+        elif not os.environ.get("GATEWAY_WORKSPACE_ROOT"):
+            try:
+                if pathlib.Path(root).expanduser().resolve(strict=False) == pathlib.Path.cwd().resolve(strict=False):
+                    normalized["gateway"].pop("workspace_root", None)
+            except Exception:
+                pass
 
     # Encrypt sensitive fields before saving
     try:

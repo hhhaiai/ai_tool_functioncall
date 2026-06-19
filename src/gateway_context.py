@@ -622,6 +622,7 @@ def _compact_messages(messages: Any, *, keep_recent: int, text_limit: int) -> li
 def _compact_request_for_upstream(path: str, body: Json, cfg: Json, *, reason: str = "over_limit") -> Json:
     """Remove bulky downstream harness metadata while preserving user intent."""
     from .gateway_protocol import _without_tools
+    had_tools = bool(body.get("tools")) or body.get("tool_choice") not in (None, "", "none")
     updated = _without_tools(body)
     for key in ("metadata", "thinking", "output_config"):
         updated.pop(key, None)
@@ -645,7 +646,12 @@ def _compact_request_for_upstream(path: str, body: Json, cfg: Json, *, reason: s
             updated["input"] = _trim_content_for_context(existing, summary_limit)
         updated["instructions"] = _gateway_system_prompt(reason)
     updated.setdefault("gateway_context", {})
-    updated["gateway_context"].update({"compacted": True, "reason": reason, "original_estimated_tokens": _body_token_estimate(body)})
+    updated["gateway_context"].update({
+        "compacted": True,
+        "reason": reason,
+        "original_estimated_tokens": _body_token_estimate(body),
+        "had_tools": had_tools,
+    })
     return updated
 
 

@@ -23,7 +23,7 @@
 4. **无限上下文组合策略**
    - 短上下文：直接召回 SQLite 记忆 + 本地 planner 工具证据。
    - 大上下文：`context_fanout` 分片并发请求上游，最后综合 + 质量审查。
-   - 项目分析：本地真实 `Tree/Glob/PythonSymbols/ReadManyFiles` 先收集证据，再交给上游总结。
+   - 项目分析：默认先生成下游用户侧 `Tree/Glob/PythonSymbols/ReadManyFiles` 工具请求；显式本地代理模式才由 Gateway 先收集证据再交给上游总结。
 
 ## 配置项
 

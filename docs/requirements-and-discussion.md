@@ -70,8 +70,8 @@ Gateway 是一个**真实的工具执行 runtime**，不是 prompt faker。
 
 | # | 需求 | 优先级 | 状态 |
 |---|------|--------|------|
-| 1 | **文本级工具调用识别与执行** - 解析模型文本输出中的工具调用语法，执行真实工具 | P0 | **已实现** |
-| 2 | **code_interpreter 本地沙箱** - 在 Gateway 本地执行 Python 代码 | P1 | **已实现** |
+| 1 | **文本级工具调用识别与归属分流** - 解析模型文本输出中的工具调用语法，Gateway-owned 工具执行，用户侧工具下发客户端 | P0 | **已实现** |
+| 2 | **code_interpreter / 本地代码执行治理** - 默认下发用户客户端；显式本地代理模式才在 Gateway 执行 Python 代码 | P1 | **已实现** |
 | 3 | **高风险工具治理** - 写入、Shell、GUI 工具默认关闭，按 workspace/root 权限执行并记录失败 | P1 | **已实现基础治理；可继续增强审批流** |
 | 4 | **无限上下文** - 支持超长输入的分片处理、上下文压缩、SQLite 记忆召回 | P1 | **已实现并有回归测试** |
 | 5 | **支持稳定真实 tool calls** - 覆盖项目识别、文件读写改、Shell/coding、网络查询、并行工具、SQLite 记录 | P0 | **已实现并有 smoke 测试** |
@@ -85,8 +85,8 @@ Gateway 是一个**真实的工具执行 runtime**，不是 prompt faker。
 
 - 默认上游：由环境变量或本地 `.gateway_service.json` 配置；公开文档不包含测试地址和真实 key。
 - 上游可只有 OpenAI `/v1/chat/completions`；Gateway 对下游仍提供 `/v1/chat/completions`、`/v1/responses`、`/v1/messages`，内部统一转到上游 chat completions。
-- 默认认为上游不支持 native tools/function calls：Gateway 不把大 `tools` schema 透传给上游，而是本地真实执行 tools。
-- Gateway 本地真实执行 tools：项目识别、文件读取/写入/编辑、Bash/coding、WebFetch/WebSearch、并行工具。
+- 默认认为上游不支持 native tools/function calls：Gateway 不把大 `tools` schema 透传给上游，而是使用文本工具适配并按工具归属分流。
+- Gateway-owned 工具真实执行：HTTP Action/MCP/WebFetch/WebSearch/calculator/Memory 等；用户侧文件读取/写入/编辑、Bash/coding、Skill、GUI/local agent 默认下发给 Claude Code/Codex 客户端执行。
 - 高频日志只写 SQLite WAL：`gateway_log.sqlite3`；JSONL/JSON 仅作为历史导入/读取，不作为默认写入后端。
 - Web UI 当前支持多上游 API profile、上游能力勾选、下游多 key + 协议限制。
 - 脚本只保留两个：`scripts/mimo_gateway.sh` 和 `scripts/claude_m1.sh`。

@@ -1,6 +1,6 @@
 # Gateway 架构文档
 
-> 真实测试上游 / Mimo 作为上游时默认按 **Gateway adapter** 处理：`tools_enabled=adapter`，`supports_tools=false`，`supports_function_calls=false`。真实地址只放本地 `.gateway_service.json`、`.env` 或运行时环境变量，不写入提交代码。当前探针显示 `/v1/messages` 在 forced tool_choice 下可返回 Anthropic `tool_use`，但上游直连没有 `/anthropic` 别名、没有 `/v1/tools/call` / `/v1/functions/call`，且 `/v1/responses` forced tool probe 未返回 Codex 需要的 `function_call`。因此 Claude Code/Codex 不直连该上游执行工具，而是连接 Gateway，由 Gateway 本地 runtime/MCP/HTTP Actions 执行真实工具，再把结果回填给上游模型继续生成。Mimo 上下文按 `1048576` tokens（1M）配置。
+> 真实测试上游 / Mimo 作为上游时默认按 **Gateway adapter** 处理：`tools_enabled=adapter`，`supports_tools=false`，`supports_function_calls=false`。真实地址只放本地 `.gateway_service.json`、`.env` 或运行时环境变量，不写入提交代码。当前探针显示 `/v1/messages` 在 forced tool_choice 下可返回 Anthropic `tool_use`，但上游直连没有 `/anthropic` 别名、没有 `/v1/tools/call` / `/v1/functions/call`，且 `/v1/responses` forced tool probe 未返回 Codex 需要的 `function_call`。因此 Claude Code/Codex 不直连该上游执行工具，而是连接 Gateway：Gateway-owned 工具（HTTP Action/MCP/WebFetch/WebSearch/calculator/Memory 等）由 Gateway 真执行；用户侧机器工具（Read/LS/Bash/Skill/GUI/local agent 等）由 Gateway 转成下游原生 tool request，让客户端在用户机器执行后回传结果。Mimo 上下文按 `1048576` tokens（1M）配置。
 
 ## 1. 系统定位
 
@@ -38,7 +38,7 @@
 
 | 类型 | Tool 支持 | 代表厂商 | Gateway 处理方式 |
 |------|-----------|----------|------------------|
-| **Chat API** | ❌ 不支持 | 某些三方模型 | 文本注入 + 本地工具执行 |
+| **Chat API** | ❌ 不支持 | 某些三方模型 | 文本注入 + 工具归属分流（Gateway-owned 执行 / 用户侧下发） |
 | **Sub API** | ⚠️ 部分支持 | 部分商家的精简版 | 补齐缺失能力 |
 | **Full API** | ✅ 完全支持 | OpenAI、Claude 官方 | 直接透传 |
 
@@ -67,13 +67,13 @@ Anthropic Messages   →  gateway_protocol  →  任意下游格式
 对于上游不支持或部分支持工具的场景：
 
 ```
-上游返回 (无tool能力)          Gateway 本地执行
+上游返回 (无tool能力)          Gateway 归属判断
          │                           │
          ▼                           ▼
-┌──────────────────┐      ┌────────────────────────┐
-│ 文本协议提示      │      │ gateway_tool_runtime   │
-│ 解析弱工具调用    │      │ 真实执行工具 + 回填结果 │
-└──────────────────┘      └────────────────────────┘
+┌──────────────────┐      ┌────────────────────────────────────┐
+│ 文本协议提示      │      │ gateway-owned: 真执行并回填上游       │
+│ 解析弱工具调用    │      │ user-side: 返回下游原生 tool request │
+└──────────────────┘      └────────────────────────────────────┘
 ```
 
 **核心模块**: `gateway_tool_runtime.py`, `gateway_builtin_tools.py`
@@ -322,4 +322,4 @@ Token 估算 (body_token_estimate)
 | OpenCode | OpenAI Chat | `OPENAI_BASE_URL` |
 | Python SDK | OpenAI Chat/Responses | `base_url + api_key` |
 
-所有下游通过 Gateway 后，都获得一致的 Tool Call 使用入口；真实执行能力来自 Gateway 内置工具、MCP、HTTP Action、provider-native tools 或其它明确配置的 executor。Claude Code / Codex 的工具、Skills 和项目级路径按“当前下游项目根”隔离，内部 `workspace_root` / `gateway_workspace` / `projectDir` / `cwd` 等路由字段只在 Gateway 内使用，不作为上游模型语义透传；普通转发与 streaming passthrough 都会在上游请求前清理这些字段及 metadata JSON 里的同类嵌套字段。
+所有下游通过 Gateway 后，都获得一致的 Tool Call 使用入口；真实执行能力来自两类位置：Gateway-owned 工具（MCP、HTTP Action、网络/纯函数/记忆等）在 Gateway 执行，用户侧机器工具（文件、shell、GUI、项目 skills/local agent 等）返回给 Claude Code / Codex 在用户机器执行。Claude Code / Codex 的项目级路径按“当前下游项目根”隔离，内部 `workspace_root` / `gateway_workspace` / `projectDir` / `cwd` 等路由字段只在 Gateway 内用于会话/记忆/路由，不作为上游模型语义透传；普通转发与 streaming passthrough 都会在上游请求前清理这些字段及 metadata JSON 里的同类嵌套字段。

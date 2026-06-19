@@ -309,9 +309,12 @@ def run_streaming_orchestration(
     from .gateway_tool_runtime import (
         _append_text_tool_results,
         _append_tool_results,
+        _calls_require_downstream_execution,
+        _convert_text_calls_to_downstream_response,
         _convert_response_to_path,
         _detect_intent_tool_calls,
         _direct_local_bash_response,
+        _direct_downstream_tool_request_response,
         _direct_local_file_read_response,
         _execute_tool_call,
         _extract_text_tool_calls,
@@ -374,9 +377,12 @@ def _run_streaming_orchestration_scoped(
     from .gateway_tool_runtime import (
         _append_text_tool_results,
         _append_tool_results,
+        _calls_require_downstream_execution,
+        _convert_text_calls_to_downstream_response,
         _convert_response_to_path,
         _detect_intent_tool_calls,
         _direct_local_bash_response,
+        _direct_downstream_tool_request_response,
         _direct_local_file_read_response,
         _direct_local_skill_response,
         _execute_tool_call,
@@ -392,6 +398,8 @@ def _run_streaming_orchestration_scoped(
             direct_response = _direct_local_skill_response(path, memory_body)
         if direct_response is None:
             direct_response = _direct_local_bash_response(path, memory_body)
+        if direct_response is None:
+            direct_response = _direct_downstream_tool_request_response(path, memory_body)
         if direct_response is not None:
             _stream_final_response(handler, path, direct_response)
             _remember_conversation_turn(path, body, direct_response)
@@ -461,6 +469,16 @@ def _run_streaming_orchestration_scoped(
         if not calls:
             _stream_final_response(handler, path, downstream_response)
             _remember_conversation_turn(path, body, downstream_response)
+            return
+
+        if _calls_require_downstream_execution(calls, memory_body):
+            native_response = (
+                _convert_text_calls_to_downstream_response(path, calls, downstream_response, upstream_protocol)
+                if text_fallback
+                else downstream_response
+            )
+            _stream_final_response(handler, path, native_response)
+            _remember_conversation_turn(path, body, native_response)
             return
 
         results = []
@@ -580,6 +598,22 @@ def _merge_builtin_tools(path: str, body: dict) -> dict:
     tools = body.get("tools", [])
     if not isinstance(tools, list):
         tools = []
+    gateway_context = body.get("gateway_context") if isinstance(body.get("gateway_context"), dict) else {}
+    caller_requested_tools = (
+        bool(tools)
+        or body.get("tool_choice") not in (None, "", "none")
+        or bool(gateway_context.get("had_tools"))
+    )
+
+    if _should_use_text_tool_adapter(tools_enabled, native_capable) and not caller_requested_tools:
+        # Plain chat requests should stay plain.  The gateway only downgrades
+        # tool schemas into text adapter instructions when the downstream
+        # actually requested tools/tool_choice; otherwise every weak-upstream
+        # request gets polluted with a large tool manual and simple messages no
+        # longer reach upstream intact.
+        body.pop("tools", None)
+        body.pop("tool_choice", None)
+        return body
 
     # Add builtin tools
     for tool in BUILTIN_TOOLS.values():
@@ -734,6 +768,22 @@ def _stream_final_response(handler: Any, path: str, response: dict) -> None:
         choices = response.get("choices", [])
         for choice in choices:
             message = choice.get("message", {})
+            if message.get("tool_calls"):
+                _write_sse(handler, {
+                    "id": response.get("id", ""),
+                    "object": "chat.completion.chunk",
+                    "choices": [{
+                        "index": choice.get("index", 0),
+                        "delta": {"tool_calls": message["tool_calls"]},
+                        "finish_reason": None,
+                    }],
+                })
+                _write_sse(handler, {
+                    "id": response.get("id", ""),
+                    "object": "chat.completion.chunk",
+                    "choices": [{"index": choice.get("index", 0), "delta": {}, "finish_reason": "tool_calls"}],
+                })
+                continue
             if message.get("content"):
                 _write_sse(handler, {
                     "id": response.get("id", ""),
@@ -744,11 +794,12 @@ def _stream_final_response(handler: Any, path: str, response: dict) -> None:
                         "finish_reason": None,
                     }],
                 })
-        _write_sse(handler, {
-            "id": response.get("id", ""),
-            "object": "chat.completion.chunk",
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-        })
+        if not any(((choice.get("message") or {}).get("tool_calls")) for choice in choices):
+            _write_sse(handler, {
+                "id": response.get("id", ""),
+                "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            })
     elif "/messages" in path:
         msg_id = response.get("id", f"msg_{uuid.uuid4().hex}")
         model = response.get("model", "")

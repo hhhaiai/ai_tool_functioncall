@@ -61,6 +61,7 @@ gateway:
   # 工具权限
   allow_write_tools: false           # 允许文件写入工具；仅可信本地 coding-agent 场景开启
   allow_shell_tools: false           # 允许 Shell 执行工具；生产默认关闭
+  execute_user_side_tools_in_gateway: false  # 默认禁止在 Gateway 服务机执行用户侧文件/shell/GUI/local agent 工具
 
   # 工具执行
   max_tool_rounds: 10                # 最大工具调用轮数

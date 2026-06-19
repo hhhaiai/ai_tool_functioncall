@@ -105,6 +105,7 @@ ufw enable
 | `GATEWAY_TOOL_MODE` | Tool mode | orchestrate |
 | `GATEWAY_ALLOW_WRITE_TOOLS` | Enable workspace write/edit tools | `0` |
 | `GATEWAY_ALLOW_SHELL_TOOLS` | Enable shell/code execution tools | `0` |
+| `GATEWAY_EXECUTE_USER_SIDE_TOOLS` | Execute user-side filesystem/shell/GUI/local-agent tools on the Gateway host instead of delegating to client | `0` |
 | `GATEWAY_CONTEXT_ENABLED` | Enable context management | 1 |
 | `GATEWAY_MEMORY_ENABLED` | Enable memory system | 1 |
 
@@ -214,7 +215,7 @@ deploy:
 
 1. **Change default passwords**: Always change `GATEWAY_ADMIN_PASSWORD`
 2. **Require client auth**: Always set `GATEWAY_DOWNSTREAM_KEY` in production
-3. **Least privilege tools**: Keep `GATEWAY_ALLOW_WRITE_TOOLS=0` and `GATEWAY_ALLOW_SHELL_TOOLS=0` unless the deployment is a trusted coding-agent workspace
+3. **Least privilege tools**: Keep `GATEWAY_ALLOW_WRITE_TOOLS=0`, `GATEWAY_ALLOW_SHELL_TOOLS=0`, and `GATEWAY_EXECUTE_USER_SIDE_TOOLS=0` unless the deployment is a trusted local coding-agent workspace where Gateway and client intentionally share the same machine/workspace
 4. **Use HTTPS**: Configure SSL certificates for production
 5. **Restrict access**: Use firewall rules to limit access
 6. **API keys**: Use `GATEWAY_DOWNSTREAM_KEY` for client authentication

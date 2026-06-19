@@ -200,16 +200,17 @@ curl http://127.0.0.1:8885/healthz
 | `upstream.model` | `mimo-v2.5-pro`（模板） | 默认模型名称 |
 | `upstream.protocol` | openai_chat | 上游协议类型 |
 | `upstream.max_input_tokens` / `max_output_tokens` | 1048576 / 131072（Mimo 模板） | 上游上下文/输出预算声明；客户端片段按 1M 同步 |
-| `upstream.tools_enabled` | adapter（Mimo 模板） | 工具模式：`auto` 按能力自动选择；`native` 发送原生 tools；`native_only` 能力不足即失败；`adapter`/`text_only`/`off` 走 Gateway 本地真实工具文本适配 |
+| `upstream.tools_enabled` | adapter（Mimo 模板） | 工具模式：`auto` 按能力自动选择；`native` 发送原生 tools；`native_only` 能力不足即失败；`adapter`/`text_only`/`off` 走 Gateway 文本工具适配 |
 | `upstream.paths.models` | `/v1/models` | Admin UI 模型自动获取和 `/v1/models` 转发使用的上游路径 |
-| `upstream.capabilities.supports_tools` / `supports_function_calls` | false（Mimo 模板） | 上游是否原生支持当前客户端所需 tools/function calls；Mimo `/v1/messages` forced probe 可返回 `tool_use`，但 `/v1/responses` function_call 未证实，Claude Code/Codex 默认由 Gateway 本地 runtime 执行 |
+| `upstream.capabilities.supports_tools` / `supports_function_calls` | false（Mimo 模板） | 上游是否原生支持当前客户端所需 tools/function calls；Mimo `/v1/messages` forced probe 可返回 `tool_use`，但 `/v1/responses` function_call 未证实，Claude Code/Codex 默认由 Gateway adapter 转成下游原生工具请求 |
 | `upstream.capabilities.supports_vision` | false | 上游是否支持图片/截图/识图输入；在 Admin UI 明确展示和保存 |
 | `upstream.capabilities.supports_network` | false | 上游模型是否具备联网能力；在 Admin UI 明确展示和保存 |
 | `upstream.capabilities.supports_web_search` | false | 上游模型是否支持 web search；在 Admin UI 明确展示和保存 |
-| `gateway.workspace_root` | `./workspace`（模板）/ 当前目录（无配置时） | 工具读写的兜底根目录；当前请求的显式 `workspace_root` / `gateway_workspace` 优先，其次自动识别 Claude Code / Codex 下游项目目录，再其次才是非默认 `GATEWAY_WORKSPACE_ROOT`、保存配置和默认当前目录 |
+| `gateway.workspace_root` | 空（默认）/ 显式配置 root | 工具读写的兜底根目录；当前请求的显式 `workspace_root` / `gateway_workspace` 优先，其次自动识别 Claude Code / Codex 下游项目目录，再其次是 `GATEWAY_WORKSPACE_ROOT`、显式保存配置 root；默认不会回退 Gateway 服务启动目录，缺失 workspace 时使用匿名隔离空间 |
 | `gateway.tool_mode` | orchestrate | 工具模式：`orchestrate` / `native_passthrough` / `proxy`；兼容旧值 `passthrough` |
 | `gateway.allow_write_tools` | false | 是否允许文件写入 |
 | `gateway.allow_shell_tools` | false | 是否允许 Shell 执行 |
+| `gateway.execute_user_side_tools_in_gateway` | false | 是否把用户侧文件/shell/GUI/local-agent 工具在 Gateway 服务机执行；默认 false，Gateway 只向下游返回 tool_use/tool_calls/function_call，由 Claude Code/Codex 在用户机器执行 |
 | `gateway.client_snippet_api_key` | - | 客户端连接 Gateway 的 API Key；保存配置时会自动同步为可认证的 downstream key |
 | `gateway.client_context_window` | 1048576 | 下游 Claude Code/Codex 配置片段中的上下文窗口；Mimo 按 1M 配置 |
 | `gateway.max_tool_rounds` | 5 | orchestrate 模式最大工具调用轮数；运行时优先使用 `GATEWAY_MAX_TOOL_ROUNDS` 环境变量，其次使用 Admin/配置文件保存值 |
@@ -219,7 +220,7 @@ curl http://127.0.0.1:8885/healthz
 | `gateway.max_request_body_bytes` | 67108864 | HTTP POST 请求体读取前上限；超限返回 413，避免大请求先占用内存 |
 | `gateway.max_log_payload_chars` | 200000 | 单个 request/response 日志 payload 与 tool failure 内容截断上限；先遮盖敏感字段再截断 |
 | `gateway.text_tool_adapter_compact_token_limit` | 48000 | 弱上游文本工具适配前的压缩阈值上限；实际阈值动态计算为 `max(8000, min(upstream.max_input_tokens * 0.45, 此值))`；设为 0 可关闭 |
-| `gateway.local_planner_enabled` | true | 对分析/审查请求以及点名 `read/show/cat/open/查看/读取` 文件路径的请求，先用 Gateway 本地真实读文件/目录/符号工具注入证据；弱上游不发 tool call 时也能稳定完成本地文件读取 smoke；文件路径按当前下游项目根隔离 |
+| `gateway.local_planner_enabled` | true | 对分析/审查请求以及点名 `read/show/cat/open/查看/读取` 文件路径的请求，默认合成下游用户侧工具请求；只有 `execute_user_side_tools_in_gateway=true` 时才使用旧的 Gateway 本地读文件/目录/符号证据注入 |
 | `context.max_input_tokens` | 1048576 | Mimo 1M 上下文阈值；超过此值触发上下文压缩/扇出 |
 
 ### 3.4 环境变量对照表
@@ -232,11 +233,12 @@ curl http://127.0.0.1:8885/healthz
 | `UPSTREAM_MAX_INPUT_TOKENS` / `UPSTREAM_MAX_OUTPUT_TOKENS` | upstream token limits | Mimo 模板为 `1048576` / `131072` |
 | `GATEWAY_TOOLS_ENABLED` | upstream.tools_enabled | Mimo 跨 Claude Code/Codex 稳定接入时设为 `adapter` |
 | `UPSTREAM_SUPPORTS_TOOLS` / `UPSTREAM_SUPPORTS_FUNCTION_CALLS` | upstream.capabilities | Mimo Messages `tool_use` 仅部分证实；Codex Responses function_call 未证实，默认均设为 `0` |
+| `GATEWAY_EXECUTE_USER_SIDE_TOOLS` | gateway.execute_user_side_tools_in_gateway | 默认 `0`；只有本地代理式部署且确认 Gateway 与用户客户端同机/同 workspace 时才可开启 |
 | `GATEWAY_UPSTREAM_PROTOCOL` | upstream.protocol | 上游协议类型，优先于 legacy `UPSTREAM_PROTOCOL` |
 | `UPSTREAM_PROTOCOL` | upstream.protocol | 兼容旧环境变量，未设置 `GATEWAY_UPSTREAM_PROTOCOL` 时生效 |
 | `GATEWAY_DOWNSTREAM_KEY` | downstream key + gateway.client_snippet_api_key | 下游 API Key；环境变量会同时用于认证和客户端片段 |
 | `GATEWAY_ADMIN_PASSWORD` | admin.password | 管理员密码 |
-| `GATEWAY_WORKSPACE_ROOT` | gateway.workspace_root | 显式设置为非当前目录时优先于保存配置，但仍低于请求体 root 和下游客户端项目目录；启动脚本默认导出的 `$PWD` 只作为兜底，不会压过 UI/配置保存的 workspace_root |
+| `GATEWAY_WORKSPACE_ROOT` | request workspace fallback | 显式设置时优先于保存配置 root，但仍低于请求体 root 和下游客户端项目目录；不设置时不会使用 Gateway 服务 cwd 作为用户项目目录 |
 | `GATEWAY_SKILLS_DIRS` | Skill tool search path | 额外 skills 目录，使用 `:` 分隔；加载顺序在当前下游项目 skills、项目内插件 skills、用户全局 skills 之后 |
 | `GATEWAY_PORT` | - | 监听端口（默认 8885） |
 | `GATEWAY_HOST` | - | 监听地址（默认 0.0.0.0） |
@@ -452,7 +454,7 @@ GATEWAY_ADMIN_PASSWORD=admin \
 2026-05-25 的结论是：真实测试 Mimo OpenAI-compatible 上游可用（地址只在本地 ignored 配置/环境变量中保存）；它支持 `/v1/chat/completions`、`/v1/responses`、`/v1/messages`，并且 `/v1/messages` forced tool_choice 探针可返回 Anthropic `tool_use`。但它没有 `/anthropic` 兼容别名、没有 direct tools/functions runtime endpoint，且 `/v1/responses` forced tool probe 未返回 Codex 需要的 `function_call`。为了同时稳定支持 Claude Code + Codex，不要让客户端直连该上游；应让客户端连接本 Gateway：
 
 ```bash
-# Gateway 本地真实工具 runtime 验活；不依赖上游 tool endpoint
+# Gateway-owned 直接工具验活；不依赖上游 tool endpoint
 curl -fsS http://127.0.0.1:8885/v1/tools/call \
   -H 'Authorization: Bearer <your-gateway-key>' \
   -H 'Content-Type: application/json' \
@@ -475,15 +477,16 @@ remote /anthropic/v1/messages                       404（上游无该别名）
 remote /v1/tools/call / /v1/functions/call          404（上游无工具端点）
 remote /v1/messages forced tool_choice              OK，返回 Anthropic tool_use
 remote /v1/responses forced tool probe              未返回 function_call，仅 reasoning/message
-Gateway /v1/tools/call Bash/calculator              OK，本地真实执行
-Gateway /v1/functions/call project trace            OK，按下游项目根读取 .traces，不串到服务根
-Gateway /anthropic/v1/messages streaming Read/Bash/Skill OK，adapter/orchestrate 确定性本地工具分支
+Gateway /v1/tools/call calculator                   OK，Gateway-owned 工具本地真实执行
+Gateway user-side Read/LS/Bash/Skill                OK，返回下游 tool_use/tool_calls/function_call，不在服务机执行
+Gateway /v1/functions/call project trace            OK，显式 direct tool endpoint 仍按传入 workspace 隔离
+Gateway /anthropic/v1/messages streaming Read/Bash/Skill OK，adapter/orchestrate 返回下游工具请求
 Anthropic SSE tool_use.input -> input_json_delta     OK，兼容 Claude Code streaming parser
 Gateway /v1/responses streaming Bash                OK，Responses SSE 含 output_item/content_part/done，兼容 Codex parser
 Gateway streaming passthrough internal fields       OK，转发上游前剥离 workspace/project 路由字段
 Claude Code Primary working directory               OK，优先于旧摘要 Worktree，工具/Skills/项目级 .traces 按下游项目根隔离
 Codex Responses <environment_context><cwd>           OK，Skills 和工具路径按 Codex 项目根隔离
-Gateway Skill/list_skills/read_skill                 OK，项目 `.codex/.claude/.opencode/.agents/skills`、`skills/`、项目内插件 skills、全局 skills、GATEWAY_SKILLS_DIRS
+Gateway Skill/list_skills/read_skill                 OK，Admin/direct 能查看 Gateway 可见 skills；对话用户侧 Skill 默认下发给客户端
 Gateway Memory/RecallMemory                         OK，默认只列出当前下游项目根，服务目录记忆不串入项目
 Live Claude Code CLI + Codex CLI project smoke       OK，可复跑 `tests/integration/project_scope_cli_smoke.py --require-claude --require-codex`；示例 artifact `.gateway_runtime/project-scope-cli-smoke-20260525-035342/summary.json`，pass=true
 Mimo context                                        1048576 tokens（1M）
@@ -521,7 +524,7 @@ claude_mnative -p "Reply with OK only."
 HTTP 入口规范化为内部 `/v1/messages` / `/v1/messages/count_tokens`。下游鉴权
 同时接受 `Authorization: Bearer <key>` 和 Anthropic SDK 常见的 `x-api-key: <key>`。
 不要把 Claude Code 直接指向真实测试上游：该上游没有 `/anthropic/v1/messages` 别名，也没有本地工具执行端点。
-即使该上游 `/v1/messages` forced probe 可返回 `tool_use`，Claude Code 仍需要 Gateway 的 `/anthropic` 兼容别名、SSE 规范化和本地工具 runtime。
+即使该上游 `/v1/messages` forced probe 可返回 `tool_use`，Claude Code 仍需要 Gateway 的 `/anthropic` 兼容别名、SSE 规范化和工具归属分流（Gateway-owned 执行，用户侧工具下发客户端）。
 
 ### 6.2 OpenCode
 

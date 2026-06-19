@@ -130,13 +130,13 @@ class GatewayTool:
 - 生成 OpenAI/Anthropic 工具定义
 - 验证工具调用参数
 
-**内置工具数量**: 50+ (Read, Write, Edit, Bash, WebSearch, WebFetch 等)
+**内置工具数量**: 50+。其中 WebSearch/WebFetch/calculator/HTTP Action/MCP/Memory 等是 Gateway-owned；Read/Write/Edit/Bash/Skill/GUI/local agent 等是用户侧工具，默认只生成下游 tool request。
 
 ---
 
 ### 3.2 `gateway_tool_runtime.py` - 工具执行引擎
 
-**职责**: 解析、执行、缓存工具调用
+**职责**: 解析工具调用、判断工具归属、执行 gateway-owned 工具、下发用户侧工具、缓存可缓存结果
 
 **关键函数**:
 ```python
@@ -146,11 +146,11 @@ _execute_tool_call(call: ToolCall, workspace: str) -> ToolResult
 _parallel_tool_execution(calls: list[ToolCall]) -> list[ToolResult]
 ```
 
-**执行策略**:
-- ✅ 读工具并行执行 (Read, Grep, Glob, WebSearch)
-- ✅ 写工具串行执行 (Write, Edit, Bash)
-- ✅ 工具依赖分析 (自动排序)
-- ✅ 工具结果缓存 (30s TTL)
+**执行/下发策略**:
+- ✅ Gateway-owned 工具真执行：HTTP Action/MCP/WebSearch/WebFetch/calculator/Memory 等。
+- ✅ 用户侧机器工具默认下发：Read/Grep/Glob/Write/Edit/Bash/Skill/GUI/local agent 以 Anthropic `tool_use`、OpenAI Chat `tool_calls` 或 Responses `function_call` 返回给下游客户端。
+- ✅ 显式本地代理模式：`gateway.execute_user_side_tools_in_gateway=true` 或 legacy `delegate_tools_to_downstream=false` 时，才允许用户侧工具在 Gateway 服务机执行。
+- ✅ 工具结果缓存仅用于可缓存且由 Gateway 实际执行的工具。
 
 **安全特性**:
 - ✅ 路径遍历防护 (workspace root 包含检查)
@@ -1115,7 +1115,7 @@ def _should_fanout_context(messages: list) -> bool
 ---
 
 #### 5. 测试覆盖
-- ✅ 单元测试覆盖率高 (779 tests)
+- ✅ 单元测试覆盖率高 (886 tests)
 - ⚠️ 无集成测试 (多上游场景)
 - ⚠️ 无性能测试 (负载测试)
 
@@ -1201,7 +1201,7 @@ gateway_http_handler (GatewayHandler)
 | 维度 | 评分 | 说明 |
 |------|------|------|
 | **类型安全** | ⭐⭐⭐⭐⭐ | 全面使用 type hints |
-| **测试覆盖** | ⭐⭐⭐⭐☆ | 779 tests, 高覆盖率 |
+| **测试覆盖** | ⭐⭐⭐⭐☆ | 886 tests, 高覆盖率 |
 | **文档完善** | ⭐⭐⭐☆☆ | 函数有 docstring, 类文档不足 |
 | **错误处理** | ⭐⭐⭐⭐☆ | 完整异常体系 |
 | **性能优化** | ⭐⭐⭐☆☆ | 有缓存和连接池, 但非 asyncio |
@@ -1217,7 +1217,7 @@ gateway_http_handler (GatewayHandler)
 
 ### ✅ 已完成
 - [x] 核心功能完整 (8/8)
-- [x] 单元测试覆盖 (779 tests)
+- [x] 单元测试覆盖 (886 tests)
 - [x] 安全漏洞修复 (15 CRITICAL/HIGH)
 - [x] 协议兼容 (OpenAI + Anthropic)
 - [x] 工具执行 (50+ 内置工具)
@@ -1254,7 +1254,7 @@ gateway_http_handler (GatewayHandler)
 - 强大的工具执行系统 (50+ 内置工具)
 - 智能缓存与增强 (语义缓存 + 智力提升)
 - 清晰的类设计 (45+ 类, 职责分离)
-- 高测试覆盖率 (779 tests)
+- 高测试覆盖率 (886 tests)
 
 **需改进**:
 - 持久化缺失 (缓存/统计/记忆)

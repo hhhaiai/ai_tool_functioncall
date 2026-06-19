@@ -1,6 +1,39 @@
-# 当前审计结论（2026-05-25）
+# 当前审计结论（2026-06-19）
 
 本文件记录本轮对 `ai_tool_functioncall` 当前工作区的结构审计、风险点核验和回归修复结果。
+
+## 2026-06-19 增量审计结论
+
+本轮重新按用户确认的 Gateway 目标检查：
+
+```text
+上游：普通/弱工具 API，可完全不支持 tools/function calls
+中游：本 Gateway，做协议适配、文本工具适配、workspace 隔离、上下文/记忆治理
+下游：Claude Code / Codex / SDK，必须拿到协议正确的 tool/function 处理结果
+```
+
+发现并修复的当前阻断点：
+1. macOS `urllib` 系统代理会把 `127.0.0.1` mock upstream / Admin / Web2API 请求送到代理，导致大量 `RemoteDisconnected`；新增 package bootstrap 统一绕过 loopback proxy。
+2. 弱上游 adapter 曾对无 tools 的普通请求也注入完整工具手册，导致简单 `/anthropic/v1/messages` 被污染；现在只有下游实际提交 tools/tool_choice 或压缩前请求含 tools 时才注入 adapter。
+3. workspace 默认值曾在配置层回填服务 cwd，和“不能把 Gateway 服务目录当用户项目目录”的边界冲突；现在默认空 root，优先请求/metadata/env/显式配置，最后匿名隔离空间。
+4. Admin UI 无 workspace 时调用 Skills 扫描会 500；现在无 workspace 时跳过项目 skills，仅展示用户全局/额外 skills。
+5. 配置 hash 被二次加密导致保存值不稳定；现在 `password_hash` / `key_hash` 保持稳定 hash，明文密码仍不落盘。
+6. 匿名 workspace 未解析 `metadata.user_id` JSON 内 session，导致同 session 记忆召回跨 workspace 失效；现在按 session 稳定。
+7. Bash 文本工具参数归一化只保留单一字段，弱 markup 测试会在 `command/cmd` 间不一致；现在两个字段兼容。
+8. 工具执行位置曾混在一起：Read/LS/Bash/Skill 等用户机器工具可能被 Gateway 服务机执行。现在按工具归属分流：gateway-owned（HTTP Action/MCP/WebFetch/WebSearch/calculator/Memory 等）由 Gateway 真执行；用户侧文件/shell/GUI/local-agent/Skill 工具默认返回下游原生 `tool_use/tool_calls/function_call`，由 Claude Code/Codex 在用户机器执行。
+
+当前门禁：
+```bash
+python3 -m compileall -q src tests
+# OK
+python3 -m pytest -q
+# 886 passed, 2 skipped
+
+local mock smoke（临时 127.0.0.1:9011/8899）
+# OK: /healthz, /v1/models, /v1/chat/completions, /v1/tools/call calculator, /v1/messages user-side LS delegation
+```
+
+---
 
 补充运行验证：当前工作区支持 Claude Code / Anthropic SDK 常见的
 `ANTHROPIC_BASE_URL=http://127.0.0.1:8885/anthropic` 接入方式；
@@ -190,7 +223,7 @@
 
 36. **`tools_enabled=auto` 未结合上游 capability 做运行时降级**
    - 问题：即使 profile 标记 `supports_tools=false` / `supports_function_calls=false`，`auto` 模式仍可能向上游发送原生 `tools` schema。
-   - 修复：`_merge_builtin_tools()` 现在读取 active upstream capabilities；`auto` + native tools/function calls 关闭时自动走本地真实工具文本适配；`native_only` + 能力关闭时 fail-fast；新增回归测试覆盖该路径。
+   - 修复：`_merge_builtin_tools()` 现在读取 active upstream capabilities；`auto` + native tools/function calls 关闭时自动走文本工具适配，并按工具归属执行 gateway-owned 工具或下发用户侧工具；`native_only` + 能力关闭时 fail-fast；新增回归测试覆盖该路径。
 
 37. **弱上游文本工具适配遇到 Claude Code 大 harness 会触发 provider `too long`**
    - 问题：Claude Code 请求可携带大 system、system-reminder、skills 上下文和几十个工具 schema；当上游不支持 native tools、Gateway 改用文本工具适配时，如果不先压缩，真实上游可能 200 返回 `Sorry, the text you sent is too long!`。
@@ -214,7 +247,7 @@
 
 42. **Claude Code 本地文件读取 smoke 中弱上游只输出“我要读取”但不发工具调用**
    - 问题：当上游标记不支持 native tools、Gateway 走文本工具适配时，真实上游有时不会按 `<function=Read>` 发起工具调用，而是只回答“Let me read that file”，导致本地文件读取类 smoke exit 0 但没有读到文件内容。
-   - 修复：local planner 的路径识别从仅支持 `@path` 扩展到绝对路径、相对路径和常见源码/文本文件名；对“read/show/cat/open/查看/读取”等点名文件请求，弱上游文本工具模式下 Gateway 会对“输出 marker 后面的值”这类明确请求走窄口径本地直读，直接返回真实文件值。新增回归测试覆盖绝对路径文件读取；同时修正 workspace root 优先级为请求体显式 root > 非默认 `GATEWAY_WORKSPACE_ROOT` > 保存配置 `gateway.workspace_root` > 默认根，避免启动脚本默认 `$PWD` 压过 UI 配置，也不破坏显式 env root 的 direct tool 场景。真实 Claude Code 本地文件 smoke 复验通过。
+   - 修复：local planner 的路径识别从仅支持 `@path` 扩展到绝对路径、相对路径和常见源码/文本文件名；对“read/show/cat/open/查看/读取”等点名文件请求，默认不在 Gateway 服务机读文件，而是直接合成下游原生工具请求（Anthropic `tool_use` / Chat `tool_calls` / Responses `function_call`），要求客户端在用户机器执行并把 tool_result 返回 Gateway。只有显式 `gateway.execute_user_side_tools_in_gateway=true` 或 legacy `delegate_tools_to_downstream=false` 才保留旧本地代理式执行。
 
 43. **服务启动目录与下游项目目录必须隔离**
    - 问题：Gateway 作为中游服务启动在自身仓库时，不能把服务 cwd 当成 Claude Code/Codex 的项目目录；`/Users/sanbo/Desktop/PersonalAIBrain/.traces` 这类路径属于下游项目级目录，Skills/plugin/Memory 也必须按下游项目根隔离。
@@ -231,7 +264,7 @@ bash -n scripts/mimo_gateway.sh scripts/deploy.sh scripts/generate-ssl.sh script
 # OK
 
 python3 -m pytest -q
-# 200 passed
+# 886 passed, 2 skipped
 
 GATEWAY_VERIFY_MODEL_REQUESTS=0 GATEWAY_VERIFY_DIRECT_REQUESTS=24 GATEWAY_VERIFY_WORKERS=8 GATEWAY_VERIFY_REQUIRE_CLI=1 ./scripts/mimo_gateway.sh verify
 # unittest tests OK; tool acceptance OK; security/auth guardrails OK; 24-request concurrency/performance smoke OK; Claude/Codex project-scope smoke OK

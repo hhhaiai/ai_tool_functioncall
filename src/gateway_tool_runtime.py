@@ -467,6 +467,13 @@ def _create_anonymous_workspace(body: Json) -> pathlib.Path:
     metadata = body.get("metadata")
     if isinstance(metadata, dict):
         session_id = metadata.get("session_id") or metadata.get("conversation_id")
+        if not session_id:
+            try:
+                user_meta = json.loads(metadata.get("user_id") or "{}")
+            except Exception:
+                user_meta = {}
+            if isinstance(user_meta, dict):
+                session_id = user_meta.get("session_id") or user_meta.get("conversation_id")
 
     # If no session_id, generate from request content
     if not session_id:
@@ -537,6 +544,12 @@ def _request_workspace_root(body: Json) -> pathlib.Path:
         _log_workspace_resolution("env_var", path)
         return path
 
+    configured_root = str(_gateway_config().get("workspace_root") or "").strip()
+    if configured_root:
+        path = pathlib.Path(configured_root).expanduser().resolve(strict=False)
+        _log_workspace_resolution("configured_root", path)
+        return path
+
     # SECURITY: Create isolated anonymous space for this session
     # This allows users to chat even without providing workspace
     anonymous_space = _create_anonymous_workspace(body)
@@ -597,7 +610,6 @@ def _normalize_tool_args(name: str, arguments: Json) -> Json:
         return arguments
     # Map common aliases - only apply if the target property exists in schema
     alias_map = {
-        "command": "cmd",
         "cmd": "command",
         "file": "path",
         "file_path": "path",
@@ -618,6 +630,8 @@ def _normalize_tool_args(name: str, arguments: Json) -> Json:
             result[mapped_key] = value
         else:
             result[key] = value
+    if name == "Bash" and "command" in result and "cmd" in props and "cmd" not in result:
+        result["cmd"] = result["command"]
     return result
 
 
@@ -1163,9 +1177,9 @@ def _convert_text_calls_to_downstream_response(
         choices = original_response.get("choices") or [{}]
         choice = dict(choices[0]) if choices else {}
         message = dict(choice.get("message") or {})
-        # Include any text content before tool calls
-        if message.get("content"):
-            pass  # Keep existing content
+        # Do not leak text-adapter markup to clients as visible assistant text.
+        if isinstance(message.get("content"), str) and re.search(r"<function=|<tool_call>|```tool_code|\"tool_calls\"", message["content"]):
+            message["content"] = None
         message["tool_calls"] = tool_calls
         choice["message"] = message
         choice["finish_reason"] = "tool_calls"
@@ -1450,7 +1464,7 @@ def _append_text_tool_results(path: str, body: Json, response: Json, calls: list
         ],
     }
     report_text = (
-        "Gateway executed your text-based tool calls locally. Real results below.\n"
+        "Gateway executed Gateway-owned or explicitly opted-in text-based tool calls. Real results below.\n"
         "Continue your analysis. If you need MORE tools, output them as:\n"
         "<function=ToolName><parameter=param>value</parameter></function>\n\n"
         + json.dumps(tool_report, ensure_ascii=False, indent=2)
@@ -1546,6 +1560,8 @@ def _direct_local_file_read_response(path: str, body: Json) -> Json | None:
     of the file value.  For explicit "value after <marker>" requests, the
     gateway can safely execute the read itself and return the exact value.
     """
+    if not _gateway_executes_user_side_tools_locally():
+        return None
     user_text = _last_user_text(path, body)
     if not user_text:
         return None
@@ -1605,6 +1621,8 @@ def _extract_explicit_skill_request(text: str) -> tuple[str, str]:
 
 def _direct_local_skill_response(path: str, body: Json) -> Json | None:
     """Satisfy explicit local Skill list/read prompts for weak upstreams."""
+    if not _gateway_executes_user_side_tools_locally():
+        return None
     action, name = _extract_explicit_skill_request(_last_user_text(path, body))
     if not action:
         return None
@@ -1655,6 +1673,8 @@ def _direct_local_bash_response(path: str, body: Json) -> Json | None:
     It protects Claude Code/Codex adapter mode when a no-native-tools upstream
     merely says "I will run the command" instead of emitting adapter tags.
     """
+    if not _gateway_executes_user_side_tools_locally():
+        return None
     user_text = _last_user_text(path, body)
     command = _extract_explicit_shell_command_request(user_text)
     if not command:
@@ -1667,6 +1687,46 @@ def _direct_local_bash_response(path: str, body: Json) -> Json | None:
     if stdout and any(token in lowered for token in ("stdout", "output only", "reply only", "answer only", "只输出", "仅输出")):
         return _fallback_response(path, stdout, status_note="gateway_local_bash")
     return _fallback_response(path, result.content, status_note="gateway_local_bash")
+
+
+def _direct_downstream_tool_request_response(path: str, body: Json) -> Json | None:
+    """Surface obvious user-machine tool requests without touching Gateway FS/shell."""
+    if _gateway_executes_user_side_tools_locally() or _has_tool_result_in_messages(path, body):
+        return None
+    user_text = _last_user_text(path, body)
+    if not user_text:
+        return None
+    calls: list[ToolCall] = []
+    skill_action, skill_name = _extract_explicit_skill_request(user_text)
+    if skill_action:
+        arguments = {"name": skill_name} if skill_action == "read" else {}
+        calls.append(ToolCall(f"client_required_{uuid.uuid4().hex}", "Skill", arguments, {"gateway_downstream_tool_request": True}))
+    command = "" if calls else _extract_explicit_shell_command_request(user_text)
+    if command:
+        calls.append(ToolCall(f"client_required_{uuid.uuid4().hex}", "Bash", {"command": command}, {"gateway_downstream_tool_request": True}))
+    else:
+        lowered = user_text.lower()
+        paths = _extract_mentioned_paths(user_text)
+        read_intent = any(token in lowered for token in ("read", "show", "cat", "open", "查看", "读取", "读", "打开"))
+        list_intent = any(token in lowered for token in ("current directory", "list files", "list directory", "当前目录", "列出文件", "目录下", "ls "))
+        if read_intent and paths:
+            # Prefer the path closest to the explicit read request. Claude Code
+            # prompts often include stale Worktree/System-reminder paths before
+            # the actual user request; asking the client to read all extracted
+            # paths could leak or touch the wrong project.
+            calls.append(ToolCall(f"client_required_{uuid.uuid4().hex}", "Read", {"path": paths[-1]}, {"gateway_downstream_tool_request": True}))
+        elif list_intent:
+            target = paths[-1] if paths else "."
+            calls.append(ToolCall(f"client_required_{uuid.uuid4().hex}", "LS", {"path": target}, {"gateway_downstream_tool_request": True}))
+    if not calls:
+        return None
+    normalized_calls = [_normalize_tool_call(call) for call in calls]
+    return _build_tool_round_response(
+        path,
+        normalized_calls,
+        [],
+        {"model": str(body.get("model") or _config_env("UPSTREAM_MODEL", "")), "usage": {"input_tokens": 0, "output_tokens": 0}},
+    )
 
 
 def _weak_upstream_text_tools_active(gateway_mode: str) -> bool:
@@ -1682,6 +1742,95 @@ def _weak_upstream_text_tools_active(gateway_mode: str) -> bool:
     if tools_enabled == "auto" and not native_capable:
         return True
     return False
+
+
+USER_SIDE_TOOL_RISKS = {"read_local", "write_local", "execute_code", "gui", "ai_agent"}
+
+
+def _gateway_executes_user_side_tools_locally() -> bool:
+    """Return True only for explicit legacy/local-proxy execution mode.
+
+    The production default for Codex/Claude Code clients is that tools touching
+    the user's filesystem, shell, GUI, or local agent runtime execute on the
+    downstream client.  Gateway-side execution is kept only as an explicit
+    compatibility/local-proxy opt-in.
+    """
+    gateway = _gateway_config()
+    env_value = os.environ.get("GATEWAY_EXECUTE_USER_SIDE_TOOLS")
+    if env_value is not None:
+        return env_value.strip().lower() in {"1", "true", "yes", "on"}
+    if gateway.get("execute_user_side_tools_in_gateway") is True:
+        return True
+    # Backward-compatible escape hatch for old tests/deployments that
+    # intentionally opted out of downstream delegation.
+    if gateway.get("delegate_tools_to_downstream") is False:
+        return True
+    return False
+
+
+def _declared_tool_names_from_body(body: Json) -> set[str]:
+    names: set[str] = set()
+    for tool in body.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        candidates: list[Any] = [tool.get("name")]
+        function = tool.get("function")
+        if isinstance(function, dict):
+            candidates.append(function.get("name"))
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate.strip():
+                names.add(candidate.strip())
+                names.add(_normalize_tool_name(candidate.strip()))
+    return {name for name in names if name}
+
+
+def _tool_call_requires_downstream_execution(call: ToolCall, body: Json | None = None) -> bool:
+    """Return True when a tool call must be surfaced to the downstream client.
+
+    User-machine tools (filesystem, shell, GUI, local subagents) must not run in
+    the Gateway service by default. Gateway-owned tools such as HTTP Actions,
+    MCP server tools, network tools, pure utilities, and Gateway state tools can
+    still execute in the service.
+    """
+    if _gateway_executes_user_side_tools_locally():
+        return False
+    normalized = _normalize_tool_call(call)
+    tool = BUILTIN_TOOLS.get(normalized.name)
+
+    if normalized.name == "multi_tool_use.parallel":
+        tool_uses = normalized.arguments.get("tool_uses")
+        if isinstance(tool_uses, list):
+            for item in tool_uses:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name") or item.get("tool") or item.get("tool_name") or item.get("recipient_name")
+                args = item.get("arguments") or item.get("input") or item.get("parameters") or {}
+                if isinstance(name, str) and "." in name:
+                    name = name.rsplit(".", 1)[-1]
+                if isinstance(name, str) and _tool_call_requires_downstream_execution(
+                    ToolCall(f"{normalized.call_id}_nested", name, args if isinstance(args, dict) else {}, item),
+                    body,
+                ):
+                    return True
+
+    if tool is not None:
+        return tool.risk in USER_SIDE_TOOL_RISKS
+
+    # Gateway-owned extension points.
+    if _mcp_parse_public_name(normalized.name) or _http_action_by_name(normalized.name):
+        return False
+
+    # Caller-private/custom functions are owned by the downstream client when
+    # the request declared their schema. Do not fake or fail them in Gateway.
+    if body is not None:
+        declared = _declared_tool_names_from_body(body)
+        if normalized.name in declared or call.name in declared:
+            return True
+    return False
+
+
+def _calls_require_downstream_execution(calls: list[ToolCall], body: Json | None = None) -> bool:
+    return any(_tool_call_requires_downstream_execution(call, body) for call in calls)
 
 
 def _select_local_planner_files(user_text: str, max_files: int) -> list[str]:
@@ -1756,6 +1905,8 @@ def _build_local_planner_context(user_text: str) -> str:
 
 
 def _apply_local_planner_context(path: str, body: Json) -> Json:
+    if not _gateway_executes_user_side_tools_locally():
+        return body
     if not _should_build_local_planner_context(path, body):
         return body
     user_text = _last_user_text(path, body)
@@ -2034,9 +2185,10 @@ def token_count_response(body: Json) -> Json:
 def _build_tool_round_response(path: str, calls: list[ToolCall], results: list[ToolResult], fallback_response: Json) -> Json:
     model = fallback_response.get("model") or _config_env("UPSTREAM_MODEL", "")
     usage = fallback_response.get("usage") or {"input_tokens": 0, "output_tokens": 0}
+    strategy = "gateway_local_planner_tool_round" if results else "gateway_downstream_tool_request"
     if "/messages" in path:
         content: list[dict] = []
-        for call, result in zip(calls, results):
+        for call in calls:
             content.append({"type": "tool_use", "id": call.call_id, "name": call.name, "input": call.arguments})
         text = _response_text(path, fallback_response)
         if text:
@@ -2054,7 +2206,7 @@ def _build_tool_round_response(path: str, calls: list[ToolCall], results: list[T
             "stop_reason": "tool_use" if has_tool_use else "end_turn",
             "stop_sequence": None,
             "usage": usage,
-            "gateway_context": {"strategy": "gateway_local_planner_tool_round"},
+            "gateway_context": {"strategy": strategy},
         }
     if "/responses" in path:
         output_items: list[dict] = []
@@ -2078,7 +2230,7 @@ def _build_tool_round_response(path: str, calls: list[ToolCall], results: list[T
             "output": output_items,
             "status": "completed",
             "usage": usage,
-            "gateway_context": {"strategy": "gateway_local_planner_tool_round"},
+            "gateway_context": {"strategy": strategy},
         }
     tool_calls = []
     for call in calls:
@@ -2094,7 +2246,7 @@ def _build_tool_round_response(path: str, calls: list[ToolCall], results: list[T
         "model": model,
         "choices": [choice],
         "usage": usage,
-        "gateway_context": {"strategy": "gateway_local_planner_tool_round"},
+        "gateway_context": {"strategy": strategy},
     }
 
 
@@ -2129,7 +2281,10 @@ def _has_tool_result_in_messages(path: str, body: Json) -> bool:
 
 def _collect_local_planner_tool_rounds(path: str, body: Json) -> tuple[list[ToolCall], list[ToolResult]]:
     ctx = body.get("gateway_context") if isinstance(body.get("gateway_context"), dict) else {}
-    if not ctx.get("local_planner"):
+    should_surface = bool(ctx.get("local_planner"))
+    if not should_surface and not _gateway_executes_user_side_tools_locally():
+        should_surface = _should_build_local_planner_context(path, body)
+    if not should_surface:
         return [], []
     # If the client already sent back tool_result blocks, the tools were
     # already surfaced in a previous turn — do not surface again.
@@ -2140,6 +2295,36 @@ def _collect_local_planner_tool_rounds(path: str, body: Json) -> tuple[list[Tool
         return [], []
     calls: list[ToolCall] = []
     results: list[ToolResult] = []
+
+    def add_user_side_call(name: str, arguments: dict) -> None:
+        call = ToolCall(
+            f"client_required_{uuid.uuid4().hex}",
+            name,
+            arguments,
+            {"gateway_downstream_tool_request": True},
+        )
+        calls.append(_normalize_tool_call(call))
+
+    if not _gateway_executes_user_side_tools_locally():
+        paths = _extract_mentioned_paths(user_text)
+        lowered = user_text.lower()
+        read_intent = any(token in lowered for token in ("read", "show", "cat", "open", "查看", "读取", "读", "打开"))
+        analyze_intent = any(token in lowered for token in ("分析", "analyze", "review", "审查", "梳理", "check", "inspect"))
+        if not paths:
+            if any(token in lowered for token in ("current directory", "当前目录", "list files", "列出文件", "目录")):
+                add_user_side_call("LS", {"path": "."})
+            return calls, results
+        for raw_path in paths[: max(1, min(int(_gateway_config().get("local_planner_max_files") or 24), 12))]:
+            cleaned = raw_path.rstrip("/") or "."
+            looks_file = bool(re.search(r"\.[A-Za-z0-9]{1,12}$", pathlib.PurePosixPath(cleaned).name))
+            if read_intent or looks_file:
+                add_user_side_call("Read", {"path": cleaned})
+            elif analyze_intent:
+                add_user_side_call("Tree", {"path": cleaned, "max_depth": 3, "max_entries": 300})
+            else:
+                add_user_side_call("LS", {"path": cleaned})
+        return calls, results
+
     def run(name: str, arguments: dict) -> None:
         call = ToolCall(f"planner_surfaced_{uuid.uuid4().hex}", name, arguments, {"gateway_local_planner_surface": True})
         result = _execute_tool_call(call, provider="local_planner_surface")
@@ -2286,6 +2471,8 @@ def _forced_gateway_tool_round(path: str, body: Json) -> tuple[ToolCall | None, 
         arguments=_infer_forced_tool_arguments(path, name, body),
         raw={"gateway_forced_tool_choice": True},
     ))
+    if _tool_call_requires_downstream_execution(call, body):
+        return call, None, _synthetic_tool_response(path, call, str(body.get("model") or _config_env("UPSTREAM_MODEL", "")))
     if call.name in BUILTIN_TOOLS or _mcp_parse_public_name(call.name) or _http_action_by_name(call.name):
         return call, _execute_tool_call(call, provider="gateway_forced_tool_choice"), None
     # Gateway cannot execute caller-private custom functions.  For forced
@@ -2349,8 +2536,9 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
     gateway_cfg = _gateway_config()
     mode = str(os.environ.get("GATEWAY_TOOL_MODE") or gateway_cfg.get("tool_mode") or "orchestrate").lower()
     memory_body = _inject_recalled_memories(path, body)
-    # Gateway-specific tools (skills, memory, direct file reads) are executed locally.
-    # Client tools (Read, Write, Bash, etc.) are returned to downstream for execution.
+    # Gateway-owned tools may execute in the service. User-machine tools
+    # (Read/LS/Bash/Skill/GUI/local agents) are surfaced to the downstream
+    # client by default so they run against the user's real workspace/machine.
     direct_response = None
     if _weak_upstream_text_tools_active(mode):
         direct_response = _direct_local_file_read_response(path, memory_body)
@@ -2358,6 +2546,8 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
             direct_response = _direct_local_skill_response(path, memory_body)
         if direct_response is None:
             direct_response = _direct_local_bash_response(path, memory_body)
+        if direct_response is None:
+            direct_response = _direct_downstream_tool_request_response(path, memory_body)
     if direct_response is not None:
         _remember_conversation_turn(path, body, direct_response)
         return direct_response
@@ -2470,13 +2660,12 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
                 else:
                     request_body = _append_tool_results(upstream_path, request_body, upstream_response, results)
                 continue
-            # If the gateway already executed local planner tools, surface those
-            # results to the downstream client as explicit tool rounds instead of
-            # returning a plain assistant text response.  Weak upstreams often
-            # ignore injected evidence and answer "I will read the file" even
-            # though the gateway already executed the read.
-            planner_calls, planner_results = _collect_local_planner_tool_rounds(path, request_body)
-            if planner_calls and planner_results:
+            # If the weak upstream did not emit tool calls, synthesize the
+            # protocol-level user-side tool request (default) or surface the
+            # explicit legacy local-planner results (opt-in local execution).
+            planner_source_body = request_body if _gateway_executes_user_side_tools_locally() else memory_body
+            planner_calls, planner_results = _collect_local_planner_tool_rounds(path, planner_source_body)
+            if planner_calls:
                 synthetic_calls, synthetic_results = _collect_synthetic_upstream_calls(path, downstream_response)
                 all_calls = planner_calls + synthetic_calls
                 all_results = planner_results + synthetic_results
@@ -2486,31 +2675,37 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
             _remember_conversation_turn(path, body, downstream_response)
             return downstream_response
 
+        if _calls_require_downstream_execution(calls, memory_body):
+            # The upstream asked for a tool that must run on the user's machine
+            # (filesystem/shell/GUI/local agent) or for a caller-private custom
+            # function.  Surface a protocol-level tool request to Claude Code /
+            # Codex instead of executing inside the Gateway service.
+            native_response = (
+                _convert_text_calls_to_downstream_response(path, calls, downstream_response, upstream_protocol)
+                if text_fallback
+                else downstream_response
+            )
+            _remember_conversation_turn(path, body, native_response)
+            return native_response
+
         # --- Key design decision: who executes tools? ---
-        # When delegate_tools_to_downstream=true (default), text tool calls from
-        # upstream are converted to native protocol format and returned to the
-        # downstream client (Claude Code / Codex) for execution.
+        # When delegate_tools_to_downstream=true, all remaining text tool calls
+        # are converted to native protocol format and returned to the downstream
+        # client (Claude Code / Codex) for execution.
         # When false, the gateway executes tools locally (legacy behavior).
         # Auto-detect: delegate when downstream is Claude Code/Codex (path-based)
         # and upstream doesn't support native tools. Config can override.
         cfg_delegate = _gateway_config().get("delegate_tools_to_downstream")
         if cfg_delegate is None:
-            # Default: delegate for downstream coding-agent endpoints, but only when
-            # the upstream already produced native protocol-level tool calls.
-            # For weak upstreams the gateway must run tools locally, otherwise
-            # Claude Code / Codex receives an unexecuted tool_use/tool_calls response.
-            _upstream_cfg_delegate = _upstream_config()
-            _upstream_caps_delegate = _upstream_cfg_delegate.get("capabilities") if isinstance(_upstream_cfg_delegate.get("capabilities"), dict) else {}
-            _native_capable_delegate = (
-                bool(_upstream_caps_delegate.get("supports_tools", _upstream_cfg_delegate.get("supports_tools", False)))
-                and bool(_upstream_caps_delegate.get("supports_function_calls", _upstream_cfg_delegate.get("supports_function_calls", False)))
-            )
-            delegate = (
-                path in ("/v1/messages", "/v1/chat/completions", "/v1/responses", "/anthropic/v1/messages")
-                and (not text_fallback or _native_capable_delegate)
-            )
+            # Default: gateway-owned tools execute in Gateway; user-machine
+            # tools were already surfaced above. Explicit config can still
+            # request legacy "delegate every tool" behavior.
+            delegate = False
         else:
             delegate = bool(cfg_delegate)
+        if delegate and not text_fallback:
+            _remember_conversation_turn(path, body, downstream_response)
+            return downstream_response
         if text_fallback and delegate:
             native_response = _convert_text_calls_to_downstream_response(
                 path, calls, downstream_response, upstream_protocol,

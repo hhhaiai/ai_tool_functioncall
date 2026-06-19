@@ -944,9 +944,10 @@ class NativeGatewayTests(unittest.TestCase):
                     client,
                 )
                 serialized = json.dumps(result, ensure_ascii=False)
-                self.assertIn("PROJECT-SKILL-OK", serialized)
+                self.assertIn('"name": "Skill"', serialized)
+                self.assertIn("project-skill", serialized)
                 self.assertNotIn("SERVICE-SHOULD-NOT-LEAK", serialized)
-                self.assertEqual(result.get("gateway_context", {}).get("strategy"), "gateway_local_skill_read")
+                self.assertEqual(result.get("gateway_context", {}).get("strategy"), "gateway_downstream_tool_request")
                 self.assertEqual(client.requests, [])
             finally:
                 gateway.CONFIG_PATH = old_config
@@ -1000,8 +1001,9 @@ class NativeGatewayTests(unittest.TestCase):
                 client = FakeClient([])
                 result = run_tool_orchestration("/v1/responses", body, client)
                 serialized = json.dumps(result, ensure_ascii=False)
-                self.assertIn("CODEX-PROJECT-SKILL-OK", serialized)
-                self.assertEqual(result.get("gateway_context", {}).get("strategy"), "gateway_local_skill_read")
+                self.assertIn('"name": "Skill"', serialized)
+                self.assertIn("codex-project-skill", serialized)
+                self.assertEqual(result.get("gateway_context", {}).get("strategy"), "gateway_downstream_tool_request")
                 self.assertEqual(client.requests, [])
             finally:
                 gateway.CONFIG_PATH = old_config
@@ -1054,9 +1056,13 @@ class NativeGatewayTests(unittest.TestCase):
                     client,
                 )
                 serialized = json.dumps(result, ensure_ascii=False)
-                self.assertIn("PERSONAL-BRAIN-TRACE-OK", serialized)
+                self.assertIn(str(project_trace), serialized)
                 self.assertNotIn("WRONG-SERVICE", serialized)
-                self.assertEqual(result.get("gateway_context", {}).get("strategy"), "gateway_local_file_read")
+                tool_use = [block for block in (result.get("content") or []) if block.get("type") == "tool_use"]
+                self.assertTrue(tool_use)
+                self.assertEqual(tool_use[0].get("name"), "Read")
+                self.assertEqual(tool_use[0].get("input", {}).get("path"), str(project_trace))
+                self.assertEqual(result.get("gateway_context", {}).get("strategy"), "gateway_downstream_tool_request")
                 self.assertEqual(client.requests, [])
             finally:
                 gateway.CONFIG_PATH = old_config
@@ -1187,7 +1193,7 @@ class NativeGatewayTests(unittest.TestCase):
                 else:
                     os.environ["GATEWAY_WORKSPACE_ROOT"] = old_workspace_root
 
-    def test_weak_upstream_direct_skill_requests_execute_locally_for_messages_and_responses(self):
+    def test_weak_upstream_direct_skill_requests_delegate_to_downstream(self):
         with tempfile.TemporaryDirectory() as td:
             old_config = gateway.CONFIG_PATH
             old_workspace_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
@@ -1216,8 +1222,11 @@ class NativeGatewayTests(unittest.TestCase):
                     },
                     messages_client,
                 )
-                self.assertIn("SKILL-BOOST-OK", messages_result["content"][0]["text"])
-                self.assertEqual(messages_result.get("gateway_context", {}).get("strategy"), "gateway_local_skill_read")
+                skill_use = [block for block in (messages_result.get("content") or []) if block.get("type") == "tool_use"]
+                self.assertTrue(skill_use)
+                self.assertEqual(skill_use[0].get("name"), "Skill")
+                self.assertEqual(skill_use[0].get("input", {}).get("name"), "reason-boost")
+                self.assertEqual(messages_result.get("gateway_context", {}).get("strategy"), "gateway_downstream_tool_request")
                 self.assertEqual(messages_client.requests, [])
 
                 responses_client = FakeClient([])
@@ -1231,8 +1240,8 @@ class NativeGatewayTests(unittest.TestCase):
                     responses_client,
                 )
                 serialized = json.dumps(responses_result, ensure_ascii=False)
-                self.assertIn("reason-boost", serialized)
-                self.assertEqual(responses_result.get("gateway_context", {}).get("strategy"), "gateway_local_skill_list")
+                self.assertIn('"name": "Skill"', serialized)
+                self.assertEqual(responses_result.get("gateway_context", {}).get("strategy"), "gateway_downstream_tool_request")
                 self.assertEqual(responses_client.requests, [])
             finally:
                 gateway.CONFIG_PATH = old_config
@@ -1867,7 +1876,7 @@ class NativeGatewayTests(unittest.TestCase):
             finally:
                 gateway.CONFIG_PATH = old_config
 
-    def test_local_planner_reads_absolute_file_path_for_weak_upstream(self):
+    def test_local_planner_surfaces_absolute_file_path_to_downstream(self):
         with tempfile.TemporaryDirectory() as td:
             old_config = gateway.CONFIG_PATH
             gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
@@ -1898,10 +1907,169 @@ class NativeGatewayTests(unittest.TestCase):
                     },
                     client,
                 )
-                self.assertEqual(final["content"][0]["text"], "2+2=4")
-                self.assertEqual(final.get("gateway_context", {}).get("strategy"), "gateway_local_file_read")
+                tool_use = [block for block in (final.get("content") or []) if block.get("type") == "tool_use"]
+                self.assertTrue(tool_use, "local file reads must be delegated to the downstream client")
+                self.assertEqual(tool_use[0].get("name"), "Read")
+                self.assertEqual(tool_use[0].get("input", {}).get("path"), str(probe))
+                self.assertEqual(final.get("stop_reason"), "tool_use")
+                self.assertEqual(final.get("gateway_context", {}).get("strategy"), "gateway_downstream_tool_request")
                 self.assertEqual(client.requests, [])
             finally:
+                gateway.CONFIG_PATH = old_config
+
+    def test_user_side_bash_text_tool_is_delegated_not_executed_by_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+            try:
+                cfg = gateway._default_config()
+                cfg["upstream"]["tools_enabled"] = "adapter"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                gateway.save_config(cfg)
+                client = FakeClient([
+                    {
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": "<function=Bash>\n<parameter=command>pwd</parameter>\n</function>",
+                            },
+                            "finish_reason": "stop",
+                        }]
+                    }
+                ])
+                final = run_tool_orchestration(
+                    "/v1/chat/completions",
+                    {
+                        "model": "m",
+                        "messages": [{"role": "user", "content": "Please use a shell diagnostic if needed."}],
+                        "tools": [{"type": "function", "function": {"name": "Bash", "parameters": {"type": "object"}}}],
+                    },
+                    client,
+                )
+                choice = final["choices"][0]
+                self.assertEqual(choice.get("finish_reason"), "tool_calls")
+                tool_calls = choice["message"].get("tool_calls") or []
+                self.assertEqual(tool_calls[0]["function"]["name"], "Bash")
+                self.assertIn("pwd", tool_calls[0]["function"]["arguments"])
+                self.assertEqual(len(client.requests), 1)
+            finally:
+                gateway.CONFIG_PATH = old_config
+                if old_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_root
+
+    def test_current_directory_request_surfaces_client_ls_without_gateway_repo(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+            try:
+                cfg = gateway._default_config()
+                cfg["upstream"]["tools_enabled"] = "adapter"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                gateway.save_config(cfg)
+                client = FakeClient([])
+                final = run_tool_orchestration(
+                    "/v1/messages",
+                    {
+                        "model": "m",
+                        "messages": [{"role": "user", "content": "请查看当前目录下有哪些文件"}],
+                        "max_tokens": 128,
+                    },
+                    client,
+                )
+                serialized = json.dumps(final, ensure_ascii=False)
+                self.assertIn('"name": "LS"', serialized)
+                self.assertIn('"path": "."', serialized)
+                self.assertNotIn("CLAUDE.md", serialized)
+                self.assertEqual(final.get("stop_reason"), "tool_use")
+                self.assertEqual(client.requests, [])
+            finally:
+                gateway.CONFIG_PATH = old_config
+                if old_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_root
+
+    def test_gateway_owned_weather_http_action_executes_and_roundtrips(self):
+        class WeatherHandler(BaseHTTPRequestHandler):
+            seen = []
+
+            def log_message(self, fmt, *args):
+                return
+
+            def do_GET(self):  # noqa: N802
+                parsed = urllib.parse.urlparse(self.path)
+                WeatherHandler.seen.append(urllib.parse.parse_qs(parsed.query))
+                payload = b'{"temp_c":21,"condition":"sunny"}'
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), WeatherHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                cfg = gateway._default_config()
+                cfg["upstream"]["tools_enabled"] = "adapter"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                cfg["http_actions"] = {
+                    "enabled": True,
+                    "actions": [
+                        {
+                            "name": "get_weather",
+                            "description": "Get current weather",
+                            "method": "GET",
+                            "url": f"http://127.0.0.1:{httpd.server_address[1]}/weather",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                                "required": ["city"],
+                            },
+                        }
+                    ],
+                }
+                gateway.save_config(cfg)
+                client = FakeClient([
+                    {
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": "<function=get_weather>\n<parameter=city>Shanghai</parameter>\n</function>",
+                            },
+                            "finish_reason": "stop",
+                        }]
+                    },
+                    {"choices": [{"message": {"role": "assistant", "content": "Shanghai weather is sunny, 21C."}, "finish_reason": "stop"}]},
+                ])
+                final = run_tool_orchestration(
+                    "/v1/chat/completions",
+                    {
+                        "model": "m",
+                        "messages": [{"role": "user", "content": "Weather in Shanghai?"}],
+                        "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}],
+                    },
+                    client,
+                )
+                self.assertEqual(final["choices"][0]["message"]["content"], "Shanghai weather is sunny, 21C.")
+                self.assertEqual(WeatherHandler.seen[0]["city"], ["Shanghai"])
+                self.assertIn("temp_c", client.requests[1][1]["messages"][-1]["content"])
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
                 gateway.CONFIG_PATH = old_config
 
     def test_context_fanout_splits_large_chat_then_synthesizes(self):
@@ -4593,7 +4761,7 @@ class AnthropicSSEFormatTests(unittest.TestCase):
         self.assertIn('"stop_reason"', all_text)
 
 
-    def test_streaming_adapter_direct_file_read_uses_local_runtime_without_upstream(self):
+    def test_streaming_adapter_direct_file_read_surfaces_downstream_tool_without_upstream(self):
         from src.gateway_streaming import run_streaming_orchestration
 
         events = []
@@ -4653,7 +4821,10 @@ class AnthropicSSEFormatTests(unittest.TestCase):
 
                 text = "".join(events)
                 self.assertIn("text/event-stream", text)
-                self.assertIn("2+2=4", text)
+                self.assertIn('"type": "tool_use"', text)
+                self.assertIn('"name": "Read"', text)
+                self.assertIn(str(probe), text)
+                self.assertIn('"stop_reason": "tool_use"', text)
                 self.assertNotIn("event: error", text)
                 self.assertIn("message_stop", text)
             finally:
@@ -4663,7 +4834,7 @@ class AnthropicSSEFormatTests(unittest.TestCase):
                 else:
                     os.environ["GATEWAY_TOOL_MODE"] = old_mode
 
-    def test_streaming_adapter_explicit_bash_request_uses_local_runtime(self):
+    def test_streaming_adapter_explicit_bash_request_surfaces_downstream_tool(self):
         from src.gateway_streaming import run_streaming_orchestration
 
         events = []
@@ -4719,7 +4890,10 @@ class AnthropicSSEFormatTests(unittest.TestCase):
                 )
 
                 text = "".join(events)
-                self.assertIn("STREAM-BASH-OK", text)
+                self.assertIn('"type": "tool_use"', text)
+                self.assertIn('"name": "Bash"', text)
+                self.assertIn("printf STREAM-BASH-OK", text)
+                self.assertIn('"stop_reason": "tool_use"', text)
                 self.assertNotIn("event: error", text)
                 self.assertIn("message_stop", text)
             finally:
@@ -4729,7 +4903,7 @@ class AnthropicSSEFormatTests(unittest.TestCase):
                 else:
                     os.environ["GATEWAY_TOOL_MODE"] = old_mode
 
-    def test_streaming_adapter_explicit_skill_read_uses_local_runtime(self):
+    def test_streaming_adapter_explicit_skill_read_surfaces_downstream_tool(self):
         from src.gateway_streaming import run_streaming_orchestration
 
         events = []
@@ -4785,7 +4959,10 @@ class AnthropicSSEFormatTests(unittest.TestCase):
                 )
 
                 text = "".join(events)
-                self.assertIn("STREAM-SKILL-OK", text)
+                self.assertIn('"type": "tool_use"', text)
+                self.assertIn('"name": "Skill"', text)
+                self.assertIn("deep-think", text)
+                self.assertIn('"stop_reason": "tool_use"', text)
                 self.assertNotIn("event: error", text)
                 self.assertIn("message_stop", text)
             finally:
@@ -5721,7 +5898,7 @@ class ContextSummarizationTests(unittest.TestCase):
 
 class WeakUpstreamToolRoundSurfacingTests(unittest.TestCase):
     """Regression: weak upstreams that return no tool calls must still surface
-    gateway-local planner tool rounds to the downstream client across all
+    downstream-executed planner tool rounds to the downstream client across all
     three protocol paths (/v1/chat/completions, /v1/messages, /v1/responses)."""
 
     def _setup_workspace(self):
@@ -5789,7 +5966,7 @@ class WeakUpstreamToolRoundSurfacingTests(unittest.TestCase):
         msg = choice.get("message") or {}
         self.assertTrue(bool(msg.get("tool_calls")), "should have tool_calls")
         self.assertEqual(choice.get("finish_reason"), "tool_calls")
-        self.assertEqual((result.get("gateway_context") or {}).get("strategy"), "gateway_local_planner_tool_round")
+        self.assertEqual((result.get("gateway_context") or {}).get("strategy"), "gateway_downstream_tool_request")
 
     def test_messages_surfaces_tool_use_blocks(self):
         result = self._run("/v1/messages", {
@@ -5805,7 +5982,7 @@ class WeakUpstreamToolRoundSurfacingTests(unittest.TestCase):
         self.assertFalse(tool_result, "tool_result should not be in assistant message")
         # stop_reason must be tool_use to signal client to send tool_result back
         self.assertEqual(result.get("stop_reason"), "tool_use")
-        self.assertEqual((result.get("gateway_context") or {}).get("strategy"), "gateway_local_planner_tool_round")
+        self.assertEqual((result.get("gateway_context") or {}).get("strategy"), "gateway_downstream_tool_request")
 
     def test_responses_surfaces_function_call_items(self):
         result = self._run("/v1/responses", {
@@ -5814,10 +5991,8 @@ class WeakUpstreamToolRoundSurfacingTests(unittest.TestCase):
         })
         output = result.get("output") or []
         fc = [o for o in output if o.get("type") == "function_call"]
-        fco = [o for o in output if o.get("type") == "function_call_output"]
         self.assertTrue(bool(fc), "should have function_call items")
-        self.assertTrue(bool(fco), "should have function_call_output items")
-        self.assertEqual((result.get("gateway_context") or {}).get("strategy"), "gateway_local_planner_tool_round")
+        self.assertEqual((result.get("gateway_context") or {}).get("strategy"), "gateway_downstream_tool_request")
 
     def test_direct_read_preserves_context_through_protocol_conversion(self):
         """When direct_read fires, gateway_context.local_planner must survive
@@ -5827,8 +6002,8 @@ class WeakUpstreamToolRoundSurfacingTests(unittest.TestCase):
             "messages": [{"role": "user", "content": "读取 README.md"}],
             "max_tokens": 4096,
         })
-        self.assertEqual((result.get("gateway_context") or {}).get("strategy"), "gateway_local_planner_tool_round",
-                         "direct_read planner must survive protocol conversion")
+        self.assertEqual((result.get("gateway_context") or {}).get("strategy"), "gateway_downstream_tool_request",
+                         "downstream tool request marker must survive protocol conversion")
 
     def test_tool_result_in_request_prevents_re_surfacing(self):
         """When Claude Code sends back tool_result blocks (from a previous
@@ -5849,7 +6024,7 @@ class WeakUpstreamToolRoundSurfacingTests(unittest.TestCase):
         })
         # Should return upstream's plain text, NOT re-surface tool rounds
         self.assertNotEqual((result.get("gateway_context") or {}).get("strategy"),
-                            "gateway_local_planner_tool_round",
+                            "gateway_downstream_tool_request",
                             "must not re-surface tool rounds when tool_result is present")
 
 
@@ -5937,9 +6112,9 @@ class ToolCallDefaultTests(unittest.TestCase):
         self.assertIn("[IMPORTANT: Tool Call Gateway adapter is active", user_content,
                       "User message must contain adapter reminder")
 
-    def test_text_tool_adapter_roundtrip_extracts_and_executes_text_tool_calls(self):
+    def test_text_tool_adapter_roundtrip_extracts_user_side_text_tool_calls(self):
         """End-to-end: request with tools → text adapter → upstream text with
-        tool calls → extract → execute → return results."""
+        tool calls → extract user-side call for downstream execution."""
         from src.gateway_streaming import _merge_builtin_tools
         from src.gateway_tool_runtime import _extract_text_tool_calls, _extract_tool_calls
 

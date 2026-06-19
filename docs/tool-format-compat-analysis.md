@@ -174,7 +174,7 @@ The gateway uses two independent configuration axes:
 
 | Mode | Behavior |
 |------|----------|
-| `orchestrate` (default) | Gateway acts as tool runtime: parses tool calls from upstream, executes locally, injects results, loops until final answer |
+| `orchestrate` (default) | Gateway parses tool calls from upstream, executes gateway-owned tools locally, and surfaces user-side tools to downstream clients for execution |
 | `native_passthrough` / `proxy` | Gateway passes through: upstream handles tools natively, Gateway only translates protocol formats |
 | `passthrough` (legacy alias) | Same as `native_passthrough` |
 
@@ -254,7 +254,7 @@ Config cap defaults to 48000; set to 0 to disable. Env var `GATEWAY_TEXT_TOOL_AD
 | Capability | Current status | Evidence |
 |---|---|---|
 | Forced tool-choice probe shape | Implemented for Chat / Responses / Anthropic | `_probe_body()` tests verify forced `echo_probe` shapes |
-| Tool roundtrip orchestration | Implemented | Chat / Responses / Messages orchestration tests execute local tools and append results |
+| Tool roundtrip orchestration | Implemented | Chat / Responses / Messages tests cover gateway-owned execution plus user-side tool request surfacing |
 | Streaming tool event parsing | Implemented | SSE parser tests cover OpenAI Chat, Responses, Anthropic events and malformed JSON tolerance |
 | Strict argument handling | Implemented with explicit failures | Invalid JSON / invalid parameters return structured tool failures |
 | Tool execution tracing | Implemented | SQLite `tool_failures` records execution time, retry count, provider |

@@ -1,6 +1,30 @@
 # Gateway 实现状态文档
 
-> 最后更新: 2026-05-27
+> 最后更新: 2026-06-19
+
+## 2026-06-19 收敛状态
+
+本轮按最终 Gateway 目标做全仓库回归：上游可为不支持 tools/function calls 的普通 API；下游面向 Claude Code / Codex；Gateway 负责协议适配、必要的文本工具适配、workspace 隔离、记忆/上下文治理、gateway-owned 工具执行，以及用户侧工具的协议级下发。
+
+关键收敛点：
+- 普通无 tools 请求不再自动注入大段工具 adapter，避免污染上游普通对话。
+- 请求级 workspace 不再默认回退 Gateway 服务 cwd；缺失 workspace 时使用匿名隔离空间，显式 env/config root 仅作兜底。
+- 工具归属已明确：HTTP Action/MCP/WebFetch/WebSearch/calculator/Memory 等 gateway-owned 工具由 Gateway 真执行；Read/LS/Glob/Grep/Write/Edit/Bash/Skill/GUI/local agent 等用户机器工具默认返回下游原生 tool request，由 Claude Code/Codex 在用户机器执行。
+- 弱上游文本 `<function=...>`、强制 `tool_choice`、local planner 和 streaming adapter 都统一走同一归属判断；用户侧工具不再因为 Gateway 有内置实现就落到服务机执行。
+- 本机 mock/upstream/Web2API 直连绕过 macOS 系统代理，测试与本地部署不再受 `127.0.0.1:1082` 等代理影响。
+- 配置文件保留稳定 hash，明文密码仍归一化；Admin 无 workspace 时可正常渲染全局 skills。
+
+验证结果：
+```bash
+python3 -m compileall -q src tests
+python3 -m pytest -q
+# 886 passed, 2 skipped
+
+local mock smoke
+# OK: healthz, models, chat, direct calculator, user-side LS delegation
+```
+
+---
 
 ## 架构概览
 
@@ -12,7 +36,7 @@ Gateway Handler (gateway_http_handler.py)
     ├─ 语义缓存 (gateway_cache.py)         ← 缓存命中加速
     ├─ 统计记录 (gateway_stats.py)         ← Q&A 数据积累
     ├─ 协议转换 (gateway_protocol.py)      ← Anthropic ↔ OpenAI ↔ Responses
-    ├─ 工具编排 (gateway_tool_runtime.py)  ← 内置工具执行
+    ├─ 工具编排 (gateway_tool_runtime.py)  ← gateway-owned 执行 / 用户侧工具下发
     ├─ 流式处理 (gateway_streaming.py)     ← SSE 流式响应
     ├─ 上下文管理 (gateway_context.py)     ← 无限上下文/记忆/扇出
     └─ 并发优化 (gateway_concurrency.py)   ← 连接池/负载均衡
@@ -66,20 +90,17 @@ Gateway Handler (gateway_http_handler.py)
 - OpenAI Responses (`/v1/responses`)
 - Anthropic Messages (`/v1/messages`)
 
-内置工具:
-- `echo_probe` - 回声探针 (验证原生 tool calling)
-- `calculator` - 计算器
-- 文件操作: Read, Write, Edit, Glob, Grep
-- Shell: Bash
-- 网络: WebFetch, WebSearch
-- Agent: TodoWrite, ExitPlanMode
+工具归属:
+- Gateway-owned（Gateway 真执行）: `echo_probe`, `calculator`, `get_current_time`, HTTP Actions（如天气/内部 API）, MCP tools/resources, `WebFetch`, `WebSearch`, `Memory`, 纯函数/状态类工具。
+- User-side（默认下发给 Claude Code/Codex 执行）: `Read`, `ReadManyFiles`, `FileInfo`, `LS`, `Tree`, `Glob`, `Grep`, `Write`, `Edit`, `Bash`, `Git`, `PythonSymbols`, `Skill`, GUI/computer_use/click/type 等依赖用户机器/项目的工具。
+- 兼容旧本地代理部署：显式设置 `gateway.execute_user_side_tools_in_gateway=true`（或 legacy `delegate_tools_to_downstream=false`）后，才允许用户侧工具在 Gateway 服务机执行。
 
 Claude Code 兼容:
 - 支持 `input_schema` (Anthropic) ↔ `parameters` (OpenAI) 格式互转
 - 支持 `mcp__server__tool` 命名格式
 - 支持 37+ Claude Code 工具定义 (Agent, Bash, Read, Write, Edit, Glob, Grep 等)
 
-并行执行策略:
+Gateway 本地执行策略（仅 gateway-owned/显式 opt-in 本地工具）:
 ```
 读工具 (Read, Glob, Grep, WebFetch) → 并行执行
 写工具 (Write, Edit, Bash) → 串行执行
@@ -358,7 +379,7 @@ gunicorn src.gateway_app:app -w 4 -b 0.0.0.0:8885
 | 边界条件 | test_edge_cases.py | ✅ |
 | 稳定性 | test_stability.py | ✅ |
 | 集成测试 | test_gateway_e2e.py | ✅ |
-| **总计** | **779 passed** | ✅ |
+| **总计** | **886 passed, 2 skipped** | ✅ |
 
 ---
 

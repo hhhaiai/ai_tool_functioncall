@@ -95,6 +95,16 @@ def _workspace_root():
         _logger.debug("_workspace_root returning env: %s", result)
         return result
 
+    try:
+        from .gateway_config import _gateway_config
+        configured_root = str(_gateway_config().get("workspace_root") or "").strip()
+    except Exception:
+        configured_root = ""
+    if configured_root:
+        result = pathlib.Path(configured_root).expanduser().resolve(strict=False)
+        _logger.debug("_workspace_root returning configured root: %s", result)
+        return result
+
     # This should never happen as _request_workspace_root always provides a path
     # (either client workspace or anonymous space), but fail safely if it does
     _logger.debug("_workspace_root: NO WORKSPACE AVAILABLE!")
@@ -1458,17 +1468,22 @@ def _plugin_skill_dirs(workspace: pathlib.Path) -> list[pathlib.Path]:
 
 
 def _skill_dirs() -> list[pathlib.Path]:
-    workspace = _workspace_root()
+    try:
+        workspace = _workspace_root()
+    except ToolExecutionError:
+        workspace = None
     home = pathlib.Path.home()
-    candidates: list[pathlib.Path] = [
-        # Workspace-local skills first so downstream project intelligence wins.
-        workspace / ".codex" / "skills",
-        workspace / ".agents" / "skills",
-        workspace / ".claude" / "skills",
-        workspace / ".opencode" / "skills",
-        workspace / "skills",
-        *_plugin_skill_dirs(workspace),
-    ]
+    candidates: list[pathlib.Path] = []
+    if workspace is not None:
+        candidates.extend([
+            # Workspace-local skills first so downstream project intelligence wins.
+            workspace / ".codex" / "skills",
+            workspace / ".agents" / "skills",
+            workspace / ".claude" / "skills",
+            workspace / ".opencode" / "skills",
+            workspace / "skills",
+            *_plugin_skill_dirs(workspace),
+        ])
     candidates.extend([
         # Then user-global skill stores used by Codex, Claude Code, and OMX.
         home / ".codex" / "skills",

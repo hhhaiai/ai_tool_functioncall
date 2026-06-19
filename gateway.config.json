@@ -34,6 +34,7 @@
     "tool_mode": "orchestrate",
     "allow_write_tools": false,
     "allow_shell_tools": false,
+    "execute_user_side_tools_in_gateway": false,
     "max_tool_rounds": 10,
     "tool_execution_timeout_seconds": 60,
     "max_concurrent_requests": 32,

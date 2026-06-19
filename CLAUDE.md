@@ -1,6 +1,6 @@
 # Gateway 项目进度跟踪
 
-> 最后更新: 2026-06-18
+> 最后更新: 2026-06-19
 
 ## 项目概述
 
@@ -165,7 +165,7 @@ AI Gateway 中游服务 - 将各种上游 API（不支持/部分支持 tool call
 
 | 测试文件 | 状态 | 数量 |
 |----------|------|------|
-| tests/test_gateway.py | ✅ PASS | 165 (35 HTTP 环境问题) |
+| tests/test_gateway.py | ✅ PASS | 209 |
 | tests/test_edge_cases.py | ✅ PASS | 126 |
 | tests/test_intelligence.py | ✅ PASS | 71 |
 | tests/test_web2api.py | ✅ PASS | 47 |
@@ -180,13 +180,42 @@ AI Gateway 中游服务 - 将各种上游 API（不支持/部分支持 tool call
 | tests/test_stats_logging.py | ✅ PASS | 16 |
 | tests/integration/test_gateway_e2e.py | ✅ PASS | 15 |
 | tests/test_tool_execution_trace.py | ✅ PASS | 9 |
-| **总计** | **✅ ALL PASS** | **779** (584 非 HTTP + 195 HTTP) |
+| **总计** | **✅ ALL PASS** | **886 passed, 2 skipped** |
 
-> **注意**: 35 个 HTTP 测试因 ThreadingHTTPServer 在 Python 3.10/macOS 上的环境问题而失败（RemoteDisconnected），与代码逻辑无关。
+> **注意**: 之前 macOS/urllib 代理污染导致的本机 HTTP `RemoteDisconnected` 已在 2026-06-19 修复；当前全量回归为 886 passed, 2 skipped。
 
 ---
 
 ## 最近修复
+
+### 2026-06-19: Gateway 最终可用性收敛与精简
+
+**目标确认**: 本项目是中游 Gateway：上游可以是不支持/弱支持 tools/function calls 的普通 API；下游面向 Claude Code / Codex / SDK。Gateway 必须保持协议正确、不能污染普通请求、不能把服务启动目录误当用户项目目录。
+
+**本轮修复/精简:**
+- ✅ 修复 macOS/urllib 系统代理污染：新增 `src/__init__.py`，强制 `127.0.0.1/localhost/::1` 走本机直连，避免 mock upstream/Admin/Web2API 被代理导致 `RemoteDisconnected`。
+- ✅ 普通无 tools 请求保持普通转发：弱上游 text adapter 只在下游确实提交 `tools/tool_choice`（或压缩前请求含 tools）时注入工具协议说明，避免简单 chat 被塞入大段 Gateway 工具手册。
+- ✅ workspace root 边界收紧：默认不再保存/回退 Gateway 服务 cwd；优先级为请求显式 root / 下游 metadata / `GATEWAY_WORKSPACE_ROOT` / 显式配置 root / 匿名隔离空间。Admin skills 页面在没有 workspace 时只展示全局/额外 skills，不再 500。
+- ✅ 工具执行归属收敛：Gateway-owned 工具（HTTP Action/MCP/WebFetch/WebSearch/calculator/Memory 等）仍由 Gateway 真执行；用户侧机器工具（Read/LS/Glob/Grep/Write/Edit/Bash/Skill/GUI/local agent）默认转成下游原生 tool request，由 Claude Code/Codex 在用户机器执行并回传结果。
+- ✅ 弱上游文本工具、强制 `tool_choice`、local planner、streaming adapter 共用同一归属判断；例如“查看当前目录”会返回 `LS` tool_use，不会列出 Gateway 仓库；天气 HTTP Action 会真实请求配置的天气接口。
+- ✅ 匿名 workspace 按 `metadata.user_id` 内 JSON 的 `session_id` 稳定分配，SQLite 记忆召回在同 session 下恢复一致。
+- ✅ 配置加密精简：`password_hash` / `key_hash` 保持稳定 hash，不再二次 Fernet 加密；明文 `admin.password` 仍会归一化为 hash 且不持久化。
+- ✅ Bash 弱文本工具参数同时兼容 `command` 与 `cmd`，修复弱上游 `<function=Bash>` markup 解析后的参数不一致。
+- ✅ 清理本地生成物：删除 `__pycache__`、`.pytest_cache`、`.ruff_cache`、`.DS_Store`；保留 `.gateway_runtime/`、`gateway_log.sqlite3`、`.gateway_service.json` 等可能含本地状态/密钥/日志的文件。
+
+**验证:**
+```bash
+python3 -m compileall -q src tests
+# OK
+
+python3 -m pytest -q
+# 886 passed, 2 skipped
+
+# 临时端口本地 mock smoke
+# OK: healthz, /v1/models, chat, direct calculator, user-side LS delegation
+```
+
+---
 
 ### 2026-06-18: Tool Call 默认行为修复 — 所有上游 API 默认使用 Text Adapter 模式
 
@@ -202,7 +231,7 @@ AI Gateway 中游服务 - 将各种上游 API（不支持/部分支持 tool call
 
 **效果**:
 - ✅ 所有上游 API 默认使用 Text Adapter 模式（不发送原生 tools，改为注入文本提示）
-- ✅ Gateway 自动从上游文本响应中提取 tool calls，本地执行，结果回传
+- ✅ Gateway 自动从上游文本响应中提取 tool calls；gateway-owned 工具本地执行，用户侧机器工具下发给下游客户端执行
 - ✅ 显式配置 `capabilities.supports_tools: true` 仍可启用原生 tool call 透传
 - ✅ 新增 6 个测试 (`ToolCallDefaultTests`)
 
@@ -241,11 +270,11 @@ AI Gateway 中游服务 - 将各种上游 API（不支持/部分支持 tool call
 
 **问题**: Gateway 在客户端未提供 `workspace_root` 时，会回退到**服务器目录**，导致攻击者可以读取服务器上的任意文件（`/etc/passwd`、SSH 密钥、配置文件等）
 
-**修复**:
-- ✅ `_request_workspace_root()` 现在返回 `None` 而不是服务器目录
-- ✅ `_workspace_root()` 在无客户端 workspace 时抛出清晰错误
-- ✅ 工具调用（Read/Write/Glob/Grep）在无 workspace 时安全失败
-- ✅ **绝对不再使用** `os.getcwd()` 或服务器路径作为默认值
+**当前修复状态（已被 2026-06-19 收敛更新覆盖）**:
+- ✅ `_request_workspace_root()` 不再回退 Gateway 服务 cwd；缺失客户端 workspace 时使用匿名隔离空间，避免服务目录泄露。
+- ✅ 用户侧机器工具默认不在 Gateway 服务机执行，而是返回下游原生 tool request。
+- ✅ 只有显式 `GATEWAY_WORKSPACE_ROOT` / 配置 root / `gateway.execute_user_side_tools_in_gateway=true` 等本地代理式部署才允许 Gateway 使用本机 workspace。
+- ✅ **绝对不再使用** `os.getcwd()` 或服务器路径作为隐式用户 workspace。
 
 **安全原则**:
 - 🔴 **绝对红线**: Gateway 绝不能使用服务器目录作为工作空间
@@ -254,8 +283,8 @@ AI Gateway 中游服务 - 将各种上游 API（不支持/部分支持 tool call
 
 **验证**:
 ```python
-# 无 workspace 时返回 None，不使用服务器目录
-assert _request_workspace_root({}) is None  # ✓ SECURE
+# 无 workspace 时不会返回服务器目录；会分配匿名隔离空间
+assert "anonymous_spaces" in str(_request_workspace_root({}))  # ✓ SECURE
 ```
 
 详见：[SECURITY_FIX_WORKSPACE.md](SECURITY_FIX_WORKSPACE.md)
@@ -277,7 +306,7 @@ assert _request_workspace_root({}) is None  # ✓ SECURE
 2. 客户端 metadata：`metadata.project_dir`, `metadata.cwd` 等
 3. 自动提取：从 system/messages 中提取路径（Claude Code 格式）
 4. 环境变量：`GATEWAY_WORKSPACE_ROOT`（如果非 cwd）
-5. 默认值：服务启动时的 cwd
+5. 匿名隔离空间（不会是服务启动 cwd）
 
 **效果**:
 - ✅ Gateway 现在是无状态服务（针对 workspace）

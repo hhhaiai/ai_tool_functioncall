@@ -177,7 +177,6 @@ def is_encrypted(value: str) -> bool:
 SENSITIVE_FIELDS = {
     "upstream.api_key",
     "upstream_profiles[].api_key",
-    "downstream_keys[].key_hash",  # Note: already hashed, but encrypt anyway
     "cache.embedding_api_key",
     "context.long_context_upstream.api_key",
     "mcp.servers[].env.*",  # Any env vars in MCP servers
@@ -193,6 +192,13 @@ def _should_encrypt_field(path: str) -> bool:
     Returns:
         True if field is sensitive
     """
+    field_name = path.split(".")[-1].lower()
+    # Hashes are one-way verifier material, not plaintext credentials.  Keep
+    # them stable on disk so config diffs, tests, and admin auth normalization
+    # remain deterministic; redaction still hides them in logs/UI.
+    if field_name in {"password_hash", "key_hash"}:
+        return False
+
     # Exact match
     if path in SENSITIVE_FIELDS:
         return True
@@ -207,7 +213,6 @@ def _should_encrypt_field(path: str) -> bool:
                 return True
 
     # Special case: any field named "api_key", "password", "secret", "token"
-    field_name = path.split(".")[-1].lower()
     if any(keyword in field_name for keyword in ["api_key", "password", "secret", "token", "key_hash"]):
         return True
 

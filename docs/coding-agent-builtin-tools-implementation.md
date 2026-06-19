@@ -57,7 +57,7 @@
 | `mcp_get_prompt` | ready | mcp | 调用已配置 MCP server 的 `prompts/get` |
 | `multi_tool_use.parallel`, `parallel` | ready | orchestration | 并发执行多个 Gateway tool call，禁止递归 parallel |
 | `Agent`, `Task`, `spawn_agent`, `subagent` | ready | ai_agent | 调上游模型执行子任务；大 prompt 会走分片分析+汇总 |
-| `Skill`, `list_skills` | ready | ai_agent | 读取本地 `SKILL.md` 并组合 Agent 执行，或列出 skills |
+| `Skill`, `list_skills` | ready | ai_agent | 默认作为用户侧工具下发给客户端；显式本地代理模式才读取 Gateway 可见的 `SKILL.md` |
 | `Tree`, `tree` | ready | read_local | workspace 内树形目录 |
 | `JsonQuery`, `jq` | ready | read_local | JSON 文件点路径查询 |
 | `PythonSymbols`, `python_symbols` | ready | read_local | Python AST 符号提取 |
@@ -67,8 +67,8 @@
 | `RegexEdit` | gated | write_local | 需 `GATEWAY_ALLOW_WRITE_TOOLS=1` |
 | `NotebookEdit`, `notebook_edit` | gated | write_local | 需 `GATEWAY_ALLOW_WRITE_TOOLS=1`，编辑 `.ipynb` cells |
 | `apply_patch` | gated | write_local | 需 `GATEWAY_ALLOW_WRITE_TOOLS=1`，调用 `apply_patch` CLI |
-| `Bash`, `exec_command`, `shell_command`, `exec_shell`, `local_shell`, `user_shell` | gated | execute_code | 需 `GATEWAY_ALLOW_SHELL_TOOLS=1` |
-| `exec_shell_start`, `write_stdin`, `exec_wait`, `exec_kill` | gated | execute_code | 持久 shell session，需 `GATEWAY_ALLOW_SHELL_TOOLS=1` |
+| `Bash`, `exec_command`, `shell_command`, `exec_shell`, `local_shell`, `user_shell` | gated | execute_code | 默认下发给客户端；显式 `GATEWAY_EXECUTE_USER_SIDE_TOOLS=1` 后还需 `GATEWAY_ALLOW_SHELL_TOOLS=1` 才在 Gateway 执行 |
+| `exec_shell_start`, `write_stdin`, `exec_wait`, `exec_kill` | gated | execute_code | 默认下发给客户端；显式本地代理模式下需 `GATEWAY_ALLOW_SHELL_TOOLS=1` |
 
 ### 2.3 运行时依赖 / connector 边界
 
@@ -83,7 +83,7 @@
 | `image_generation` / `generate_image` | 使用真实 OpenAI / Pollinations / Hugging Face provider | 所有 provider 失败时失败并标记 `connector_required`，不生成 placeholder |
 | `WebBrowser` | 轻量浏览器兼容入口，实际执行真实 HTTP fetch | 网络/URL 失败时返回真实错误 |
 
-**注意：** `code_interpreter` 已实现为真实工具（`src/gateway_builtin_tools.py:_tool_code_interpreter()`），使用 `subprocess.run` 执行 Python 代码。默认禁用，需设置 `GATEWAY_ALLOW_SHELL_TOOLS=1` 启用。
+**注意：** `code_interpreter` 已实现为真实工具（`src/gateway_builtin_tools.py:_tool_code_interpreter()`），但属于用户侧执行能力。默认会下发给下游客户端；只有显式 `GATEWAY_EXECUTE_USER_SIDE_TOOLS=1` 的本地代理部署才会在 Gateway 服务机执行，并且仍需 `GATEWAY_ALLOW_SHELL_TOOLS=1`。
 
 补全策略：优先通过 MCP 市场安装对应 server（浏览器、GitHub、数据库、文件系统、搜索、代码执行等），其次通过 Admin UI 的 HTTP Action 把已有服务注册为工具。Gateway 会自动暴露 `mcp__server__tool` 和 `mcp_server_tool` 两套名称。
 
