@@ -12,6 +12,7 @@ import uuid
 from typing import Any
 
 Json = dict[str, Any]
+_TOOL_RESULT_ERROR_PREFIX = "[gateway_tool_result_error]\n"
 
 
 def _text_from_content(content: Any) -> str:
@@ -37,6 +38,20 @@ def _text_from_content(content: Any) -> str:
     return str(content) if content else ""
 
 
+def _encode_tool_result_content(content: Any, is_error: bool = False) -> str:
+    text = _text_from_content(content)
+    if is_error and not text.startswith(_TOOL_RESULT_ERROR_PREFIX):
+        return _TOOL_RESULT_ERROR_PREFIX + text
+    return text
+
+
+def _decode_tool_result_content(content: Any) -> tuple[str, bool]:
+    text = _text_from_content(content)
+    if text.startswith(_TOOL_RESULT_ERROR_PREFIX):
+        return text[len(_TOOL_RESULT_ERROR_PREFIX):], True
+    return text, False
+
+
 def _openai_text_from_content(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -53,6 +68,152 @@ def _openai_text_from_content(content: Any) -> str:
         if content.get("type") == "text":
             return str(content.get("text") or "")
     return str(content) if content else ""
+
+
+def _legacy_function_call_id(name: Any) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(name or "function")).strip("_")
+    return f"legacy_function_call_{safe or 'function'}"
+
+
+def _openai_function_arguments_string(arguments: Any) -> str:
+    if arguments is None:
+        return "{}"
+    if isinstance(arguments, str):
+        return arguments
+    return json.dumps(arguments, ensure_ascii=False)
+
+
+def _openai_function_arguments_to_anthropic_input(arguments: Any) -> Json:
+    if arguments is None:
+        return {}
+    if isinstance(arguments, dict):
+        return arguments
+    if isinstance(arguments, str):
+        if not arguments.strip():
+            return {}
+        try:
+            parsed = json.loads(arguments)
+        except json.JSONDecodeError:
+            return {"input": arguments}
+    else:
+        parsed = arguments
+    if isinstance(parsed, dict):
+        return parsed
+    return {"input": parsed}
+
+
+_RESPONSES_TOOL_CALL_TYPES = {
+    "function_call",
+    "tool_call",
+    "custom_tool_call",
+    # Codex/OpenAI Responses built-in tool history items.
+    "local_shell_call",
+    "tool_search_call",
+    "file_search_call",
+    "web_search_call",
+    "computer_call",
+    "code_interpreter_call",
+    "mcp_call",
+}
+
+_RESPONSES_TOOL_OUTPUT_TYPES = {
+    "function_call_output",
+    "custom_tool_call_output",
+    "local_shell_call_output",
+    "tool_search_call_output",
+    "tool_search_output",
+    "file_search_call_output",
+    "web_search_call_output",
+    "computer_call_output",
+    "code_interpreter_call_output",
+    "mcp_call_output",
+    "tool_result",
+}
+
+_RESPONSES_TOOL_DEFAULT_NAMES = {
+    "local_shell_call": "local_shell",
+    "tool_search_call": "tool_search",
+    "file_search_call": "file_search_call",
+    "web_search_call": "web_search_call",
+    "computer_call": "computer_call",
+    "code_interpreter_call": "code_interpreter",
+    "mcp_call": "mcp_call",
+}
+
+
+def _is_responses_tool_call_type(item_type: Any) -> bool:
+    return str(item_type or "") in _RESPONSES_TOOL_CALL_TYPES
+
+
+def _is_responses_tool_output_type(item_type: Any) -> bool:
+    return str(item_type or "") in _RESPONSES_TOOL_OUTPUT_TYPES
+
+
+def _is_responses_tool_history_type(item_type: Any) -> bool:
+    return _is_responses_tool_call_type(item_type) or _is_responses_tool_output_type(item_type)
+
+
+def _responses_tool_call_name(item: Json) -> str:
+    item_type = str(item.get("type") or "")
+    return str(item.get("name") or _RESPONSES_TOOL_DEFAULT_NAMES.get(item_type) or "")
+
+
+def _responses_tool_call_arguments_value(item: Json) -> Json:
+    item_type = str(item.get("type") or "")
+    raw_args = item.get("arguments")
+    if raw_args is None and item_type == "custom_tool_call" and "input" in item:
+        raw_input = item.get("input")
+        return dict(raw_input) if isinstance(raw_input, dict) else {"input": raw_input}
+    if raw_args is None and "input" in item:
+        raw_args = item.get("input")
+    if raw_args is None and "action" in item:
+        raw_args = item.get("action")
+    if raw_args is None:
+        return {}
+    if isinstance(raw_args, dict):
+        return dict(raw_args)
+    if isinstance(raw_args, str):
+        if not raw_args.strip():
+            return {}
+        try:
+            parsed = json.loads(raw_args)
+            return parsed if isinstance(parsed, dict) else {"input": parsed}
+        except json.JSONDecodeError:
+            return {"input": raw_args}
+    return {"input": raw_args}
+
+
+def _responses_tool_call_arguments_string(item: Json) -> str:
+    raw_args = item.get("arguments")
+    if isinstance(raw_args, str):
+        return raw_args
+    return json.dumps(_responses_tool_call_arguments_value(item), ensure_ascii=False)
+
+
+def _responses_tool_output_content(item: Json) -> Any:
+    if "output" in item:
+        return item.get("output")
+    if "content" in item:
+        return item.get("content")
+    if "result" in item:
+        return item.get("result")
+    return item.get("text", "")
+
+
+def _openai_tool_calls_from_message(message: Json) -> list[Json]:
+    result = [tc for tc in (message.get("tool_calls") or []) if isinstance(tc, dict)]
+    legacy = message.get("function_call")
+    if isinstance(legacy, dict) and legacy.get("name"):
+        result.append({
+            "id": _legacy_function_call_id(legacy.get("name")),
+            "type": "function",
+            "function": {
+                "name": legacy.get("name", ""),
+                "arguments": _openai_function_arguments_string(legacy.get("arguments")),
+            },
+            "gateway_legacy_function_call": True,
+        })
+    return result
 
 
 def _anthropic_system_to_text(system: Any) -> str:
@@ -143,7 +304,9 @@ def _convert_anthropic_messages_to_openai(messages: list[Json]) -> tuple[list[Js
         role = msg.get("role")
         content = msg.get("content")
         if role == "system":
-            system_text = _anthropic_system_to_text(content)
+            text = _anthropic_system_to_text(content)
+            if text:
+                system_text = (system_text + "\n\n" + text).strip() if system_text else text
             continue
         if role == "user":
             if isinstance(content, str):
@@ -159,7 +322,10 @@ def _convert_anthropic_messages_to_openai(messages: list[Json]) -> tuple[list[Js
                             text_parts.append("[image]")
                         elif item.get("type") == "tool_result":
                             tool_use_id = item.get("tool_use_id", "")
-                            result_text = _text_from_content(item.get("content") or "")
+                            result_text = _encode_tool_result_content(
+                                item.get("content") or "",
+                                bool(item.get("is_error")),
+                            )
                             tool_results.append({
                                 "role": "tool",
                                 "tool_call_id": tool_use_id,
@@ -267,7 +433,7 @@ def _openai_tool_calls_from_response(response: Json) -> list[dict]:
     choices = response.get("choices") or []
     for choice in choices:
         message = choice.get("message") or {}
-        tool_calls = message.get("tool_calls") or []
+        tool_calls = _openai_tool_calls_from_message(message) if isinstance(message, dict) else []
         if tool_calls:
             return tool_calls
     return []
@@ -354,17 +520,13 @@ def _from_openai_chat_response(path: str, response: Json) -> Json:
             content_parts.append({"type": "thinking", "thinking": think_text})
         if remaining:
             content_parts.append({"type": "text", "text": remaining})
-    for tc in message.get("tool_calls") or []:
+    for tc in _openai_tool_calls_from_message(message):
         func = tc.get("function") or {}
-        try:
-            args = json.loads(func.get("arguments") or "{}")
-        except json.JSONDecodeError:
-            args = {}
         content_parts.append({
             "type": "tool_use",
             "id": tc.get("id", ""),
             "name": func.get("name", ""),
-            "input": args,
+            "input": _openai_function_arguments_to_anthropic_input(func.get("arguments")),
         })
     has_tool_use = any(isinstance(block, dict) and block.get("type") == "tool_use" for block in content_parts)
     result: Json = {
@@ -398,7 +560,7 @@ def _last_user_text(path: str, body: Json) -> str:
                 item_type = item.get("type")
                 if role and role != "user":
                     continue
-                if item_type in {"function_call_output", "custom_tool_call_output"}:
+                if _is_responses_tool_history_type(item_type):
                     continue
                 content = item.get("content")
                 if content is None:
@@ -488,28 +650,32 @@ def _openai_messages_to_anthropic(messages: list[Json]) -> tuple[list[Json], str
             reasoning = msg.get("reasoning")
             if reasoning:
                 content_parts.append({"type": "thinking", "thinking": str(reasoning)})
-            for tc in msg.get("tool_calls") or []:
+            for tc in _openai_tool_calls_from_message(msg):
                 func = tc.get("function") or {}
-                try:
-                    args = json.loads(func.get("arguments") or "{}")
-                except json.JSONDecodeError:
-                    args = {}
                 content_parts.append({
                     "type": "tool_use",
                     "id": tc.get("id", ""),
                     "name": func.get("name", ""),
-                    "input": args,
+                    "input": _openai_function_arguments_to_anthropic_input(func.get("arguments")),
                 })
             if content_parts:
                 result.append({"role": "assistant", "content": content_parts})
-        elif role == "tool":
+        elif role in {"tool", "function"}:
+            tool_use_id = msg.get("tool_call_id", "")
+            if role == "function" and not tool_use_id:
+                tool_use_id = _legacy_function_call_id(msg.get("name"))
+            tool_content, is_error = _decode_tool_result_content(msg.get("content", ""))
+            is_error = is_error or bool(msg.get("is_error"))
+            block: Json = {
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": tool_content,
+            }
+            if is_error:
+                block["is_error"] = True
             result.append({
                 "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": msg.get("tool_call_id", ""),
-                    "content": msg.get("content", ""),
-                }],
+                "content": [block],
             })
     # Merge consecutive same-role messages (Anthropic requires strict alternation)
     merged = []
@@ -635,19 +801,23 @@ def _openai_chat_to_responses_payload(body: Json, *, stream: bool | None = None)
             content = msg.get("content", "")
             if content:
                 input_items.append({"role": "assistant", "content": content})
-            for tc in msg.get("tool_calls") or []:
+            for tc in _openai_tool_calls_from_message(msg):
                 func = tc.get("function") or {}
                 input_items.append({
                     "type": "function_call",
                     "call_id": tc.get("id", ""),
                     "name": func.get("name", ""),
-                    "arguments": func.get("arguments", "{}"),
+                    "arguments": _openai_function_arguments_string(func.get("arguments")),
                 })
-        elif role == "tool":
+        elif role in {"tool", "function"}:
+            call_id = msg.get("tool_call_id", "")
+            if role == "function" and not call_id:
+                call_id = _legacy_function_call_id(msg.get("name"))
+            output = _encode_tool_result_content(msg.get("content", ""), bool(msg.get("is_error")))
             input_items.append({
                 "type": "function_call_output",
-                "call_id": msg.get("tool_call_id", ""),
-                "output": msg.get("content", ""),
+                "call_id": call_id,
+                "output": output,
             })
     payload: Json = {
         "model": body.get("model") or "",
@@ -685,13 +855,16 @@ def _from_responses_response_to_openai(response: Json) -> Json:
                 for c in item.get("content") or []:
                     if isinstance(c, dict) and c.get("type") == "output_text":
                         text_parts.append(str(c.get("text") or ""))
-            elif item.get("type") == "function_call":
+            elif _is_responses_tool_call_type(item.get("type")):
+                name = _responses_tool_call_name(item)
+                if not name:
+                    continue
                 tool_calls.append({
-                    "id": item.get("call_id", ""),
+                    "id": item.get("call_id") or item.get("id") or "",
                     "type": "function",
                     "function": {
-                        "name": item.get("name", ""),
-                        "arguments": item.get("arguments", "{}"),
+                        "name": name,
+                        "arguments": _responses_tool_call_arguments_string(item),
                     },
                 })
     message: Json = {"role": "assistant"}
@@ -700,7 +873,7 @@ def _from_responses_response_to_openai(response: Json) -> Json:
     if tool_calls:
         message["tool_calls"] = tool_calls
     return {
-        "choices": [{"message": message, "finish_reason": "stop"}],
+        "choices": [{"message": message, "finish_reason": "tool_calls" if tool_calls else "stop"}],
     }
 
 
@@ -753,13 +926,13 @@ def _from_openai_chat_to_responses_response(response: Json) -> Json:
             "type": "message",
             "content": [{"type": "output_text", "text": message["content"]}],
         })
-    for tc in message.get("tool_calls") or []:
+    for tc in _openai_tool_calls_from_message(message):
         func = tc.get("function") or {}
         output_items.append({
             "type": "function_call",
             "call_id": tc.get("id", ""),
             "name": func.get("name", ""),
-            "arguments": func.get("arguments", "{}"),
+            "arguments": _openai_function_arguments_string(func.get("arguments")),
         })
     return _ensure_openai_responses_response({
         "id": response.get("id"),
@@ -776,12 +949,17 @@ def _from_openai_chat_to_responses_response(response: Json) -> Json:
 _GATEWAY_INTERNAL_REQUEST_FIELDS = {
     "workspace_root",
     "gateway_workspace",
+    "workspace",
+    "workspace_dir",
     "project_dir",
     "projectDir",
     "cwd",
     "working_directory",
     "primary_working_directory",
     "worktree",
+    "client_id",
+    "gateway_context",
+    "gateway_agent_planner",
 }
 
 
@@ -862,23 +1040,23 @@ def _convert_request_to_upstream(downstream_path: str, body: Json, upstream_prot
     body = _strip_gateway_internal_request_fields(body)
     if upstream_protocol == "anthropic_messages":
         if "/messages" in downstream_path:
-            return "/v1/messages", body
+            return "/v1/messages", _strip_gateway_internal_request_fields(body)
         converted = _openai_chat_to_anthropic_payload(body)
-        return "/v1/messages", converted
+        return "/v1/messages", _strip_gateway_internal_request_fields(converted)
     if upstream_protocol == "openai_responses":
         if "/responses" in downstream_path:
-            return "/v1/responses", body
+            return "/v1/responses", _strip_gateway_internal_request_fields(body)
         converted = _openai_chat_to_responses_payload(body)
-        return "/v1/responses", converted
+        return "/v1/responses", _strip_gateway_internal_request_fields(converted)
     # upstream_protocol == "openai_chat" (default)
     if "/messages" in downstream_path:
         converted = _to_openai_chat_payload(downstream_path, body)
-        return "/v1/chat/completions", converted
+        return "/v1/chat/completions", _strip_gateway_internal_request_fields(converted)
     if "/responses" in downstream_path:
         # Responses -> Chat: extract messages from input items
         converted = _responses_to_chat_payload(body)
-        return "/v1/chat/completions", converted
-    return "/v1/chat/completions", body
+        return "/v1/chat/completions", _strip_gateway_internal_request_fields(converted)
+    return "/v1/chat/completions", _strip_gateway_internal_request_fields(body)
 
 
 def _is_anthropic_response(response: Json) -> bool:
@@ -911,7 +1089,9 @@ def _is_openai_responses_response(response: Json) -> bool:
         return True
     if isinstance(output, list) and output:
         first = output[0]
-        if isinstance(first, dict) and first.get("type") in ("function_call", "message", "tool_call"):
+        if isinstance(first, dict) and (
+            first.get("type") == "message" or _is_responses_tool_history_type(first.get("type"))
+        ):
             return True
     return False
 
@@ -973,23 +1153,27 @@ def _responses_to_chat_payload(body: Json) -> Json:
                     messages.append({"role": role, "content": content})
                 elif isinstance(content, list):
                     messages.append({"role": role, "content": content})
-            elif item.get("type") == "function_call":
+            elif _is_responses_tool_call_type(item.get("type")):
+                name = _responses_tool_call_name(item)
+                if not name:
+                    continue
                 messages.append({
                     "role": "assistant",
                     "tool_calls": [{
-                        "id": item.get("call_id", ""),
+                        "id": item.get("call_id") or item.get("id") or "",
                         "type": "function",
                         "function": {
-                            "name": item.get("name", ""),
-                            "arguments": item.get("arguments", "{}"),
+                            "name": name,
+                            "arguments": _responses_tool_call_arguments_string(item),
                         },
                     }],
                 })
-            elif item.get("type") == "function_call_output":
+            elif _is_responses_tool_output_type(item.get("type")):
+                is_error = bool(item.get("is_error")) or str(item.get("status") or "").lower() in {"error", "failed", "incomplete"}
                 messages.append({
                     "role": "tool",
-                    "tool_call_id": item.get("call_id", ""),
-                    "content": item.get("output", ""),
+                    "tool_call_id": item.get("call_id") or item.get("tool_call_id") or item.get("id") or "",
+                    "content": _encode_tool_result_content(_responses_tool_output_content(item), is_error),
                 })
     # Add instructions as system message
     instructions = body.get("instructions")

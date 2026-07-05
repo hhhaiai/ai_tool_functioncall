@@ -62,6 +62,39 @@ def _ensure_screenshot_dir() -> pathlib.Path:
     return d
 
 
+def _image_generation_url_policy() -> Json:
+    allow_private = os.environ.get("GATEWAY_ALLOW_PRIVATE_NETWORK_TOOLS", "").strip().lower() in {"1", "true", "yes", "on"}
+    try:
+        from .gateway_config import _gateway_config
+        allow_private = allow_private or bool(_gateway_config().get("allow_private_network_tools", False))
+    except Exception:
+        pass
+    return {"allow_private_network": allow_private}
+
+
+def _open_image_provider_url(req: Any, *, timeout: float) -> Any:
+    from .gateway_http_actions import _http_action_opener, _validate_action_url
+
+    policy = _image_generation_url_policy()
+    _validate_action_url(getattr(req, "full_url", ""), policy)
+    return _http_action_opener(policy).open(req, timeout=timeout)
+
+
+def _image_generation_size(size: str) -> tuple[int, int]:
+    try:
+        configured_max = int(os.environ.get("GATEWAY_IMAGE_MAX_DIMENSION", "2048"))
+    except ValueError:
+        configured_max = 2048
+    max_dimension = max(64, min(configured_max, 4096))
+    width, height = 1024, 1024
+    if "x" in size:
+        parts = size.lower().split("x", 1)
+        width, height = int(parts[0]), int(parts[1])
+    width = max(64, min(width, max_dimension))
+    height = max(64, min(height, max_dimension))
+    return width, height
+
+
 # ---------------------------------------------------------------------------
 # computer_use — take screenshot + return path/base64
 # ---------------------------------------------------------------------------
@@ -340,12 +373,13 @@ def _tool_image_generation(args: Json) -> str:
                 "size": args.get("size") or "1024x1024",
                 "response_format": "b64_json",
             }).encode()
+            base_url = os.environ.get("IMAGE_GEN_BASE_URL", "https://api.openai.com").rstrip("/")
             req = urllib.request.Request(
-                os.environ.get("IMAGE_GEN_BASE_URL", "https://api.openai.com") + "/v1/images/generations",
+                base_url + "/v1/images/generations",
                 data=body,
                 headers={"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"},
             )
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with _open_image_provider_url(req, timeout=120) as resp:
                 data = json.loads(resp.read().decode())
             b64_data = data["data"][0]["b64_json"]
             img_bytes = base64.b64decode(b64_data)
@@ -363,13 +397,10 @@ def _tool_image_generation(args: Json) -> str:
         import urllib.request
         import urllib.parse
         encoded_prompt = urllib.parse.quote(prompt)
-        width, height = 1024, 1024
-        if "x" in size:
-            parts = size.split("x")
-            width, height = int(parts[0]), int(parts[1])
+        width, height = _image_generation_size(size)
         url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width={width}&height={height}&nologo=true&seed={int(time.time())}"
         req = urllib.request.Request(url, headers={"User-Agent": "Gateway/1.0"})
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with _open_image_provider_url(req, timeout=120) as resp:
             img_bytes = resp.read()
         if len(img_bytes) < 1000:
             raise ValueError(f"Response too small ({len(img_bytes)} bytes), likely error")
@@ -396,7 +427,7 @@ def _tool_image_generation(args: Json) -> str:
                 data=body,
                 headers={"Authorization": f"Bearer {hf_key}", "Content-Type": "application/json"},
             )
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with _open_image_provider_url(req, timeout=120) as resp:
                 img_bytes = resp.read()
             out_path.write_bytes(img_bytes)
             b64_str = base64.b64encode(img_bytes).decode("ascii")

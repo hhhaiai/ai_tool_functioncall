@@ -4,12 +4,12 @@
     "password": "admin"
   },
   "upstream": {
-    "base_url": "",
+    "base_url": "http://47.85.40.209:8885",
     "api_key": "",
     "model": "mimo-v2.5-pro",
     "protocol": "openai_chat",
     "tools_enabled": "adapter",
-    "timeout_seconds": 60,
+    "timeout_seconds": 120.0,
     "max_input_tokens": 1048576,
     "max_output_tokens": 131072,
     "max_concurrency": 32,
@@ -26,11 +26,15 @@
       "supports_parallel_tool_calls": false,
       "supports_vision": false,
       "supports_network": false,
-      "supports_json_schema": true
-    }
+      "supports_web_search": false,
+      "supports_json_schema": false
+    },
+    "native_tools_verified": false,
+    "use_for_coding": true,
+    "id": "mimo-chat-only-8885",
+    "name": "mimo chat-only 8885"
   },
   "gateway": {
-    "workspace_root": "./workspace",
     "tool_mode": "orchestrate",
     "allow_write_tools": false,
     "allow_shell_tools": false,
@@ -49,12 +53,13 @@
     "text_tool_call_fallback_enabled": true,
     "public_base_url": "http://127.0.0.1:8885",
     "client_snippet_api_key": "",
-    "downstream_model_alias": "",
-    "review_model_alias": "",
+    "downstream_model_alias": "mimo-v2.5-pro",
+    "review_model_alias": "mimo-v2.5-pro",
     "client_context_window": 1048576,
     "client_auto_compact_token_limit": 943718,
     "client_output_token_limit": 131072,
-    "text_tool_adapter_compact_token_limit": 48000
+    "text_tool_adapter_compact_token_limit": 48000,
+    "agent_planner_strict_every_turn": true
   },
   "context": {
     "enabled": true,
@@ -71,6 +76,8 @@
     "memory_recall_limit": 8,
     "memory_inject_max_chars": 4000,
     "memory_summary_max_chars": 900,
+    "memory_rollup_every_turns": 8,
+    "memory_rollup_max_chars": 4000,
     "route_to_long_context": true,
     "long_context_upstream": {
       "base_url": "",
@@ -87,5 +94,41 @@
   "http_actions": {
     "enabled": true,
     "actions": []
-  }
+  },
+  "cache": {},
+  "upstream_profiles": [
+    {
+      "base_url": "http://47.85.40.209:8885",
+      "api_key": "",
+      "model": "mimo-v2.5-pro",
+      "protocol": "openai_chat",
+      "tools_enabled": "adapter",
+      "timeout_seconds": 120.0,
+      "max_input_tokens": 1048576,
+      "max_output_tokens": 131072,
+      "max_concurrency": 32,
+      "paths": {
+        "models": "/v1/models",
+        "chat_completions": "/v1/chat/completions",
+        "responses": "/v1/responses",
+        "messages": "/v1/messages"
+      },
+      "capabilities": {
+        "supports_streaming": true,
+        "supports_tools": false,
+        "supports_function_calls": false,
+        "supports_parallel_tool_calls": false,
+        "supports_vision": false,
+        "supports_network": false,
+        "supports_web_search": false,
+        "supports_json_schema": false
+      },
+      "native_tools_verified": false,
+      "use_for_coding": true,
+      "id": "mimo-chat-only-8885",
+      "name": "mimo chat-only 8885"
+    }
+  ],
+  "active_upstream_id": "mimo-chat-only-8885",
+  "active_upstream": "mimo-chat-only-8885"
 }

@@ -157,6 +157,7 @@ def _render_admin_ui() -> str:
     from .gateway_config import load_config, _redacted_config
     from .gateway_logging import _stats_snapshot, _tail_requests, _tail_failures, _tool_catalog_snapshot
     from .gateway_context import _sqlite_tail_memories
+    from .gateway_agent_planner import list_runtime_events
     from .gateway_mcp import _enabled_mcp_servers, _mcp_list_server_tools, _mcp_public_name
 
     cfg = load_config()
@@ -579,6 +580,7 @@ def _render_admin_ui() -> str:
     from .gateway_config import load_config, _redacted_config
     from .gateway_logging import _stats_snapshot, _tail_requests, _tail_failures, _tool_catalog_snapshot
     from .gateway_context import _sqlite_tail_memories
+    from .gateway_agent_planner import list_runtime_events
     from .gateway_mcp import _enabled_mcp_servers, _mcp_list_server_tools, _mcp_public_name
 
     cfg = load_config()
@@ -587,6 +589,7 @@ def _render_admin_ui() -> str:
     requests = _tail_requests(30)
     failures = _tail_failures(30)
     memories = _sqlite_tail_memories(30)
+    runtime_events = list_runtime_events(30)
     tools = _tool_catalog_snapshot()
     mcp_servers = _enabled_mcp_servers()
 
@@ -639,7 +642,7 @@ def _render_admin_ui() -> str:
         unique_tool_count=unique_tools, tool_name_count=len(tool_items),
         mcp_servers=mcp_servers, mcp_tools=mcp_tools, skills=skills,
         http_actions=http_actions, requests_data=requests, failures_data=failures,
-        memories_data=memories, total_requests=total_requests,
+        memories_data=memories, runtime_events_data=runtime_events, total_requests=total_requests,
         failure_count=failure_count,
         public_base=gateway_cfg.get("public_base_url", "http://127.0.0.1:8885"),
     )
@@ -684,6 +687,7 @@ def _render_html(**kw):
     requests_data = kw["requests_data"]
     failures_data = kw["failures_data"]
     memories_data = kw["memories_data"]
+    runtime_events_data = kw.get("runtime_events_data") or []
     total_requests = kw["total_requests"]
     failure_count = kw["failure_count"]
     public_base = kw["public_base"]
@@ -737,8 +741,26 @@ def _render_html(**kw):
     req_html = "\n".join(rrows) or '<tr><td colspan="3" class="muted">No requests</td></tr>'
     frows = [f'<tr><td class="mono small">{E(str(f.get("ts",""))[:19])}</td><td>{E(f.get("tool_name"))}</td><td>{E(f.get("failure_type"))}</td><td>{E(str(f.get("content",""))[:80])}</td></tr>' for f in failures_data[:20]]
     fail_html = "\n".join(frows) or '<tr><td colspan="4" class="muted">No failures</td></tr>'
-    mrows2 = [f'<tr><td class="mono small">{E(str(m.get("ts",""))[:19])}</td><td class="mono">{E(str(m.get("session_key",""))[:12])}</td><td>{E(m.get("kind"))}</td><td>{E(str(m.get("summary",""))[:100])}</td></tr>' for m in memories_data[:20]]
-    mem_html = "\n".join(mrows2) or '<tr><td colspan="4" class="muted">No memories</td></tr>'
+    mrows2 = [
+        f'<tr><td class="mono small">{E(str(m.get("ts",""))[:19])}</td>'
+        f'<td class="mono small">{E(str(m.get("tenant_key") or "")[:18])}</td>'
+        f'<td class="mono small">{E(str(m.get("workspace_key") or m.get("workspace_root") or "")[-28:])}</td>'
+        f'<td class="mono small">{E(str(m.get("memory_session_key") or m.get("session_key") or "")[:24])}</td>'
+        f'<td>{E(m.get("kind"))}</td><td>{E(str(m.get("summary","") )[:100])}</td></tr>'
+        for m in memories_data[:20]
+    ]
+    mem_html = "\n".join(mrows2) or '<tr><td colspan="6" class="muted">No memories</td></tr>'
+    erows = [
+        f'<tr><td class="mono small">{E(str(e.get("ts",""))[:19])}</td>'
+        f'<td>{E(e.get("event_type"))}</td>'
+        f'<td>{E(e.get("workflow"))}</td>'
+        f'<td>{E(e.get("step"))}</td>'
+        f'<td class="mono small">{E(str(e.get("tenant_key") or "")[:18])}</td>'
+        f'<td class="mono small">{E(str(e.get("workspace_key") or "")[-28:])}</td>'
+        f'<td>{E(str(e.get("summary",""))[:120])}</td></tr>'
+        for e in runtime_events_data[:20]
+    ]
+    events_html = "\n".join(erows) or '<tr><td colspan="7" class="muted">No runtime events</td></tr>'
 
     scards = [f'<div class="skill-card"><h4>{E(s["name"])}</h4><div class="meta">{E(s["source"].split("/")[-1])}</div><div class="actions"><button class="sm ghost" onclick="viewSkill(\'{E(s["name"])}\')">View</button></div></div>' for s in skills]
     skill_html = "\n".join(scards) or '<p class="muted">No skills</p>'
@@ -946,10 +968,12 @@ r = client.chat.completions.create(
 </div>
 
 <div class="tab-content" data-panel="todo">
+<div class="card"><h2>Agent Runtime</h2><p class="muted small" style="margin-bottom:10px">统一状态 API：<code>/admin/agent-runtime.json?tenant_contains=&amp;workspace_contains=&amp;session_contains=</code></p><p class="muted small" style="margin-bottom:10px">事件时间线：<code>/admin/agent-runtime-events.json?event_type=planner_state</code></p><p class="muted small" style="margin-bottom:10px">需求审计：<code>/admin/agent-runtime-audit.json?tenant_contains=&amp;workspace_contains=&amp;session_contains=</code></p><p class="small">聚合 Agent Planner sessions、workflow、evidence、无限上下文 memory/rollup，以及 planner/memory/Gateway-owned/fallback dispatch 进展事件。</p></div>
+<div class="card"><h2>Agent Runtime Events</h2><p class="muted small">最近 runtime timeline；按 tenant/workspace/session 归属，便于远端多用户排障。</p><table><thead><tr><th>时间</th><th>事件</th><th>Workflow</th><th>Step</th><th>Tenant</th><th>Workspace</th><th>摘要</th></tr></thead><tbody>{events_html}</tbody></table></div>
 <div class="card"><h2>Tool Call 兼容性</h2><p class="muted small" style="margin-bottom:10px">当前上游能力状态</p>{todo_html}</div>
 <div class="grid2"><div class="card"><h2>最近请求</h2><table><thead><tr><th>时间</th><th>路径</th><th>状态</th></tr></thead><tbody>{req_html}</tbody></table></div>
 <div class="card"><h2>最近失败</h2><table><thead><tr><th>时间</th><th>工具</th><th>类型</th><th>内容</th></tr></thead><tbody>{fail_html}</tbody></table></div></div>
-<div class="grid2"><div class="card"><h2>对话记忆</h2><table><thead><tr><th>时间</th><th>Session</th><th>类型</th><th>摘要</th></tr></thead><tbody>{mem_html}</tbody></table></div>
+<div class="grid2"><div class="card"><h2>对话记忆</h2><p class="muted small">Scope-aware memory/rollup; API: <code>/admin/memories.json?tenant_contains=&amp;workspace_contains=&amp;session_contains=&amp;kind=session_rollup</code></p><table><thead><tr><th>时间</th><th>Tenant</th><th>Workspace</th><th>Session</th><th>类型</th><th>摘要</th></tr></thead><tbody>{mem_html}</tbody></table></div>
 <div class="card"><h2>统计</h2><pre><code>{E(stats_pretty)}</code></pre></div></div>
 <div class="card"><h2>配置 (Redacted)</h2><pre><code>{E(config_pretty)}</code></pre></div>
 </div>

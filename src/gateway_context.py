@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import pathlib
 import re
 import threading
 import uuid
@@ -148,49 +149,173 @@ def _json_object_from_maybe_string(value: Any) -> Json:
     return {}
 
 
+def _stable_memory_key_part(value: Any, *, max_len: int = 96) -> str:
+    if value is None:
+        return ""
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    if len(text) <= max_len and re.fullmatch(r"[A-Za-z0-9_.:@+-]+", text):
+        return text
+    return hashlib.sha256(text.encode("utf-8", "ignore")).hexdigest()[:24]
+
+
+def _tenant_key_from_body(body: Json, metadata: Json | None = None) -> str:
+    metadata = metadata if isinstance(metadata, dict) else body.get("metadata") or {}
+    if isinstance(metadata, str):
+        metadata = _json_object_from_maybe_string(metadata)
+    user_meta = _json_object_from_maybe_string(metadata.get("user_id"))
+    scoped_client_id = None
+    try:
+        from . import gateway_builtin_tools as _bt
+        scoped_client_id = _bt._CLIENT_ID_SCOPE_OVERRIDE.get()
+    except Exception:
+        scoped_client_id = None
+    candidates = (
+        metadata.get("tenant"),
+        metadata.get("tenant_id"),
+        metadata.get("account_id"),
+        metadata.get("organization_id"),
+        user_meta.get("tenant"),
+        user_meta.get("tenant_id"),
+        user_meta.get("account_id"),
+        user_meta.get("organization_id"),
+        user_meta.get("user_id"),
+        user_meta.get("user"),
+        user_meta.get("email"),
+        metadata.get("user_id"),
+        metadata.get("user"),
+        body.get("user"),
+        scoped_client_id,
+        body.get("client_id"),
+    )
+    for candidate in candidates:
+        part = _stable_memory_key_part(candidate)
+        if part:
+            return part
+    return "anonymous"
+
+
 def _memory_session_key(body: Json) -> str:
     metadata = body.get("metadata") or {}
     if isinstance(metadata, str):
         metadata = _json_object_from_maybe_string(metadata)
+    tenant = _tenant_key_from_body(body, metadata)
     session_id = metadata.get("session_id") or metadata.get("conversation_id") or ""
     if not session_id:
         user_meta = _json_object_from_maybe_string(metadata.get("user_id"))
         session_id = user_meta.get("session_id") or user_meta.get("conversation_id") or ""
     if session_id:
-        return str(session_id)
+        return f"tenant:{tenant}:session:{_stable_memory_key_part(session_id)}"
     messages = body.get("messages") or []
-    if messages:
+    if tenant != "anonymous" and messages:
         first_msg = messages[0]
         if isinstance(first_msg, dict):
             content = first_msg.get("content") or ""
             if isinstance(content, str) and len(content) > 10:
-                return __import__("hashlib").sha256(content[:100].encode()).hexdigest()[:16]
-    return f"session_{uuid.uuid4().hex[:8]}"
+                digest = hashlib.sha256(content[:100].encode()).hexdigest()[:16]
+                return f"tenant:{tenant}:anon:{digest}"
+    return f"tenant:{tenant}:session_{uuid.uuid4().hex[:12]}"
 
 
-def _memory_workspace_root() -> str:
+def _memory_workspace_root(body: Json | None = None) -> str:
     try:
-        from .gateway_builtin_tools import _workspace_root
-        workspace = str(_workspace_root())
+        from . import gateway_builtin_tools as _bt
+        override = _bt._WORKSPACE_ROOT_OVERRIDE.get()
+        if override is not None:
+            return str(pathlib.Path(override).resolve())
     except Exception:
-        from .gateway_config import _gateway_config
-        workspace = str(_gateway_config().get("workspace_root", ""))
-    return workspace or "default"
+        pass
+    if isinstance(body, dict):
+        try:
+            from .gateway_tool_runtime import (
+                _body_has_client_workspace_hint,
+                _body_has_remote_identity,
+                _has_non_absolute_client_workspace_hint,
+                _request_workspace_root,
+            )
+            if (
+                _body_has_client_workspace_hint(body)
+                or _has_non_absolute_client_workspace_hint(body)
+                or _body_has_remote_identity(body)
+            ):
+                return str(_request_workspace_root(body))
+        except Exception:
+            pass
+    return "default"
 
 
 def _memory_workspace_legacy_hash(workspace: str) -> str:
     return __import__("hashlib").sha256(workspace.encode()).hexdigest()[:16]
 
 
-def _memory_workspace_key() -> str:
+def _memory_workspace_key(body: Json | None = None) -> str:
     # Store the resolved downstream project root, not a service-root hash, so
     # Memory/RecallMemory evidence remains auditable and project-scoped.
-    return _memory_workspace_root()
+    return _memory_workspace_root(body)
 
 
 def _memory_workspace_lookup_keys(workspace: str) -> list[str]:
     legacy = _memory_workspace_legacy_hash(workspace)
     return [workspace] if legacy == workspace else [workspace, legacy]
+
+
+def _memory_session_index_parts(session_key: str) -> Json:
+    text = str(session_key or "")
+    tenant = "anonymous"
+    memory_session = text
+    if text.startswith("tenant:"):
+        rest = text[len("tenant:"):]
+        markers = (":session:", ":conversation:", ":thread:", ":anon:", ":session_")
+        marker_positions = [(rest.find(marker), marker) for marker in markers if rest.find(marker) >= 0]
+        if marker_positions:
+            pos, marker = min(marker_positions, key=lambda item: item[0])
+            tenant = rest[:pos] or "anonymous"
+            suffix = rest[pos + len(marker):]
+            memory_session = marker.strip(":_") + ":" + suffix
+        else:
+            tenant = rest or "anonymous"
+            memory_session = ""
+    return {"tenant_key": tenant, "memory_session_key": memory_session}
+
+
+def _memory_index_fields(session_key: str, workspace_root: str) -> Json:
+    parts = _memory_session_index_parts(session_key)
+    return {
+        "tenant_key": str(parts.get("tenant_key") or "anonymous"),
+        "workspace_key": str(workspace_root or "default"),
+        "memory_session_key": str(parts.get("memory_session_key") or session_key or ""),
+    }
+
+
+def _sqlite_backfill_memory_index_fields(conn: Any, *, limit: int = 5000) -> None:
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, session_key, workspace_root
+            FROM conversation_memories
+            WHERE tenant_key='' OR workspace_key='' OR memory_session_key=''
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    except Exception:
+        return
+    updated = False
+    for row in rows:
+        fields = _memory_index_fields(str(row[1] or ""), str(row[2] or ""))
+        conn.execute(
+            """
+            UPDATE conversation_memories
+            SET tenant_key=?, workspace_key=?, memory_session_key=?
+            WHERE id=?
+            """,
+            (fields["tenant_key"], fields["workspace_key"], fields["memory_session_key"], row[0]),
+        )
+        updated = True
+    if updated:
+        conn.commit()
 
 
 def _memory_extract_keywords(text: str, *, limit: int = 40) -> list[str]:
@@ -261,29 +386,193 @@ def _sqlite_insert_memory(session_key: str, workspace_root: str, kind: str, summ
     from .gateway_logging import _sqlite_init, _sqlite_connect
     import datetime as _dt
     _sqlite_init()
+    fields = _memory_index_fields(session_key, workspace_root)
     conn = _sqlite_connect()
     try:
+        _sqlite_backfill_memory_index_fields(conn)
+        now = _dt.datetime.now(_dt.timezone.utc).isoformat()
         conn.execute(
             """
             INSERT INTO conversation_memories
-                (ts, session_key, workspace_root, kind, summary, keywords_json, source_request_id, importance, last_used_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (
+                    ts, session_key, workspace_root, tenant_key, workspace_key, memory_session_key,
+                    kind, summary, keywords_json, source_request_id, importance, last_used_at
+                )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                now,
                 session_key,
                 workspace_root,
+                fields["tenant_key"],
+                fields["workspace_key"],
+                fields["memory_session_key"],
                 kind,
                 summary,
                 json.dumps(keywords, ensure_ascii=False),
                 source_request_id,
                 importance,
-                _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                now,
             ),
         )
         conn.commit()
+        if kind == "session_rollup":
+            try:
+                from .gateway_agent_planner import record_runtime_event
+                record_runtime_event(
+                    session_key=session_key,
+                    tenant_key=fields["tenant_key"],
+                    workspace_key=fields["workspace_key"],
+                    event_type="memory_rollup",
+                    workflow="memory",
+                    step="session_rollup",
+                    summary=summary[:500],
+                    metadata={"importance": importance, "keywords": keywords[:20]},
+                )
+            except Exception:
+                pass
     finally:
         conn.close()
+
+
+def _memory_rollup_every() -> int:
+    cfg = _memory_config()
+    raw = cfg.get("memory_rollup_every_turns", os.environ.get("GATEWAY_MEMORY_ROLLUP_EVERY_TURNS", 8))
+    try:
+        return max(0, int(raw or 0))
+    except (TypeError, ValueError):
+        return 8
+
+
+def _memory_rollup_max_chars() -> int:
+    cfg = _memory_config()
+    raw = cfg.get("memory_rollup_max_chars", os.environ.get("GATEWAY_MEMORY_ROLLUP_MAX_CHARS", 4000))
+    try:
+        return max(500, int(raw or 4000))
+    except (TypeError, ValueError):
+        return 4000
+
+
+def _sqlite_latest_rollup(session_key: str, workspace_root: str) -> Json | None:
+    from .gateway_logging import _sqlite_init, _sqlite_connect
+    _sqlite_init()
+    conn = _sqlite_connect()
+    try:
+        _sqlite_backfill_memory_index_fields(conn)
+        fields = _memory_index_fields(session_key, workspace_root)
+        row = conn.execute(
+            """
+            SELECT id, ts, summary, keywords_json, importance, last_used_at
+            FROM conversation_memories
+            WHERE tenant_key = ? AND workspace_key = ? AND memory_session_key = ? AND kind = 'session_rollup'
+            ORDER BY ts DESC
+            LIMIT 1
+            """,
+            (fields["tenant_key"], fields["workspace_key"], fields["memory_session_key"]),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "ts": row[1],
+            "kind": "session_rollup",
+            "summary": row[2],
+            "keywords": json.loads(row[3]),
+            "importance": row[4],
+            "last_used_at": row[5],
+        }
+    finally:
+        conn.close()
+
+
+def _sqlite_recent_memories_since_rollup(session_key: str, workspace_root: str, *, limit: int = 200) -> list[Json]:
+    from .gateway_logging import _sqlite_init, _sqlite_connect
+    _sqlite_init()
+    conn = _sqlite_connect()
+    try:
+        _sqlite_backfill_memory_index_fields(conn)
+        fields = _memory_index_fields(session_key, workspace_root)
+        latest_rollup = _sqlite_latest_rollup(session_key, workspace_root)
+        since_ts = str((latest_rollup or {}).get("ts") or "")
+        if since_ts:
+            rows = conn.execute(
+                f"""
+                SELECT id, ts, kind, summary, keywords_json, importance, last_used_at
+                FROM conversation_memories
+                WHERE tenant_key = ? AND workspace_key = ? AND memory_session_key = ?
+                  AND kind != 'session_rollup' AND ts > ?
+                ORDER BY ts ASC
+                LIMIT ?
+                """,
+                (fields["tenant_key"], fields["workspace_key"], fields["memory_session_key"], since_ts, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"""
+                SELECT id, ts, kind, summary, keywords_json, importance, last_used_at
+                FROM conversation_memories
+                WHERE tenant_key = ? AND workspace_key = ? AND memory_session_key = ?
+                  AND kind != 'session_rollup'
+                ORDER BY ts ASC
+                LIMIT ?
+                """,
+                (fields["tenant_key"], fields["workspace_key"], fields["memory_session_key"], limit),
+            ).fetchall()
+        return [
+            {
+                "id": row[0],
+                "ts": row[1],
+                "kind": row[2],
+                "summary": row[3],
+                "keywords": json.loads(row[4]),
+                "importance": row[5],
+                "last_used_at": row[6],
+            }
+            for row in rows
+        ]
+    finally:
+        conn.close()
+
+
+def _memory_build_rollup_summary(rows: list[Json], *, max_chars: int) -> str:
+    if not rows:
+        return ""
+    messages = [
+        {"role": "user", "content": f"{row.get('kind')}: {row.get('summary', '')}"}
+        for row in rows[-20:]
+    ]
+    from .gateway_config import _env_bool
+    if _env_bool("GATEWAY_MEMORY_ROLLUP_LLM_SUMMARY", False):
+        summary = _summarize_via_llm(messages, max_summary_tokens=max(300, min(1200, max_chars // 4)))
+        if summary:
+            return _trim_text_for_context("[Periodic conversation summary]\n" + summary, max_chars)
+    parts = ["[Periodic conversation summary]"]
+    for row in rows[-20:]:
+        parts.append(f"- {row.get('kind')}: {row.get('summary', '')}")
+    return _trim_text_for_context("\n".join(parts), max_chars)
+
+
+def _maybe_rollup_conversation_memory(session_key: str, workspace_root: str) -> None:
+    every = _memory_rollup_every()
+    if every <= 0:
+        return
+    rows = _sqlite_recent_memories_since_rollup(session_key, workspace_root, limit=max(every * 2, every))
+    if len(rows) < every:
+        return
+    max_chars = _memory_rollup_max_chars()
+    rollup = _memory_build_rollup_summary(rows, max_chars=max_chars)
+    if not rollup:
+        return
+    keywords = _memory_extract_keywords(rollup)
+    _sqlite_insert_memory(
+        session_key,
+        workspace_root,
+        "session_rollup",
+        rollup,
+        keywords,
+        None,
+        5,
+    )
 
 
 def _remember_conversation_turn(path: str, body: Json, response: Json | None, *, source_request_id: str | None = None) -> None:
@@ -295,8 +584,18 @@ def _remember_conversation_turn(path: str, body: Json, response: Json | None, *,
     if not summary:
         return
     session_key = _memory_session_key(body)
-    workspace_root = _memory_workspace_key()
+    workspace_root = _memory_workspace_key(body)
     _sqlite_insert_memory(session_key, workspace_root, kind, summary, keywords, source_request_id, importance)
+    _maybe_rollup_conversation_memory(session_key, workspace_root)
+
+
+def _prepend_latest_rollup(session_key: str, workspace_root: str, memories: list[Json], limit: int) -> list[Json]:
+    rollup = _sqlite_latest_rollup(session_key, workspace_root)
+    if not rollup:
+        return memories
+    rollup_id = rollup.get("id")
+    filtered = [mem for mem in memories if mem.get("id") != rollup_id]
+    return [rollup] + filtered[: max(0, limit - 1)]
 
 
 def _sqlite_recall_memories(session_key: str, workspace_root: str, query_keywords: list[str], limit: int) -> list[Json]:
@@ -305,17 +604,17 @@ def _sqlite_recall_memories(session_key: str, workspace_root: str, query_keyword
     _sqlite_init()
     conn = _sqlite_connect()
     try:
-        workspace_keys = _memory_workspace_lookup_keys(workspace_root)
-        placeholders = ",".join("?" for _ in workspace_keys)
+        _sqlite_backfill_memory_index_fields(conn)
+        fields = _memory_index_fields(session_key, workspace_root)
         rows = conn.execute(
-            f"""
+            """
             SELECT id, ts, kind, summary, keywords_json, importance, last_used_at
             FROM conversation_memories
-            WHERE session_key = ? AND workspace_root IN ({placeholders})
+            WHERE tenant_key = ? AND workspace_key = ? AND memory_session_key = ?
             ORDER BY importance DESC, ts DESC
             LIMIT ?
             """,
-            (session_key, *workspace_keys, limit * 2),
+            (fields["tenant_key"], fields["workspace_key"], fields["memory_session_key"], limit * 2),
         ).fetchall()
         scored = []
         for row in rows:
@@ -351,17 +650,17 @@ def _recall_conversation_memories(path: str, body: Json) -> list[Json]:
     cfg = _memory_config()
     limit = cfg.get("memory_recall_limit", 8)
     session_key = _memory_session_key(body)
-    workspace_root = _memory_workspace_key()
+    workspace_root = _memory_workspace_key(body)
     user_text = _memory_extract_request_text(path, body)
     # Use smart memory search with relevance scoring when query is available
     if user_text.strip():
         try:
-            return _smart_memory_search(session_key, workspace_root, user_text, limit)
+            return _prepend_latest_rollup(session_key, workspace_root, _smart_memory_search(session_key, workspace_root, user_text, limit), limit)
         except Exception:
             pass
     # Fallback to keyword-based search
     keywords = _memory_extract_keywords(user_text)
-    return _sqlite_recall_memories(session_key, workspace_root, keywords, limit)
+    return _prepend_latest_rollup(session_key, workspace_root, _sqlite_recall_memories(session_key, workspace_root, keywords, limit), limit)
 
 
 def _memory_block(memories: list[Json]) -> str:
@@ -369,7 +668,8 @@ def _memory_block(memories: list[Json]) -> str:
         return ""
     parts = ["[Gateway recalled memory]", "[Conversation Memories]"]
     for mem in memories:
-        parts.append(f"- {mem.get('summary', '')}")
+        summary = " ".join(str(mem.get('summary', '')).split())
+        parts.append(f"- {summary}")
     return "\n".join(parts) + "\n\n"
 
 
@@ -405,7 +705,23 @@ def _inject_recalled_memories(path: str, body: Json) -> Json:
         memory_text = memory_text[:max_chars] + "..."
     body = __import__("copy").deepcopy(body)
     messages = body.get("messages") or []
-    if "/messages" in path:
+    if "/responses" in path:
+        raw_input = body.get("input")
+        if isinstance(raw_input, str):
+            body["input"] = [
+                {"role": "system", "content": memory_text},
+                {"role": "user", "content": raw_input},
+            ]
+        elif isinstance(raw_input, list):
+            input_items = list(raw_input)
+            if input_items and isinstance(input_items[0], dict) and input_items[0].get("role") == "system":
+                input_items[0]["content"] = memory_text + str(input_items[0].get("content") or "")
+            else:
+                input_items.insert(0, {"role": "system", "content": memory_text})
+            body["input"] = input_items
+        else:
+            body["input"] = [{"role": "system", "content": memory_text}]
+    elif "/messages" in path:
         if messages and isinstance(messages[0], dict):
             if messages[0].get("role") == "user":
                 content = messages[0].get("content")
@@ -427,35 +743,82 @@ def _inject_recalled_memories(path: str, body: Json) -> Json:
     return body
 
 
-def _sqlite_tail_memories(limit: int = 50, workspace_root: str | None = None) -> list[Json]:
+def _sqlite_tail_memories(
+    limit: int = 50,
+    workspace_root: str | None = None,
+    *,
+    tenant_key: str | None = None,
+    tenant_contains: str | None = None,
+    workspace_contains: str | None = None,
+    session_contains: str | None = None,
+    kind: str | None = None,
+    has_rollup: bool | None = None,
+) -> list[Json]:
     from .gateway_logging import _sqlite_init, _sqlite_connect
+    try:
+        limit = max(1, min(int(limit or 50), 500))
+    except (TypeError, ValueError):
+        limit = 50
+    tenant_exact = str(tenant_key or "").strip()
+    tenant_filter = str(tenant_contains or "").strip().lower()
+    workspace_filter = str(workspace_contains or "").strip().lower()
+    session_filter = str(session_contains or "").strip().lower()
+    kind_filter = str(kind or "").strip()
     _sqlite_init()
     conn = _sqlite_connect()
     try:
+        _sqlite_backfill_memory_index_fields(conn)
+        where: list[str] = []
+        params: list[Any] = []
         if workspace_root:
-            workspace_keys = _memory_workspace_lookup_keys(workspace_root)
-            placeholders = ",".join("?" for _ in workspace_keys)
-            rows = conn.execute(
-                f"SELECT id, ts, session_key, workspace_root, kind, summary, keywords_json, source_request_id, importance, last_used_at FROM conversation_memories WHERE workspace_root IN ({placeholders}) ORDER BY id DESC LIMIT ?",
-                (*workspace_keys, limit),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT id, ts, session_key, workspace_root, kind, summary, keywords_json, source_request_id, importance, last_used_at FROM conversation_memories ORDER BY id DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            where.append("workspace_key = ?")
+            params.append(workspace_root)
+        if tenant_exact:
+            where.append("tenant_key = ?")
+            params.append(tenant_exact)
+        if tenant_filter:
+            where.append("LOWER(tenant_key) LIKE ?")
+            params.append(f"%{tenant_filter}%")
+        if workspace_filter:
+            where.append("LOWER(workspace_key) LIKE ?")
+            params.append(f"%{workspace_filter}%")
+        if session_filter:
+            where.append("(LOWER(session_key) LIKE ? OR LOWER(memory_session_key) LIKE ?)")
+            params.extend([f"%{session_filter}%", f"%{session_filter}%"])
+        if kind_filter:
+            where.append("kind = ?")
+            params.append(kind_filter)
+        if has_rollup is True:
+            where.append("kind = 'session_rollup'")
+        elif has_rollup is False:
+            where.append("kind != 'session_rollup'")
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        rows = conn.execute(
+            f"""
+            SELECT id, ts, session_key, workspace_root, tenant_key, workspace_key, memory_session_key,
+                   kind, summary, keywords_json, source_request_id, importance, last_used_at
+            FROM conversation_memories
+            {where_sql}
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (*params, limit),
+        ).fetchall()
         return [
             {
                 "id": row[0],
                 "ts": row[1],
                 "session_key": row[2],
                 "workspace_root": row[3],
-                "kind": row[4],
-                "summary": row[5],
-                "keywords": json.loads(row[6]),
-                "source_request_id": row[7],
-                "importance": row[8],
-                "last_used_at": row[9],
+                "tenant_key": row[4],
+                "workspace_key": row[5],
+                "memory_session_key": row[6],
+                "kind": row[7],
+                "summary": row[8],
+                "keywords": json.loads(row[9]),
+                "source_request_id": row[10],
+                "importance": row[11],
+                "last_used_at": row[12],
             }
             for row in rows
         ]
@@ -548,12 +911,40 @@ def _compact_messages_with_summary(messages: list[Json], *, keep_recent: int, te
     if len(messages) <= keep_recent:
         return messages
     old_messages = messages[:-keep_recent]
-    recent_messages = messages[-keep_recent:]
+    recent_messages = []
+    for msg in messages[-keep_recent:]:
+        if isinstance(msg, dict):
+            updated = dict(msg)
+            if "content" in updated:
+                updated["content"] = _trim_content_for_context(updated.get("content"), text_limit)
+            if "input" in updated:
+                updated["input"] = _trim_content_for_context(updated.get("input"), text_limit)
+            recent_messages.append(updated)
+        else:
+            recent_messages.append(msg)
     summary = _summarize_via_llm(old_messages)
     if summary:
         compacted = [{"role": "system", "content": f"[Previous conversation summary]\n{summary}"}]
     else:
-        compacted = [{"role": "system", "content": "[Previous conversation compacted - context was too long]"}]
+        # Best-effort extractive fallback: keep a bounded role-labelled digest
+        # instead of dropping old turns entirely.  This is the non-LLM path that
+        # makes "infinite context" degrade into a rolling summary rather than a
+        # hard amnesia boundary when the summary upstream is unavailable.
+        from .gateway_protocol import _text_from_content
+        parts: list[str] = []
+        for msg in old_messages[-20:]:
+            if not isinstance(msg, dict):
+                continue
+            text = _text_from_content(msg.get("content"))
+            if not text:
+                continue
+            role = str(msg.get("role") or "unknown")
+            parts.append(f"{role}: {_trim_text_for_context(text, max(200, text_limit // 4))}")
+        digest = "\n".join(parts)
+        compacted = [{
+            "role": "system",
+            "content": "[Previous conversation compacted - summary unavailable]\n" + _trim_text_for_context(digest, text_limit),
+        }]
     compacted.extend(recent_messages)
     return compacted
 
@@ -571,16 +962,28 @@ def _trim_content_for_context(content: Any, limit: int) -> Any:
         result = []
         for item in content:
             if isinstance(item, dict):
-                if item.get("type") == "text":
-                    text = item.get("text", "")
+                updated = dict(item)
+                if updated.get("type") == "text":
+                    text = updated.get("text", "")
                     if len(text) > limit:
-                        item = {**item, "text": _trim_text_for_context(text, limit)}
-                result.append(item)
+                        updated["text"] = _trim_text_for_context(text, limit)
+                if "content" in updated:
+                    updated["content"] = _trim_content_for_context(updated.get("content"), limit)
+                result.append(updated)
             elif isinstance(item, str):
                 result.append(_trim_text_for_context(item, limit))
             else:
                 result.append(item)
         return result
+    if isinstance(content, dict):
+        updated = dict(content)
+        if updated.get("type") == "text":
+            text = updated.get("text", "")
+            if len(text) > limit:
+                updated["text"] = _trim_text_for_context(text, limit)
+        if "content" in updated:
+            updated["content"] = _trim_content_for_context(updated.get("content"), limit)
+        return updated
     return content
 
 
@@ -629,21 +1032,56 @@ def _compact_request_for_upstream(path: str, body: Json, cfg: Json, *, reason: s
     keep_recent = int(cfg.get("keep_recent_messages") or 12)
     summary_limit = int(cfg.get("summary_max_chars") or 6000)
     if path in {"/v1/chat/completions", "/v1/messages"}:
-        updated["messages"] = _compact_messages(updated.get("messages"), keep_recent=keep_recent, text_limit=summary_limit)
-        if path == "/v1/messages":
-            updated["system"] = _gateway_system_prompt(reason)
+        messages = updated.get("messages")
+        if isinstance(messages, list) and len(messages) > keep_recent:
+            compacted_messages = _compact_messages_with_summary(
+                messages,
+                keep_recent=keep_recent,
+                text_limit=summary_limit,
+            )
         else:
-            messages = updated.get("messages") or []
-            messages = [m for m in messages if not (isinstance(m, dict) and m.get("role") == "system")]
-            messages.insert(0, {"role": "system", "content": _gateway_system_prompt(reason)})
-            updated["messages"] = messages
+            compacted_messages = _compact_messages(messages, keep_recent=keep_recent, text_limit=summary_limit)
+        if not isinstance(compacted_messages, list):
+            compacted_messages = []
+        summary_text = ""
+        if (
+            compacted_messages
+            and isinstance(compacted_messages[0], dict)
+            and compacted_messages[0].get("role") == "system"
+        ):
+            summary_text = str(compacted_messages[0].get("content") or "")
+            compacted_messages = compacted_messages[1:]
+        if path == "/v1/messages":
+            from .gateway_protocol import _text_from_content
+            existing_system_raw = updated.get("system")
+            if isinstance(existing_system_raw, str):
+                existing_system = existing_system_raw
+            else:
+                existing_system = _text_from_content(existing_system_raw)
+            existing_system = _trim_text_for_context(str(existing_system or ""), summary_limit)
+            if summary_text:
+                existing_system = (existing_system + "\n\n" + summary_text).strip() if existing_system else summary_text
+            updated["messages"] = compacted_messages
+            updated["system"] = (_gateway_system_prompt(reason) + "\n\n" + existing_system).strip()
+        else:
+            system_text = _gateway_system_prompt(reason)
+            if summary_text:
+                system_text += "\n\n" + summary_text
+            compacted_messages.insert(0, {"role": "system", "content": system_text})
+            updated["messages"] = compacted_messages
     else:
-        from .gateway_protocol import _text_from_content
         existing = updated.get("input")
         if isinstance(existing, str):
             updated["input"] = _trim_text_for_context(existing, summary_limit)
         elif isinstance(existing, list):
-            updated["input"] = _trim_content_for_context(existing, summary_limit)
+            if len(existing) > keep_recent:
+                updated["input"] = _compact_messages_with_summary(
+                    existing,
+                    keep_recent=keep_recent,
+                    text_limit=summary_limit,
+                )
+            else:
+                updated["input"] = _trim_content_for_context(existing, summary_limit)
         updated["instructions"] = _gateway_system_prompt(reason)
     updated.setdefault("gateway_context", {})
     updated["gateway_context"].update({
@@ -929,20 +1367,18 @@ def _smart_memory_search(session_key: str, workspace_root: str, query: str, limi
     _sqlite_init()
     conn = _sqlite_connect()
     try:
-        # Get all memories for this session. Include legacy hashed workspace
-        # keys so pre-upgrade compact memories remain available without
-        # widening recall across projects.
-        workspace_keys = _memory_workspace_lookup_keys(workspace_root)
-        placeholders = ",".join("?" for _ in workspace_keys)
+        # Get all memories for this explicit remote tenant/workspace/session scope.
+        _sqlite_backfill_memory_index_fields(conn)
+        fields = _memory_index_fields(session_key, workspace_root)
         rows = conn.execute(
-            f"""
+            """
             SELECT id, ts, kind, summary, keywords_json, importance, last_used_at
             FROM conversation_memories
-            WHERE session_key = ? AND workspace_root IN ({placeholders})
+            WHERE tenant_key = ? AND workspace_key = ? AND memory_session_key = ?
             ORDER BY ts DESC
             LIMIT 100
             """,
-            (session_key, *workspace_keys),
+            (fields["tenant_key"], fields["workspace_key"], fields["memory_session_key"]),
         ).fetchall()
 
         if not rows:

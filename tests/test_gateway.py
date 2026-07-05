@@ -3,13 +3,16 @@ import base64
 import json
 import os
 import pathlib
+import socket
 import sys
 import tempfile
 import threading
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
 
 import src.toolcall_gateway as gateway
 from src.toolcall_gateway import (
@@ -70,6 +73,225 @@ class NativeGatewayTests(unittest.TestCase):
             ]
         }
         self.assertTrue(_native_tool_signal("/v1/chat/completions", response))
+
+    def test_extracts_legacy_chat_function_call_and_appends_function_result(self):
+        response = {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "function_call": {
+                        "name": "calculator",
+                        "arguments": "{\"expression\":\"6*7\"}",
+                    },
+                },
+                "finish_reason": "function_call",
+            }]
+        }
+
+        self.assertTrue(_native_tool_signal("/v1/chat/completions", response))
+        calls = _extract_tool_calls("/v1/chat/completions", response)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "calculator")
+        self.assertEqual(calls[0].arguments, {"expression": "6*7"})
+
+        tool_result = _execute_tool_call(calls[0])
+        self.assertTrue(tool_result.success)
+        updated = _append_tool_results(
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "calc"}]},
+            response,
+            [tool_result],
+        )
+        self.assertEqual(updated["messages"][-2]["function_call"]["name"], "calculator")
+        self.assertEqual(updated["messages"][-1]["role"], "function")
+        self.assertEqual(updated["messages"][-1]["name"], "calculator")
+        self.assertEqual(updated["messages"][-1]["content"], "42")
+
+    def test_legacy_chat_function_result_becomes_planner_evidence(self):
+        from src.gateway_agent_planner import extract_tool_evidence
+
+        response = {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "function_call": {
+                        "name": "calculator",
+                        "arguments": "{\"expression\":\"6*7\"}",
+                    },
+                },
+                "finish_reason": "function_call",
+            }]
+        }
+        calls = _extract_tool_calls("/v1/chat/completions", response)
+        tool_result = _execute_tool_call(calls[0])
+        updated = _append_tool_results(
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "calc"}]},
+            response,
+            [tool_result],
+        )
+
+        evidence = extract_tool_evidence("/v1/chat/completions", updated)
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0].call_id, "legacy_function_call_calculator")
+        self.assertEqual(evidence[0].name, "calculator")
+        self.assertIn('"expression": "6*7"', evidence[0].content)
+        self.assertTrue(evidence[0].content.endswith("42"))
+
+
+    def test_failed_chat_tool_result_marks_planner_evidence_error(self):
+        from src.gateway_agent_planner import extract_tool_evidence
+
+        response = {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_fail",
+                        "type": "function",
+                        "function": {"name": "danger_tool", "arguments": "{}"},
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }]
+        }
+        updated = _append_tool_results(
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "run danger"}]},
+            response,
+            [gateway.ToolResult(
+                call_id="call_fail",
+                name="danger_tool",
+                content="permission denied",
+                success=False,
+                failure_type="permission_denied",
+            )],
+        )
+
+        self.assertIn("[gateway_tool_result_error]", updated["messages"][-1]["content"])
+        evidence = extract_tool_evidence("/v1/chat/completions", updated)
+        self.assertTrue(evidence[-1].is_error)
+        self.assertEqual(evidence[-1].content, "permission denied")
+
+    def test_failed_chat_tool_result_marker_is_not_forwarded_to_final_synthesis(self):
+        from src.gateway_agent_planner import prepare_upstream_body
+
+        response = {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_fail",
+                        "type": "function",
+                        "function": {"name": "danger_tool", "arguments": "{}"},
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }]
+        }
+        updated = _append_tool_results(
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "run danger"}]},
+            response,
+            [gateway.ToolResult(
+                call_id="call_fail",
+                name="danger_tool",
+                content="permission denied",
+                success=False,
+                failure_type="permission_denied",
+            )],
+        )
+
+        prepared = prepare_upstream_body("/v1/chat/completions", updated)
+        tool_messages = [msg for msg in prepared["messages"] if isinstance(msg, dict) and msg.get("role") == "tool"]
+        self.assertEqual(tool_messages[-1]["content"], "permission denied")
+        self.assertNotIn("[gateway_tool_result_error]", json.dumps(prepared, ensure_ascii=False))
+
+    def test_failed_responses_tool_output_marks_planner_evidence_error(self):
+        from src.gateway_agent_planner import extract_tool_evidence
+
+        response = {
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_fail_resp",
+                "name": "danger_tool",
+                "arguments": "{}",
+            }]
+        }
+        updated = _append_tool_results(
+            "/v1/responses",
+            {"input": "run danger"},
+            response,
+            [gateway.ToolResult(
+                call_id="call_fail_resp",
+                name="danger_tool",
+                content="permission denied",
+                success=False,
+                failure_type="permission_denied",
+            )],
+        )
+
+        self.assertIn("[gateway_tool_result_error]", updated["input"][-1]["output"])
+        evidence = extract_tool_evidence("/v1/responses", updated)
+        self.assertTrue(evidence[-1].is_error)
+        self.assertEqual(evidence[-1].content, "permission denied")
+
+    def test_responses_function_call_output_becomes_planner_evidence_with_name_and_args(self):
+        from src.gateway_agent_planner import extract_tool_evidence
+
+        updated = _append_tool_results(
+            "/v1/responses",
+            {"input": "calc"},
+            {"output": [{
+                "type": "function_call",
+                "call_id": "call_calc",
+                "name": "calculator",
+                "arguments": "{\"expression\":\"6*7\"}",
+            }]},
+            [gateway.ToolResult(
+                call_id="call_calc",
+                name="calculator",
+                content="42",
+                success=True,
+            )],
+        )
+
+        evidence = extract_tool_evidence("/v1/responses", updated)
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0].call_id, "call_calc")
+        self.assertEqual(evidence[0].name, "calculator")
+        self.assertIn('"expression": "6*7"', evidence[0].content)
+        self.assertTrue(evidence[0].content.endswith("42"))
+
+    def test_responses_custom_tool_output_becomes_planner_evidence_with_string_input(self):
+        from src.gateway_agent_planner import extract_tool_evidence
+
+        updated = _append_tool_results(
+            "/v1/responses",
+            {"input": "calc"},
+            {"output": [{
+                "type": "custom_tool_call",
+                "call_id": "call_custom",
+                "name": "calculator",
+                "input": "40+2",
+            }]},
+            [gateway.ToolResult(
+                call_id="call_custom",
+                name="calculator",
+                content="42",
+                success=True,
+            )],
+        )
+
+        evidence = extract_tool_evidence("/v1/responses", updated)
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0].call_id, "call_custom")
+        self.assertEqual(evidence[0].name, "calculator")
+        self.assertIn('"input": "40+2"', evidence[0].content)
+        self.assertTrue(evidence[0].content.endswith("42"))
+
 
     def test_detects_responses_function_call(self):
         response = {"output": [{"type": "function_call", "name": "calculator", "arguments": "{}"}]}
@@ -167,6 +389,31 @@ class NativeGatewayTests(unittest.TestCase):
         )
         self.assertTrue(result.success)
         self.assertEqual(result.content, "4")
+
+    def test_declared_gateway_builtin_name_is_downstream_owned(self):
+        from src.gateway_tool_runtime import _tool_call_requires_downstream_execution
+
+        body = {
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "calculator",
+                    "description": "Client-side calculator function",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"expression": {"type": "string"}},
+                        "required": ["expression"],
+                    },
+                },
+            }],
+        }
+
+        self.assertTrue(
+            _tool_call_requires_downstream_execution(
+                ToolCall("call_client_calc", "calculator", {"expression": "6*7"}, {}),
+                body,
+            )
+        )
 
     def test_read_glob_grep_tools_respect_workspace_root(self):
         with tempfile.TemporaryDirectory() as td:
@@ -475,14 +722,14 @@ class NativeGatewayTests(unittest.TestCase):
     def test_public_runtime_templates_keep_safe_defaults(self):
         repo_root = pathlib.Path(__file__).resolve().parents[1]
         template = json.loads((repo_root / "gateway.config.json").read_text(encoding="utf-8"))
-        self.assertEqual(template["gateway"]["workspace_root"], "./workspace")
+        self.assertNotIn("workspace_root", template["gateway"])
         self.assertFalse(template["gateway"]["allow_write_tools"])
         self.assertFalse(template["gateway"]["allow_shell_tools"])
         self.assertEqual(template["gateway"].get("max_request_body_bytes"), 64 * 1024 * 1024)
         self.assertEqual(template["gateway"].get("max_log_payload_chars"), 200000)
 
         yaml_text = (repo_root / "gateway.config.yaml").read_text(encoding="utf-8")
-        self.assertIn("workspace_root: ./workspace", yaml_text)
+        self.assertIn("# workspace_root: /absolute/client/workspace", yaml_text)
         self.assertIn("allow_write_tools: false", yaml_text)
         self.assertIn("allow_shell_tools: false", yaml_text)
         self.assertIn("max_request_body_bytes: 67108864", yaml_text)
@@ -501,6 +748,27 @@ class NativeGatewayTests(unittest.TestCase):
         self.assertIn("GATEWAY_MAX_LOG_PAYLOAD_CHARS=${GATEWAY_MAX_LOG_PAYLOAD_CHARS:-200000}", prod_compose)
         self.assertIn("GATEWAY_ADMIN_PASSWORD=${GATEWAY_ADMIN_PASSWORD:-}", compose)
         self.assertIn("GATEWAY_ADMIN_PASSWORD=${GATEWAY_ADMIN_PASSWORD:?set GATEWAY_ADMIN_PASSWORD}", prod_compose)
+
+    def test_failed_responses_tool_output_marker_is_not_forwarded_to_final_synthesis(self):
+        from src.gateway_agent_planner import prepare_upstream_body
+
+        updated = _append_tool_results(
+            "/v1/responses",
+            {"input": "run danger"},
+            {"output": [{"type": "function_call", "call_id": "call_fail", "name": "danger_tool", "arguments": "{}"}]},
+            [gateway.ToolResult(
+                call_id="call_fail",
+                name="danger_tool",
+                content="permission denied",
+                success=False,
+                failure_type="permission_denied",
+            )],
+        )
+
+        prepared = prepare_upstream_body("/v1/responses", updated)
+        outputs = [item for item in prepared["input"] if isinstance(item, dict) and item.get("type") == "function_call_output"]
+        self.assertEqual(outputs[-1]["output"], "permission denied")
+        self.assertNotIn("[gateway_tool_result_error]", json.dumps(prepared, ensure_ascii=False))
 
     def test_upstream_protocol_env_supports_current_and_legacy_names(self):
         old_current = os.environ.get("GATEWAY_UPSTREAM_PROTOCOL")
@@ -538,6 +806,186 @@ class NativeGatewayTests(unittest.TestCase):
         self.assertEqual(result["content"], "42")
         self.assertEqual(result["openai_chat"]["tool_call_id"], "call_tool_alias")
 
+    def test_responses_tool_response_sets_chat_finish_reason_tool_calls(self):
+        from src.gateway_protocol import _from_responses_response_to_openai
+
+        converted = _from_responses_response_to_openai({
+            "id": "resp_tool",
+            "output": [{
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "calculator",
+                "arguments": "{\"expression\":\"6*7\"}",
+            }],
+        })
+
+        self.assertEqual(converted["choices"][0]["finish_reason"], "tool_calls")
+        self.assertEqual(converted["choices"][0]["message"]["tool_calls"][0]["id"], "call_1")
+
+    def test_responses_custom_tool_response_converts_to_chat_tool_call(self):
+        from src.gateway_protocol import _from_responses_response_to_openai
+
+        converted = _from_responses_response_to_openai({
+            "id": "resp_custom",
+            "output": [{
+                "type": "custom_tool_call",
+                "call_id": "call_custom_1",
+                "name": "calculator",
+                "input": "40+2",
+            }],
+        })
+
+        tool_call = converted["choices"][0]["message"]["tool_calls"][0]
+        self.assertEqual(tool_call["id"], "call_custom_1")
+        self.assertEqual(tool_call["function"]["name"], "calculator")
+        self.assertEqual(json.loads(tool_call["function"]["arguments"]), {"input": "40+2"})
+
+    def test_response_has_tool_calls_detects_responses_custom_tool_call(self):
+        from src.gateway_tool_runtime import _response_has_tool_calls
+
+        self.assertTrue(_response_has_tool_calls("/v1/responses", {
+            "output": [{
+                "type": "custom_tool_call",
+                "call_id": "call_custom_1",
+                "name": "calculator",
+                "input": "40+2",
+            }],
+        }))
+
+    def test_responses_custom_tool_history_converts_to_chat_messages(self):
+        from src.gateway_protocol import _convert_request_to_upstream
+
+        _, converted = _convert_request_to_upstream(
+            "/v1/responses",
+            {
+                "model": "m",
+                "input": [
+                    {
+                        "type": "custom_tool_call",
+                        "call_id": "call_custom_1",
+                        "name": "calculator",
+                        "input": "40+2",
+                    },
+                    {
+                        "type": "custom_tool_call_output",
+                        "call_id": "call_custom_1",
+                        "name": "calculator",
+                        "output": "42",
+                    },
+                ],
+            },
+            "openai_chat",
+        )
+
+        self.assertEqual(converted["messages"][0]["role"], "assistant")
+        self.assertEqual(converted["messages"][0]["tool_calls"][0]["id"], "call_custom_1")
+        self.assertEqual(converted["messages"][0]["tool_calls"][0]["function"]["name"], "calculator")
+        self.assertEqual(
+            json.loads(converted["messages"][0]["tool_calls"][0]["function"]["arguments"]),
+            {"input": "40+2"},
+        )
+        self.assertEqual(converted["messages"][1], {
+            "role": "tool",
+            "tool_call_id": "call_custom_1",
+            "content": "42",
+        })
+
+    def test_responses_codex_builtin_tool_history_converts_to_chat_messages(self):
+        from src.gateway_protocol import _convert_request_to_upstream
+
+        _, converted = _convert_request_to_upstream(
+            "/v1/responses",
+            {
+                "model": "m",
+                "input": [
+                    {
+                        "type": "local_shell_call",
+                        "call_id": "call_shell_1",
+                        "action": {"command": "pwd"},
+                    },
+                    {
+                        "type": "local_shell_call_output",
+                        "call_id": "call_shell_1",
+                        "output": "/workspace/project",
+                    },
+                    {
+                        "type": "tool_search_call",
+                        "id": "call_search_1",
+                        "action": {"query": "pytest failures"},
+                    },
+                    {
+                        "type": "tool_search_output",
+                        "id": "call_search_1",
+                        "content": "no failures",
+                    },
+                ],
+            },
+            "openai_chat",
+        )
+
+        self.assertEqual(converted["messages"][0]["role"], "assistant")
+        shell_call = converted["messages"][0]["tool_calls"][0]
+        self.assertEqual(shell_call["id"], "call_shell_1")
+        self.assertEqual(shell_call["function"]["name"], "local_shell")
+        self.assertEqual(json.loads(shell_call["function"]["arguments"]), {"command": "pwd"})
+        self.assertEqual(converted["messages"][1], {
+            "role": "tool",
+            "tool_call_id": "call_shell_1",
+            "content": "/workspace/project",
+        })
+        search_call = converted["messages"][2]["tool_calls"][0]
+        self.assertEqual(search_call["id"], "call_search_1")
+        self.assertEqual(search_call["function"]["name"], "tool_search")
+        self.assertEqual(json.loads(search_call["function"]["arguments"]), {"query": "pytest failures"})
+        self.assertEqual(converted["messages"][3], {
+            "role": "tool",
+            "tool_call_id": "call_search_1",
+            "content": "no failures",
+        })
+
+    def test_responses_codex_builtin_tool_response_converts_to_chat_tool_call(self):
+        from src.gateway_protocol import _from_responses_response_to_openai
+
+        converted = _from_responses_response_to_openai({
+            "id": "resp_shell",
+            "output": [{
+                "type": "local_shell_call",
+                "call_id": "call_shell_1",
+                "action": {"command": "pwd"},
+            }],
+        })
+
+        self.assertEqual(converted["choices"][0]["finish_reason"], "tool_calls")
+        tool_call = converted["choices"][0]["message"]["tool_calls"][0]
+        self.assertEqual(tool_call["id"], "call_shell_1")
+        self.assertEqual(tool_call["function"]["name"], "local_shell")
+        self.assertEqual(json.loads(tool_call["function"]["arguments"]), {"command": "pwd"})
+
+    def test_responses_codex_builtin_tool_output_becomes_planner_evidence(self):
+        from src.gateway_agent_planner import extract_tool_evidence
+
+        body = {
+            "input": [
+                {
+                    "type": "local_shell_call",
+                    "call_id": "call_shell_1",
+                    "action": {"command": "pwd"},
+                },
+                {
+                    "type": "local_shell_call_output",
+                    "call_id": "call_shell_1",
+                    "output": "/workspace/project",
+                },
+            ]
+        }
+
+        evidence = extract_tool_evidence("/v1/responses", body)
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0].call_id, "call_shell_1")
+        self.assertEqual(evidence[0].name, "local_shell")
+        self.assertIn('"command": "pwd"', evidence[0].content)
+        self.assertTrue(evidence[0].content.endswith("/workspace/project"))
+
     def test_gateway_internal_workspace_fields_are_not_forwarded_upstream(self):
         from src.gateway_protocol import _convert_request_to_upstream
 
@@ -545,14 +993,25 @@ class NativeGatewayTests(unittest.TestCase):
             "model": "m",
             "workspace_root": "/tmp/secret-project",
             "gateway_workspace": "/tmp/secret-project",
+            "workspace": "/tmp/secret-project",
+            "workspace_dir": "/tmp/secret-project",
             "projectDir": "/tmp/secret-project",
             "cwd": "/tmp/secret-project",
+            "gateway_context": {"agent_planner": {"session_key": "secret-session"}},
+            "gateway_agent_planner": {"evidence_injected": True},
             "metadata": {
                 "session_id": "s1",
                 "workspace_root": "/tmp/secret-project",
                 "gateway_workspace": "/tmp/secret-project",
+                "workspace": "/tmp/secret-project",
+                "workspace_dir": "/tmp/secret-project",
                 "projectDir": "/tmp/secret-project",
-                "user_id": json.dumps({"session_id": "s1", "cwd": "/tmp/secret-project"}),
+                "user_id": json.dumps({
+                    "session_id": "s1",
+                    "cwd": "/tmp/secret-project",
+                    "workspace": "/tmp/secret-project",
+                    "workspace_dir": "/tmp/secret-project",
+                }),
             },
             "messages": [{"role": "user", "content": "hello"}],
         }
@@ -563,6 +1022,10 @@ class NativeGatewayTests(unittest.TestCase):
         self.assertNotIn("/tmp/secret-project", serialized)
         self.assertNotIn("workspace_root", converted)
         self.assertNotIn("gateway_workspace", converted)
+        self.assertNotIn("workspace", converted)
+        self.assertNotIn("workspace_dir", converted)
+        self.assertNotIn("gateway_context", converted)
+        self.assertNotIn("gateway_agent_planner", converted)
         self.assertEqual(converted["metadata"]["session_id"], "s1")
         self.assertEqual(json.loads(converted["metadata"]["user_id"]), {"session_id": "s1"})
 
@@ -570,7 +1033,12 @@ class NativeGatewayTests(unittest.TestCase):
             "/v1/chat/completions",
             {
                 "model": "m",
-                "metadata": json.dumps({"session_id": "s2", "workspace_root": "/tmp/secret-project"}),
+                "metadata": json.dumps({
+                    "session_id": "s2",
+                    "workspace_root": "/tmp/secret-project",
+                    "workspace": "/tmp/secret-project",
+                    "workspace_dir": "/tmp/secret-project",
+                }),
                 "messages": [{"role": "user", "content": "hello"}],
             },
             "openai_chat",
@@ -638,7 +1106,20 @@ class NativeGatewayTests(unittest.TestCase):
                         "stream": True,
                         "workspace_root": "/tmp/secret-project",
                         "gateway_workspace": "/tmp/secret-project",
-                        "metadata": {"session_id": "s1", "workspace_root": "/tmp/secret-project", "user_id": json.dumps({"session_id": "s1", "cwd": "/tmp/secret-project"})},
+                        "workspace": "/tmp/secret-project",
+                        "workspace_dir": "/tmp/secret-project",
+                        "metadata": {
+                            "session_id": "s1",
+                            "workspace_root": "/tmp/secret-project",
+                            "workspace": "/tmp/secret-project",
+                            "workspace_dir": "/tmp/secret-project",
+                            "user_id": json.dumps({
+                                "session_id": "s1",
+                                "cwd": "/tmp/secret-project",
+                                "workspace": "/tmp/secret-project",
+                                "workspace_dir": "/tmp/secret-project",
+                            }),
+                        },
                         "messages": [{"role": "user", "content": "hi"}],
                     },
                 )
@@ -660,6 +1141,7 @@ class NativeGatewayTests(unittest.TestCase):
             try:
                 cfg = gateway._default_config()
                 cfg["gateway"]["workspace_root"] = td
+                cfg["gateway"]["execute_user_side_tools_in_gateway"] = True
                 gateway.save_config(cfg)
                 pathlib.Path(other, "app.py").write_text("print('other')\n", encoding="utf-8")
                 result = execute_direct_tool_call(
@@ -667,6 +1149,376 @@ class NativeGatewayTests(unittest.TestCase):
                 )
                 self.assertTrue(result["success"])
                 self.assertIn("other", result["content"])
+            finally:
+                gateway.CONFIG_PATH = old_config
+
+    def test_direct_user_side_tool_call_requires_downstream_client_by_default(self):
+        from src.gateway_errors import BadRequestError
+
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as other:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = td
+                cfg["gateway"]["execute_user_side_tools_in_gateway"] = False
+                gateway.save_config(cfg)
+                pathlib.Path(other, "secret.txt").write_text("gateway-service-secret\n", encoding="utf-8")
+                pathlib.Path(other, "secret.json").write_text('{"secret":"gateway-service-secret"}', encoding="utf-8")
+
+                cases = [
+                    ("Read", {"file_path": "secret.txt"}),
+                    ("Bash", {"command": "cat secret.txt"}),
+                    ("computer_use", {}),
+                    ("click", {"x": 1, "y": 1}),
+                    ("Agent", {"prompt": "read secret.txt"}),
+                    ("Skill", {"name": "read_skill"}),
+                    ("JsonQuery", {"file_path": "secret.json", "query": "secret"}),
+                ]
+                for tool_name, arguments in cases:
+                    with self.subTest(tool_name=tool_name):
+                        with self.assertRaises(BadRequestError) as raised:
+                            execute_direct_tool_call(
+                                {
+                                    "workspace_root": other,
+                                    "tool": tool_name,
+                                    "arguments": arguments,
+                                    "call_id": f"direct_{tool_name}_blocked",
+                                }
+                            )
+
+                        self.assertEqual(
+                            raised.exception.detail["failure_type"],
+                            "direct_user_side_tool_requires_downstream_client",
+                        )
+                        self.assertEqual(raised.exception.detail["tool_names"], [tool_name])
+                        self.assertNotIn("gateway-service-secret", str(raised.exception))
+                        self.assertNotIn("gateway-service-secret", json.dumps(raised.exception.detail, ensure_ascii=False))
+
+                data_query = execute_direct_tool_call(
+                    {"tool": "JsonQuery", "arguments": {"data": {"safe": {"answer": 42}}, "query": "safe.answer"}}
+                )
+                self.assertTrue(data_query["success"])
+                self.assertEqual(data_query["content"], "42")
+
+                parallel_cases = [
+                    {
+                        "workspace_root": other,
+                        "tool": "multi_tool_use.parallel",
+                        "arguments": {"tool_uses": [{"recipient_name": "functions.Read", "parameters": {"file_path": "secret.txt"}}]},
+                    },
+                    {
+                        "workspace_root": other,
+                        "tool": "parallel",
+                        "arguments": {"tool_uses": [{"recipient_name": "functions.Agent", "parameters": {"prompt": "read secret.txt"}}]},
+                    },
+                    {
+                        "workspace_root": other,
+                        "tool": "multi_tool_use.parallel",
+                        "arguments": {"tool_uses": [{"recipient_name": "functions.JsonQuery", "parameters": {"file_path": "secret.json", "query": "secret"}}]},
+                    },
+                    {
+                        "workspace_root": other,
+                        "tool_uses": [{"recipient_name": "functions.Bash", "parameters": {"command": "cat secret.txt"}}],
+                    },
+                ]
+                for body in parallel_cases:
+                    with self.subTest(parallel_body=body.get("tool") or "tool_uses"):
+                        with self.assertRaises(BadRequestError) as raised:
+                            execute_direct_tool_call(body)
+                        self.assertEqual(
+                            raised.exception.detail["failure_type"],
+                            "direct_user_side_tool_requires_downstream_client",
+                        )
+                        self.assertNotIn("gateway-service-secret", str(raised.exception))
+                        self.assertNotIn("gateway-service-secret", json.dumps(raised.exception.detail, ensure_ascii=False))
+            finally:
+                gateway.CONFIG_PATH = old_config
+
+    def test_declared_downstream_file_path_does_not_use_gateway_env_without_client_workspace(self):
+        from src.gateway_agent_planner import _adapt_args as planner_adapt_args
+        from src.gateway_tool_runtime import _adapt_arguments_for_declared_tool, _workspace_scope
+
+        with tempfile.TemporaryDirectory() as service_root:
+            body = {
+                "tools": [{
+                    "name": "Read",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                        "required": ["file_path"],
+                        "additionalProperties": False,
+                    },
+                }]
+            }
+            with _workspace_scope(pathlib.Path(service_root), body):
+                runtime_args = _adapt_arguments_for_declared_tool(body, "Read", {"path": "README.md"})
+                planner_args = planner_adapt_args(body, "Read", {"path": "README.md"})
+                runtime_direct_args = _adapt_arguments_for_declared_tool(body, "Read", {"file_path": "README.md"})
+                planner_direct_args = planner_adapt_args(body, "Read", {"file_path": "README.md"})
+
+            self.assertEqual(runtime_args["file_path"], "README.md")
+            self.assertEqual(planner_args["file_path"], "README.md")
+            self.assertEqual(runtime_direct_args["file_path"], "README.md")
+            self.assertEqual(planner_direct_args["file_path"], "README.md")
+            self.assertNotIn(service_root, json.dumps(runtime_args, ensure_ascii=False))
+            self.assertNotIn(service_root, json.dumps(planner_args, ensure_ascii=False))
+            self.assertNotIn(service_root, json.dumps(runtime_direct_args, ensure_ascii=False))
+            self.assertNotIn(service_root, json.dumps(planner_direct_args, ensure_ascii=False))
+
+    def test_declared_downstream_file_path_anchors_to_explicit_client_workspace(self):
+        from src.gateway_agent_planner import _adapt_args as planner_adapt_args
+        from src.gateway_tool_runtime import _adapt_arguments_for_declared_tool, _workspace_scope
+
+        client_root = pathlib.Path("/tmp/client-project-for-gateway-tests")
+        body = {
+            "metadata": {"workspace": str(client_root)},
+            "tools": [{
+                "name": "Read",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                    "additionalProperties": False,
+                },
+            }],
+        }
+        with _workspace_scope(client_root, body):
+            runtime_args = _adapt_arguments_for_declared_tool(body, "Read", {"path": "README.md"})
+            planner_args = planner_adapt_args(body, "Read", {"path": "README.md"})
+            runtime_direct_args = _adapt_arguments_for_declared_tool(body, "Read", {"file_path": "README.md"})
+            planner_direct_args = planner_adapt_args(body, "Read", {"file_path": "README.md"})
+
+        expected = str((client_root / "README.md").resolve(strict=False))
+        self.assertEqual(runtime_args["file_path"], expected)
+        self.assertEqual(planner_args["file_path"], expected)
+        self.assertEqual(runtime_direct_args["file_path"], expected)
+        self.assertEqual(planner_direct_args["file_path"], expected)
+
+    def test_relative_workspace_value_is_not_treated_as_gateway_service_path(self):
+        from src.gateway_agent_planner import _adapt_args as planner_adapt_args
+        from src.gateway_tool_runtime import _adapt_arguments_for_declared_tool, _request_workspace_root, _workspace_scope
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            old_cwd = os.getcwd()
+            service_root = pathlib.Path(td) / "service"
+            service_root.mkdir()
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+            try:
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = str(service_root)
+                gateway.save_config(cfg)
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = str(service_root)
+                os.chdir(service_root)
+                body = {
+                    "workspace": "relative-client-id",
+                    "metadata": {"session_id": "relative-workspace-session", "user_id": "relative-workspace-user"},
+                    "tools": [{
+                        "name": "Read",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"file_path": {"type": "string"}},
+                            "required": ["file_path"],
+                            "additionalProperties": False,
+                        },
+                    }],
+                }
+                root = _request_workspace_root(body)
+                self.assertNotEqual(root, (service_root / "relative-client-id").resolve(strict=False))
+                self.assertNotEqual(root, service_root.resolve(strict=False))
+                self.assertIn("anonymous_spaces", str(root))
+                sibling_body = dict(body)
+                sibling_body["workspace"] = "relative-client-id-2"
+                sibling_root = _request_workspace_root(sibling_body)
+                self.assertNotEqual(root, sibling_root)
+                with _workspace_scope(root, body):
+                    runtime_args = _adapt_arguments_for_declared_tool(body, "Read", {"path": "README.md"})
+                    planner_args = planner_adapt_args(body, "Read", {"path": "README.md"})
+                    runtime_direct_args = _adapt_arguments_for_declared_tool(body, "Read", {"file_path": "README.md"})
+                    planner_direct_args = planner_adapt_args(body, "Read", {"file_path": "README.md"})
+                self.assertEqual(runtime_args["file_path"], "README.md")
+                self.assertEqual(planner_args["file_path"], "README.md")
+                self.assertEqual(runtime_direct_args["file_path"], "README.md")
+                self.assertEqual(planner_direct_args["file_path"], "README.md")
+                self.assertNotIn(str(service_root), json.dumps(runtime_args, ensure_ascii=False))
+                self.assertNotIn(str(service_root), json.dumps(planner_args, ensure_ascii=False))
+                self.assertNotIn(str(service_root), json.dumps(runtime_direct_args, ensure_ascii=False))
+                self.assertNotIn(str(service_root), json.dumps(planner_direct_args, ensure_ascii=False))
+            finally:
+                gateway.CONFIG_PATH = old_config
+                os.chdir(old_cwd)
+                if old_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_root
+
+    def test_parallel_direct_tool_calls_keep_client_workspaces_isolated(self):
+        import concurrent.futures
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                cfg = gateway._default_config()
+                cfg["gateway"]["execute_user_side_tools_in_gateway"] = True
+                gateway.save_config(cfg)
+                workspaces = []
+                for idx in range(4):
+                    root = pathlib.Path(td) / f"client-{idx}"
+                    root.mkdir()
+                    (root / "marker.txt").write_text(f"client-{idx}", encoding="utf-8")
+                    workspaces.append(root)
+
+                def read_marker(root: pathlib.Path) -> str:
+                    result = execute_direct_tool_call(
+                        {"workspace_root": str(root), "tool": "Read", "arguments": {"file_path": "marker.txt"}, "call_id": str(root.name)}
+                    )
+                    self.assertTrue(result["success"])
+                    return result["content"]
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                    results = list(executor.map(read_marker, workspaces))
+
+                for idx, content in enumerate(results):
+                    self.assertIn(f"client-{idx}", content)
+                    for other_idx in range(4):
+                        if other_idx != idx:
+                            self.assertNotIn(f"client-{other_idx}", content)
+            finally:
+                gateway.CONFIG_PATH = old_config
+
+    def test_remote_exec_sessions_are_scoped_by_client_workspace_and_tenant(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                cfg = gateway._default_config()
+                cfg["gateway"]["allow_shell_tools"] = True
+                cfg["gateway"]["execute_user_side_tools_in_gateway"] = True
+                gateway.save_config(cfg)
+                workspace_a = pathlib.Path(td) / "client-a"
+                workspace_b = pathlib.Path(td) / "client-b"
+                workspace_a.mkdir()
+                workspace_b.mkdir()
+                (workspace_a / "marker.txt").write_text("CLIENT-A", encoding="utf-8")
+                (workspace_b / "marker.txt").write_text("CLIENT-B", encoding="utf-8")
+                command = (
+                    "python3 -u -c \"import sys; "
+                    "line=sys.stdin.readline().strip(); "
+                    "print(open('marker.txt').read().strip(), flush=True); "
+                    "print(line, flush=True)\""
+                )
+
+                base = {
+                    "tool": "exec_shell_start",
+                    "arguments": {"session_id": "shared-shell", "command": command},
+                }
+                start_a = execute_direct_tool_call(
+                    {
+                        **base,
+                        "workspace_root": str(workspace_a),
+                        "metadata": {"session_id": "same-session", "user_id": json.dumps({"user_id": "user-a"})},
+                    }
+                )
+                start_b = execute_direct_tool_call(
+                    {
+                        **base,
+                        "workspace_root": str(workspace_b),
+                        "metadata": {"session_id": "same-session", "user_id": json.dumps({"user_id": "user-b"})},
+                    }
+                )
+                self.assertTrue(start_a["success"], start_a)
+                self.assertTrue(start_b["success"], start_b)
+
+                write_a = execute_direct_tool_call(
+                    {
+                        "workspace_root": str(workspace_a),
+                        "metadata": {"session_id": "same-session", "user_id": json.dumps({"user_id": "user-a"})},
+                        "tool": "write_stdin",
+                        "arguments": {"session_id": "shared-shell", "chars": "hello-a\n", "read_timeout": 0.2},
+                    }
+                )
+                write_b = execute_direct_tool_call(
+                    {
+                        "workspace_root": str(workspace_b),
+                        "metadata": {"session_id": "same-session", "user_id": json.dumps({"user_id": "user-b"})},
+                        "tool": "write_stdin",
+                        "arguments": {"session_id": "shared-shell", "chars": "hello-b\n", "read_timeout": 0.2},
+                    }
+                )
+                self.assertTrue(write_a["success"], write_a)
+                self.assertTrue(write_b["success"], write_b)
+                self.assertIn("CLIENT-A", write_a["content"])
+                self.assertIn("hello-a", write_a["content"])
+                self.assertNotIn("CLIENT-B", write_a["content"])
+                self.assertIn("CLIENT-B", write_b["content"])
+                self.assertIn("hello-b", write_b["content"])
+                self.assertNotIn("CLIENT-A", write_b["content"])
+            finally:
+                gateway.CONFIG_PATH = old_config
+
+    def test_remote_team_mailboxes_are_scoped_by_client_workspace_and_tenant(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                gateway.save_config(gateway._default_config())
+                workspace_a = pathlib.Path(td) / "client-a"
+                workspace_b = pathlib.Path(td) / "client-b"
+                workspace_a.mkdir()
+                workspace_b.mkdir()
+                common_args = {"id": "shared-team", "name": "shared-team"}
+                create_a = execute_direct_tool_call(
+                    {
+                        "workspace_root": str(workspace_a),
+                        "metadata": {"session_id": "same-session", "user_id": json.dumps({"user_id": "user-a"})},
+                        "tool": "TeamCreate",
+                        "arguments": common_args,
+                    }
+                )
+                create_b = execute_direct_tool_call(
+                    {
+                        "workspace_root": str(workspace_b),
+                        "metadata": {"session_id": "same-session", "user_id": json.dumps({"user_id": "user-b"})},
+                        "tool": "TeamCreate",
+                        "arguments": common_args,
+                    }
+                )
+                self.assertTrue(create_a["success"], create_a)
+                self.assertTrue(create_b["success"], create_b)
+
+                send_a = execute_direct_tool_call(
+                    {
+                        "workspace_root": str(workspace_a),
+                        "metadata": {"session_id": "same-session", "user_id": json.dumps({"user_id": "user-a"})},
+                        "tool": "SendMessage",
+                        "arguments": {"target": "shared-team", "message": "only-a"},
+                    }
+                )
+                delete_b = execute_direct_tool_call(
+                    {
+                        "workspace_root": str(workspace_b),
+                        "metadata": {"session_id": "same-session", "user_id": json.dumps({"user_id": "user-b"})},
+                        "tool": "TeamDelete",
+                        "arguments": {"id": "shared-team"},
+                    }
+                )
+                delete_a = execute_direct_tool_call(
+                    {
+                        "workspace_root": str(workspace_a),
+                        "metadata": {"session_id": "same-session", "user_id": json.dumps({"user_id": "user-a"})},
+                        "tool": "TeamDelete",
+                        "arguments": {"id": "shared-team"},
+                    }
+                )
+                self.assertTrue(send_a["success"], send_a)
+                self.assertTrue(delete_b["success"], delete_b)
+                self.assertNotIn("only-a", delete_b["content"])
+                self.assertTrue(delete_a["success"], delete_a)
+                self.assertIn("only-a", delete_a["content"])
             finally:
                 gateway.CONFIG_PATH = old_config
 
@@ -747,7 +1599,9 @@ class NativeGatewayTests(unittest.TestCase):
     def test_direct_tool_call_accepts_anthropic_tool_use_shape(self):
         with tempfile.TemporaryDirectory() as td:
             old = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            old_exec = os.environ.get("GATEWAY_EXECUTE_USER_SIDE_TOOLS")
             os.environ["GATEWAY_WORKSPACE_ROOT"] = td
+            os.environ["GATEWAY_EXECUTE_USER_SIDE_TOOLS"] = "1"
             try:
                 with open(os.path.join(td, "note.txt"), "w", encoding="utf-8") as fh:
                     fh.write("hello\n")
@@ -762,6 +1616,10 @@ class NativeGatewayTests(unittest.TestCase):
                     os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
                 else:
                     os.environ["GATEWAY_WORKSPACE_ROOT"] = old
+                if old_exec is None:
+                    os.environ.pop("GATEWAY_EXECUTE_USER_SIDE_TOOLS", None)
+                else:
+                    os.environ["GATEWAY_EXECUTE_USER_SIDE_TOOLS"] = old_exec
 
     def test_code_interpreter_is_real_but_permission_gated(self):
         with tempfile.TemporaryDirectory() as td:
@@ -770,6 +1628,7 @@ class NativeGatewayTests(unittest.TestCase):
             try:
                 cfg = gateway._default_config()
                 cfg["gateway"]["allow_shell_tools"] = False
+                cfg["gateway"]["execute_user_side_tools_in_gateway"] = True
                 gateway.save_config(cfg)
                 result = execute_direct_tool_call({"name": "code_interpreter", "arguments": {"code": "print(40+2)"}})
                 self.assertFalse(result["success"])
@@ -1097,6 +1956,514 @@ class NativeGatewayTests(unittest.TestCase):
             t2.join(timeout=5)
             self.assertEqual(results, {"a": str(project_a.resolve()), "b": str(project_b.resolve())})
 
+    def test_remote_anonymous_workspace_is_not_shared_by_identical_prompts(self):
+        from src.gateway_tool_runtime import _request_workspace_root
+
+        body = {"model": "m", "messages": [{"role": "user", "content": "same prompt from remote user"}]}
+        root_a = _request_workspace_root(body)
+        root_b = _request_workspace_root(body)
+        self.assertNotEqual(root_a, root_b)
+        self.assertIn("anonymous_spaces", str(root_a))
+        self.assertIn("anonymous_spaces", str(root_b))
+
+    def test_remote_anonymous_workspace_is_tenant_session_scoped(self):
+        from src.gateway_tool_runtime import _request_workspace_root
+
+        body_a1 = {"metadata": {"session_id": "shared-session", "user_id": json.dumps({"user_id": "user-a"})}}
+        body_a2 = {"metadata": {"session_id": "shared-session", "user_id": json.dumps({"user_id": "user-a"})}}
+        body_b = {"metadata": {"session_id": "shared-session", "user_id": json.dumps({"user_id": "user-b"})}}
+        root_a1 = _request_workspace_root(body_a1)
+        root_a2 = _request_workspace_root(body_a2)
+        root_b = _request_workspace_root(body_b)
+        self.assertEqual(root_a1, root_a2)
+        self.assertNotEqual(root_a1, root_b)
+
+    def test_remote_identity_without_workspace_does_not_fall_back_to_gateway_env_root(self):
+        from src.gateway_tool_runtime import _request_workspace_root
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            service_root = pathlib.Path(td) / "gateway-service-root"
+            service_root.mkdir()
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = str(service_root)
+            try:
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = str(service_root)
+                gateway.save_config(cfg)
+
+                body = {"metadata": {"session_id": "remote-session", "user_id": json.dumps({"user_id": "remote-user"})}}
+                root_a = _request_workspace_root(body)
+                root_b = _request_workspace_root(body)
+
+                self.assertEqual(root_a, root_b)
+                self.assertNotEqual(root_a, service_root.resolve())
+                self.assertIn("anonymous_spaces", str(root_a))
+                self.assertNotIn(str(service_root), str(root_a))
+            finally:
+                gateway.CONFIG_PATH = old_config
+                if old_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_root
+
+    def test_downstream_client_id_without_workspace_does_not_use_gateway_env_root(self):
+        import src.gateway_agent_planner as planner
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+            old_strict = os.environ.get("GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN")
+            service_root = pathlib.Path(td) / "gateway-service-root"
+            service_root.mkdir()
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = str(service_root)
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+            os.environ["GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN"] = "1"
+            planner._STORE = None
+            try:
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = str(service_root)
+                cfg["gateway"]["agent_planner_strict_every_turn"] = True
+                cfg["upstream"]["tools_enabled"] = "adapter"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                gateway.save_config(cfg)
+
+                client = FakeClient([
+                    {
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }]
+                    }
+                ])
+                final = run_tool_orchestration(
+                    "/v1/chat/completions",
+                    {"model": "m", "messages": [{"role": "user", "content": "hello"}]},
+                    client,
+                    client_id="downstream-key-client",
+                )
+
+                session_key = (final.get("gateway_context") or {}).get("agent_planner", {}).get("session_key", "")
+                self.assertIn("anonymous_spaces", session_key)
+                self.assertNotIn(str(service_root.resolve()), session_key)
+                upstream_body = client.requests[0][1]
+                self.assertNotIn("client_id", upstream_body)
+                self.assertNotIn("downstream-key-client", json.dumps(upstream_body, ensure_ascii=False))
+            finally:
+                planner._STORE = None
+                gateway.CONFIG_PATH = old_config
+                if old_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_root
+                if old_runtime is None:
+                    os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+                else:
+                    os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+                if old_strict is None:
+                    os.environ.pop("GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN", None)
+                else:
+                    os.environ["GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN"] = old_strict
+
+    def test_downstream_client_id_overrides_body_client_id_for_runtime_scope(self):
+        import src.gateway_agent_planner as planner
+        from src.gateway_tool_runtime import _request_scope_body, _request_workspace_root
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+            old_strict = os.environ.get("GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN")
+            service_root = pathlib.Path(td) / "gateway-service-root"
+            service_root.mkdir()
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = str(service_root)
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+            os.environ["GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN"] = "1"
+            planner._STORE = None
+            try:
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = str(service_root)
+                cfg["gateway"]["agent_planner_strict_every_turn"] = True
+                cfg["upstream"]["tools_enabled"] = "adapter"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                gateway.save_config(cfg)
+
+                request_body = {
+                    "model": "m",
+                    "client_id": "spoofed-client",
+                    "metadata": {"session_id": "shared-session"},
+                    "messages": [{"role": "user", "content": "hello"}],
+                }
+                scoped = _request_scope_body(request_body, "authenticated-client")
+                self.assertTrue(scoped["client_id"].startswith("client:"))
+                self.assertNotEqual(scoped["client_id"], "authenticated-client")
+                self.assertNotEqual(scoped["client_id"], "spoofed-client")
+                self.assertEqual(request_body["client_id"], "spoofed-client")
+                authenticated_root = _request_workspace_root(scoped)
+                other_root = _request_workspace_root(
+                    _request_scope_body({"metadata": {"session_id": "shared-session"}}, "other-client")
+                )
+                self.assertNotEqual(authenticated_root, other_root)
+                self.assertNotIn(str(service_root.resolve()), str(authenticated_root))
+
+                client = FakeClient([
+                    {
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }]
+                    }
+                ])
+                final = run_tool_orchestration(
+                    "/v1/chat/completions",
+                    request_body,
+                    client,
+                    client_id="authenticated-client",
+                )
+
+                session_key = (final.get("gateway_context") or {}).get("agent_planner", {}).get("session_key", "")
+                self.assertIn(f"tenant:{scoped['client_id']}", session_key)
+                self.assertNotIn("tenant:spoofed-client", session_key)
+                upstream_body = client.requests[0][1]
+                self.assertNotIn("client_id", upstream_body)
+                self.assertNotIn("spoofed-client", json.dumps(upstream_body, ensure_ascii=False))
+                self.assertNotIn("authenticated-client", json.dumps(upstream_body, ensure_ascii=False))
+            finally:
+                planner._STORE = None
+                gateway.CONFIG_PATH = old_config
+                if old_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_root
+                if old_runtime is None:
+                    os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+                else:
+                    os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+                if old_strict is None:
+                    os.environ.pop("GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN", None)
+                else:
+                    os.environ["GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN"] = old_strict
+
+    def test_streaming_downstream_client_id_without_workspace_does_not_use_gateway_env_root(self):
+        import io
+        from src.gateway_streaming import run_streaming_orchestration
+
+        class Handler:
+            def __init__(self):
+                self.wfile = io.BytesIO()
+                self.headers = {}
+                self.status = None
+                self.sent_headers = []
+
+            def send_response(self, status):
+                self.status = status
+
+            def send_header(self, key, value):
+                self.sent_headers.append((key, value))
+
+            def end_headers(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+            service_root = pathlib.Path(td) / "gateway-service-root"
+            service_root.mkdir()
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = str(service_root)
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+            try:
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = str(service_root)
+                cfg["gateway"]["tool_mode"] = "orchestrate"
+                gateway.save_config(cfg)
+
+                captured = {}
+
+                def fake_scoped(handler, path, body, **kwargs):
+                    from src.gateway_builtin_tools import _workspace_root
+
+                    captured["workspace_root"] = str(_workspace_root())
+                    captured["body_has_client_id"] = "client_id" in body
+
+                with patch("src.gateway_streaming._run_streaming_orchestration_scoped", side_effect=fake_scoped):
+                    run_streaming_orchestration(
+                        Handler(),
+                        "/v1/chat/completions",
+                        {"model": "m", "stream": True, "messages": [{"role": "user", "content": "hello"}]},
+                        client_id="stream-client",
+                    )
+
+                self.assertIn("anonymous_spaces", captured["workspace_root"])
+                self.assertNotIn(str(service_root.resolve()), captured["workspace_root"])
+                self.assertFalse(captured["body_has_client_id"])
+            finally:
+                gateway.CONFIG_PATH = old_config
+                if old_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_root
+                if old_runtime is None:
+                    os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+                else:
+                    os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+
+    def test_gateway_owned_public_helpers_scope_downstream_client_id_without_workspace(self):
+        import src.gateway_agent_planner as planner
+        from src.gateway_agent_planner import list_runtime_events
+        from src.gateway_tool_runtime import execute_direct_tool_call, record_gateway_public_endpoint, token_count_response
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+            service_root = pathlib.Path(td) / "gateway-service-root"
+            service_root.mkdir()
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = str(service_root)
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+            planner._STORE = None
+            try:
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = str(service_root)
+                gateway.save_config(cfg)
+
+                calc = execute_direct_tool_call(
+                    {"tool": "calculator", "arguments": {"expression": "2+3"}},
+                    path="/v1/tools/call",
+                    client_id="public-client",
+                )
+                self.assertTrue(calc["success"])
+                token_count_response(
+                    {"model": "m", "messages": [{"role": "user", "content": "hello"}]},
+                    path="/v1/messages/count_tokens",
+                    client_id="public-client",
+                )
+                record_gateway_public_endpoint(
+                    "/v1/assistants",
+                    {"model": "m"},
+                    resource="assistants",
+                    action="create",
+                    response={"id": "asst_test", "object": "assistant"},
+                    client_id="public-client",
+                )
+
+                events = list_runtime_events(20)
+                self.assertGreaterEqual(len(events), 5)
+                for event in events:
+                    workspace_key = event.get("workspace_key", "")
+                    self.assertIn("anonymous_spaces", workspace_key)
+                    self.assertNotIn(str(service_root.resolve()), workspace_key)
+            finally:
+                planner._STORE = None
+                gateway.CONFIG_PATH = old_config
+                if old_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_root
+                if old_runtime is None:
+                    os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+                else:
+                    os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+
+    def test_tool_result_cache_keys_include_runtime_scope_not_only_workspace(self):
+        import src.gateway_cache as cache_mod
+
+        class SpyToolCache:
+            def __init__(self):
+                self.get_args = []
+                self.put_args = []
+
+            def is_cacheable(self, tool_name):
+                return tool_name == "JsonQuery"
+
+            def get(self, tool_name, arguments):
+                self.get_args.append(dict(arguments))
+                return None
+
+            def put(self, tool_name, arguments, result):
+                self.put_args.append(dict(arguments))
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_workspace_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            old_get_tool_result_cache = cache_mod.get_tool_result_cache
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            spy = SpyToolCache()
+            cache_mod.get_tool_result_cache = lambda: spy
+            try:
+                workspace = pathlib.Path(td) / "shared-client-workspace"
+                workspace.mkdir()
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                gateway.save_config(gateway._default_config())
+                body = {
+                    "workspace_root": str(workspace),
+                    "session_id": "cache-session",
+                    "tool": "JsonQuery",
+                    "arguments": {"data": {"answer": 42}, "query": "answer"},
+                }
+
+                result_a = execute_direct_tool_call(body, client_id="cache-client-a")
+                result_b = execute_direct_tool_call(body, client_id="cache-client-b")
+
+                self.assertTrue(result_a["success"])
+                self.assertTrue(result_b["success"])
+                self.assertEqual(len(spy.get_args), 2)
+                self.assertEqual(spy.get_args[0]["__gateway_workspace_cache_key"], spy.get_args[1]["__gateway_workspace_cache_key"])
+                self.assertIn("__gateway_runtime_cache_key", spy.get_args[0])
+                self.assertIn("__gateway_runtime_cache_key", spy.get_args[1])
+                self.assertNotEqual(
+                    spy.get_args[0]["__gateway_runtime_cache_key"],
+                    spy.get_args[1]["__gateway_runtime_cache_key"],
+                )
+                self.assertEqual([args["__gateway_runtime_cache_key"] for args in spy.put_args], [args["__gateway_runtime_cache_key"] for args in spy.get_args])
+            finally:
+                cache_mod.get_tool_result_cache = old_get_tool_result_cache
+                gateway.CONFIG_PATH = old_config
+                if old_workspace_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_workspace_root
+
+    def test_gateway_owned_post_routes_pass_downstream_key_as_client_id(self):
+        captured = {"token": [], "direct": [], "public": []}
+
+        def fake_token(body, *, path="/v1/messages/count_tokens", client_id=None):
+            captured["token"].append((path, client_id))
+            return {"input_tokens": 1}
+
+        def fake_direct(body, *, path="/tools/call", client_id=None):
+            captured["direct"].append((path, client_id))
+            return {"success": True, "content": "ok"}
+
+        def fake_public(path, body, **kwargs):
+            captured["public"].append((path, kwargs.get("client_id"), kwargs.get("resource")))
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                cfg = gateway._default_config()
+                cfg["downstream_keys"] = [{
+                    "name": "public-client",
+                    "key_hash": gateway._hash_secret("public-key"),
+                    "prefix": "public-k",
+                    "enabled": True,
+                    "protocols": ["models", "messages", "direct_tools"],
+                }]
+                gateway.save_config(cfg)
+
+                def post(path, payload):
+                    req = urllib.request.Request(
+                        f"http://127.0.0.1:{httpd.server_address[1]}{path}",
+                        data=json.dumps(payload).encode("utf-8"),
+                        headers={"content-type": "application/json", "authorization": "Bearer public-key"},
+                        method="POST",
+                    )
+                    return urllib.request.urlopen(req, timeout=5).read()
+
+                with patch("src.gateway_tool_runtime.token_count_response", side_effect=fake_token), \
+                     patch("src.gateway_tool_runtime.execute_direct_tool_call", side_effect=fake_direct), \
+                     patch("src.gateway_tool_runtime.record_gateway_public_endpoint", side_effect=fake_public):
+                    post("/v1/messages/count_tokens", {"model": "m", "messages": []})
+                    post("/v1/tools/call", {"tool": "calculator", "arguments": {"expression": "1+1"}})
+                    post("/v1/assistants", {"model": "m"})
+
+                self.assertEqual(captured["token"], [("/v1/messages/count_tokens", "public-client")])
+                self.assertEqual(captured["direct"], [("/v1/tools/call", "public-client")])
+                self.assertEqual(captured["public"], [("/v1/assistants", "public-client", "assistants")])
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+
+    def test_remote_identity_memory_without_scope_does_not_use_gateway_env_root(self):
+        from src.gateway_context import _inject_recalled_memories, _remember_conversation_turn, _sqlite_tail_memories
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_ready = gateway.SQLITE_READY
+            old_sqlite = os.environ.get("GATEWAY_SQLITE_LOG_PATH")
+            old_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_SQLITE_LOG_PATH"] = str(pathlib.Path(td) / "memory.sqlite3")
+            gateway.SQLITE_READY = False
+            service_root = pathlib.Path(td) / "gateway-service-root"
+            service_root.mkdir()
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = str(service_root)
+            try:
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = str(service_root)
+                cfg["context"]["memory_enabled"] = True
+                cfg["context"]["memory_summary_max_chars"] = 500
+                cfg["context"]["memory_recall_limit"] = 5
+                gateway.save_config(cfg)
+
+                metadata = {
+                    "session_id": "remote-memory-session",
+                    "user_id": json.dumps({"user_id": "remote-memory-user"}),
+                }
+                body = {
+                    "model": "m",
+                    "metadata": metadata,
+                    "messages": [{"role": "user", "content": "Remember cloud marker CLOUD-MEM-BOUNDARY"}],
+                }
+                _remember_conversation_turn(
+                    "/v1/chat/completions",
+                    body,
+                    {"choices": [{"message": {"role": "assistant", "content": "Recorded CLOUD-MEM-BOUNDARY"}}]},
+                )
+
+                memories = _sqlite_tail_memories(10)
+                self.assertEqual(len(memories), 1)
+                workspace_key = memories[0]["workspace_key"]
+                self.assertNotEqual(workspace_key, str(service_root.resolve()))
+                self.assertIn("anonymous_spaces", workspace_key)
+                self.assertNotIn(str(service_root.resolve()), workspace_key)
+
+                recalled = _inject_recalled_memories(
+                    "/v1/chat/completions",
+                    {
+                        "model": "m",
+                        "metadata": metadata,
+                        "messages": [{"role": "user", "content": "Which cloud marker did we record?"}],
+                    },
+                )
+                self.assertIn("CLOUD-MEM-BOUNDARY", json.dumps(recalled, ensure_ascii=False))
+            finally:
+                gateway.CONFIG_PATH = old_config
+                gateway.SQLITE_READY = old_ready
+                if old_sqlite is None:
+                    os.environ.pop("GATEWAY_SQLITE_LOG_PATH", None)
+                else:
+                    os.environ["GATEWAY_SQLITE_LOG_PATH"] = old_sqlite
+                if old_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_root
+
+    def test_remote_anonymous_workspace_accepts_metadata_tenant_alias(self):
+        from src.gateway_tool_runtime import _request_workspace_root
+
+        body_a = {"metadata": {"tenant": "tenant-alias-a", "session_id": "shared-session"}}
+        body_b = {"metadata": {"tenant": "tenant-alias-b", "session_id": "shared-session"}}
+        root_a = _request_workspace_root(body_a)
+        root_a_again = _request_workspace_root(body_a)
+        root_b = _request_workspace_root(body_b)
+        self.assertEqual(root_a, root_a_again)
+        self.assertNotEqual(root_a, root_b)
+
     def test_parallel_tool_use_inherits_active_downstream_project_root(self):
         with tempfile.TemporaryDirectory() as td:
             old_config = gateway.CONFIG_PATH
@@ -1111,6 +2478,7 @@ class NativeGatewayTests(unittest.TestCase):
                 os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
                 cfg = gateway._default_config()
                 cfg["gateway"]["workspace_root"] = str(service_root)
+                cfg["gateway"]["execute_user_side_tools_in_gateway"] = True
                 gateway.save_config(cfg)
 
                 result = execute_direct_tool_call(
@@ -1181,6 +2549,100 @@ class NativeGatewayTests(unittest.TestCase):
                 self.assertIn(str(project_root), recalled["content"])
                 self.assertNotIn("SERVICE-MEMORY-WRONG", recalled["content"])
                 self.assertNotIn(str(service_root), recalled["content"])
+            finally:
+                gateway.CONFIG_PATH = old_config
+                gateway.SQLITE_READY = old_ready
+                if old_sqlite is None:
+                    os.environ.pop("GATEWAY_SQLITE_LOG_PATH", None)
+                else:
+                    os.environ["GATEWAY_SQLITE_LOG_PATH"] = old_sqlite
+                if old_workspace_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_workspace_root
+
+    def test_memory_tool_scopes_by_authenticated_client_id_and_blocks_global_listing(self):
+        from src.gateway_context import _sqlite_tail_memories
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_ready = gateway.SQLITE_READY
+            old_sqlite = os.environ.get("GATEWAY_SQLITE_LOG_PATH")
+            old_workspace_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_SQLITE_LOG_PATH"] = str(pathlib.Path(td) / "gateway.sqlite3")
+            gateway.SQLITE_READY = False
+            try:
+                project_root = pathlib.Path(td) / "shared-downstream-project"
+                other_root = pathlib.Path(td) / "other-downstream-project"
+                project_root.mkdir()
+                other_root.mkdir()
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                cfg = gateway._default_config()
+                gateway.save_config(cfg)
+
+                write_a = execute_direct_tool_call(
+                    {
+                        "workspace_root": str(project_root),
+                        "client_id": "spoofed-body-client-b",
+                        "tool": "SaveMemory",
+                        "arguments": {"action": "write", "summary": "CLIENT-A-MEMORY-OK", "keywords": ["client-a"]},
+                    },
+                    client_id="auth-client-a",
+                )
+                self.assertTrue(write_a["success"])
+                write_b = execute_direct_tool_call(
+                    {
+                        "workspace_root": str(project_root),
+                        "client_id": "spoofed-body-client-a",
+                        "tool": "SaveMemory",
+                        "arguments": {"action": "write", "summary": "CLIENT-B-MEMORY-SECRET", "keywords": ["client-b"]},
+                    },
+                    client_id="auth-client-b",
+                )
+                self.assertTrue(write_b["success"])
+                execute_direct_tool_call(
+                    {
+                        "workspace_root": str(other_root),
+                        "tool": "SaveMemory",
+                        "arguments": {"action": "write", "summary": "OTHER-WORKSPACE-MEMORY-SECRET", "keywords": ["other"]},
+                    },
+                    client_id="auth-client-b",
+                )
+
+                recalled_a = execute_direct_tool_call(
+                    {"workspace_root": str(project_root), "tool": "RecallMemory", "arguments": {"action": "list", "limit": 10}},
+                    client_id="auth-client-a",
+                )
+                self.assertTrue(recalled_a["success"])
+                self.assertIn("CLIENT-A-MEMORY-OK", recalled_a["content"])
+                self.assertNotIn("CLIENT-B-MEMORY-SECRET", recalled_a["content"])
+                self.assertNotIn("OTHER-WORKSPACE-MEMORY-SECRET", recalled_a["content"])
+
+                recalled_b = execute_direct_tool_call(
+                    {"workspace_root": str(project_root), "tool": "RecallMemory", "arguments": {"action": "list", "limit": 10}},
+                    client_id="auth-client-b",
+                )
+                self.assertTrue(recalled_b["success"])
+                self.assertIn("CLIENT-B-MEMORY-SECRET", recalled_b["content"])
+                self.assertNotIn("CLIENT-A-MEMORY-OK", recalled_b["content"])
+
+                global_list = execute_direct_tool_call(
+                    {
+                        "workspace_root": str(project_root),
+                        "tool": "RecallMemory",
+                        "arguments": {"action": "list", "include_all_workspaces": True, "limit": 10},
+                    },
+                    client_id="auth-client-a",
+                )
+                self.assertFalse(global_list["success"])
+                self.assertEqual(global_list["failure_type"], "permission_denied")
+                self.assertNotIn("CLIENT-B-MEMORY-SECRET", global_list["content"])
+                self.assertNotIn("OTHER-WORKSPACE-MEMORY-SECRET", global_list["content"])
+
+                raw_memories = _sqlite_tail_memories(10)
+                self.assertEqual(len(raw_memories), 3)
+                self.assertNotIn("anonymous", {m["tenant_key"] for m in raw_memories})
             finally:
                 gateway.CONFIG_PATH = old_config
                 gateway.SQLITE_READY = old_ready
@@ -1291,6 +2753,7 @@ class NativeGatewayTests(unittest.TestCase):
                 cfg = gateway._default_config()
                 cfg["gateway"]["allow_write_tools"] = True
                 cfg["gateway"]["allow_shell_tools"] = True
+                cfg["gateway"]["allow_private_network_tools"] = True
                 gateway.save_config(cfg)
                 wrote = _execute_tool_call(ToolCall("w", "Write", {"file_path": "smoke/app.py", "content": "print('alpha')\n"}, {}))
                 self.assertTrue(wrote.success)
@@ -1344,10 +2807,9 @@ class NativeGatewayTests(unittest.TestCase):
                     os.environ["GATEWAY_WORKSPACE_ROOT"] = old_root
 
     def test_image_generation_does_not_fake_success_when_providers_fail(self):
-        import urllib.request as _urllib_request
         from src import gateway_computer_use as cu
 
-        old_urlopen = _urllib_request.urlopen
+        old_open_provider = cu._open_image_provider_url
         old_openai = os.environ.get("OPENAI_API_KEY")
         old_image_key = os.environ.get("IMAGE_GEN_API_KEY")
         old_hf = os.environ.get("HF_TOKEN")
@@ -1370,7 +2832,7 @@ class NativeGatewayTests(unittest.TestCase):
                 return FakeImage()
 
         try:
-            _urllib_request.urlopen = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("network unavailable"))
+            cu._open_image_provider_url = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("network unavailable"))
             cu._PIL_Image = FakePIL
             for key in ("OPENAI_API_KEY", "IMAGE_GEN_API_KEY", "HF_TOKEN", "HUGGINGFACE_TOKEN"):
                 os.environ.pop(key, None)
@@ -1384,8 +2846,78 @@ class NativeGatewayTests(unittest.TestCase):
             self.assertEqual(result.failure_type, "connector_required")
             self.assertIn("No real image generation provider", result.content)
         finally:
-            _urllib_request.urlopen = old_urlopen
+            cu._open_image_provider_url = old_open_provider
             cu._PIL_Image = old_pil
+            for key, value in {
+                "OPENAI_API_KEY": old_openai,
+                "IMAGE_GEN_API_KEY": old_image_key,
+                "HF_TOKEN": old_hf,
+                "HUGGINGFACE_TOKEN": old_hf2,
+            }.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_image_generation_private_provider_url_requires_admin_opt_in(self):
+        from src import gateway_computer_use as cu
+
+        old_open_provider = cu._open_image_provider_url
+        old_openai = os.environ.get("OPENAI_API_KEY")
+        old_image_key = os.environ.get("IMAGE_GEN_API_KEY")
+        old_base = os.environ.get("IMAGE_GEN_BASE_URL")
+        old_hf = os.environ.get("HF_TOKEN")
+        old_hf2 = os.environ.get("HUGGINGFACE_TOKEN")
+        try:
+            os.environ["OPENAI_API_KEY"] = "test-key"
+            os.environ["IMAGE_GEN_BASE_URL"] = "http://127.0.0.1:9"
+            os.environ.pop("IMAGE_GEN_API_KEY", None)
+            os.environ.pop("HF_TOKEN", None)
+            os.environ.pop("HUGGINGFACE_TOKEN", None)
+
+            def fake_open(req, *, timeout):
+                if "image.pollinations.ai" in getattr(req, "full_url", ""):
+                    raise RuntimeError("pollinations disabled")
+                return old_open_provider(req, timeout=timeout)
+
+            cu._open_image_provider_url = fake_open
+            payload = json.loads(cu._tool_image_generation({"prompt": "draw a gateway"}))
+            self.assertFalse(payload["ok"])
+            self.assertTrue(any("allow_private_network" in item for item in payload.get("provider_errors", [])))
+        finally:
+            cu._open_image_provider_url = old_open_provider
+            for key, value in {
+                "OPENAI_API_KEY": old_openai,
+                "IMAGE_GEN_API_KEY": old_image_key,
+                "IMAGE_GEN_BASE_URL": old_base,
+                "HF_TOKEN": old_hf,
+                "HUGGINGFACE_TOKEN": old_hf2,
+            }.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_direct_image_generation_is_gateway_owned_provider_tool(self):
+        from src import gateway_computer_use as cu
+
+        old_open_provider = cu._open_image_provider_url
+        old_openai = os.environ.get("OPENAI_API_KEY")
+        old_image_key = os.environ.get("IMAGE_GEN_API_KEY")
+        old_hf = os.environ.get("HF_TOKEN")
+        old_hf2 = os.environ.get("HUGGINGFACE_TOKEN")
+        try:
+            cu._open_image_provider_url = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("network unavailable"))
+            for key in ("OPENAI_API_KEY", "IMAGE_GEN_API_KEY", "HF_TOKEN", "HUGGINGFACE_TOKEN"):
+                os.environ.pop(key, None)
+            result = execute_direct_tool_call(
+                {"tool": "image_generation", "arguments": {"prompt": "draw a cloud gateway"}, "call_id": "direct_image_gateway_owned"}
+            )
+            self.assertFalse(result["success"])
+            self.assertEqual(result["failure_type"], "connector_required")
+            self.assertIn("No real image generation provider", result["content"])
+        finally:
+            cu._open_image_provider_url = old_open_provider
             for key, value in {
                 "OPENAI_API_KEY": old_openai,
                 "IMAGE_GEN_API_KEY": old_image_key,
@@ -1429,42 +2961,52 @@ class NativeGatewayTests(unittest.TestCase):
 
     def test_orchestrates_chat_until_final(self):
         old_protocol = os.environ.get("UPSTREAM_PROTOCOL")
+        old_config = gateway.CONFIG_PATH
         os.environ["UPSTREAM_PROTOCOL"] = "openai_chat"
         try:
-            client = FakeClient(
-                [
-                    {
-                        "choices": [
-                            {
-                                "message": {
-                                    "role": "assistant",
-                                    "content": None,
-                                    "tool_calls": [
-                                        {
-                                            "id": "call_1",
-                                            "type": "function",
-                                            "function": {
-                                                "name": "calculator",
-                                                "arguments": "{\"expression\":\"9/3\"}",
-                                            },
-                                        }
-                                    ],
-                                },
-                                "finish_reason": "tool_calls",
-                            }
-                        ]
-                    },
-                    {"choices": [{"message": {"role": "assistant", "content": "result is 3"}}]},
-                ]
-            )
-            final = run_tool_orchestration(
-                "/v1/chat/completions",
-                {"model": "m", "messages": [{"role": "user", "content": "calc"}]},
-                client,
-            )
-            self.assertEqual(final["choices"][0]["message"]["content"], "result is 3")
-            self.assertEqual(client.requests[1][1]["messages"][-1]["content"], "3")
+            with tempfile.TemporaryDirectory() as td:
+                gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+                cfg = gateway._default_config()
+                cfg["upstream"]["protocol"] = "openai_chat"
+                cfg["upstream"]["tools_enabled"] = "native"
+                cfg["upstream"]["capabilities"]["supports_tools"] = True
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = True
+                gateway.save_config(cfg)
+                client = FakeClient(
+                    [
+                        {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": None,
+                                        "tool_calls": [
+                                            {
+                                                "id": "call_1",
+                                                "type": "function",
+                                                "function": {
+                                                    "name": "calculator",
+                                                    "arguments": "{\"expression\":\"9/3\"}",
+                                                },
+                                            }
+                                        ],
+                                    },
+                                    "finish_reason": "tool_calls",
+                                }
+                            ]
+                        },
+                        {"choices": [{"message": {"role": "assistant", "content": "result is 3"}}]},
+                    ]
+                )
+                final = run_tool_orchestration(
+                    "/v1/chat/completions",
+                    {"model": "m", "messages": [{"role": "user", "content": "calc"}]},
+                    client,
+                )
+                self.assertEqual(final["choices"][0]["message"]["content"], "result is 3")
+                self.assertEqual(client.requests[1][1]["messages"][-1]["content"], "3")
         finally:
+            gateway.CONFIG_PATH = old_config
             if old_protocol:
                 os.environ["UPSTREAM_PROTOCOL"] = old_protocol
             else:
@@ -1689,6 +3231,7 @@ class NativeGatewayTests(unittest.TestCase):
                 cfg = gateway._default_config()
                 cfg["gateway"]["text_tool_call_fallback_enabled"] = True
                 cfg["gateway"]["delegate_tools_to_downstream"] = False
+                cfg["gateway"]["execute_user_side_tools_in_gateway"] = True
                 gateway.save_config(cfg)
                 pathlib.Path(td, "a.py").write_text("print('a')\n", encoding="utf-8")
                 pathlib.Path(td, "README.md").write_text("# demo\n", encoding="utf-8")
@@ -1738,6 +3281,7 @@ class NativeGatewayTests(unittest.TestCase):
                 cfg["upstream"]["capabilities"]["supports_function_calls"] = False
                 cfg["gateway"]["text_tool_call_fallback_enabled"] = True
                 cfg["gateway"]["delegate_tools_to_downstream"] = False
+                cfg["gateway"]["execute_user_side_tools_in_gateway"] = True
                 gateway.save_config(cfg)
                 pathlib.Path(td, "x.py").write_text("print('x')\n", encoding="utf-8")
                 client = FakeClient(
@@ -1768,6 +3312,63 @@ class NativeGatewayTests(unittest.TestCase):
                     os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
                 else:
                     os.environ["GATEWAY_WORKSPACE_ROOT"] = old_root
+
+    def test_delegate_tools_to_downstream_false_does_not_enable_cloud_local_user_side_execution(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            old_exec = os.environ.get("GATEWAY_EXECUTE_USER_SIDE_TOOLS")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = td
+            os.environ.pop("GATEWAY_EXECUTE_USER_SIDE_TOOLS", None)
+            try:
+                cfg = gateway._default_config()
+                cfg["upstream"]["tools_enabled"] = "adapter"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                cfg["gateway"]["text_tool_call_fallback_enabled"] = True
+                cfg["gateway"]["local_planner_enabled"] = False
+                cfg["gateway"]["delegate_tools_to_downstream"] = False
+                cfg["gateway"]["execute_user_side_tools_in_gateway"] = False
+                gateway.save_config(cfg)
+                pathlib.Path(td, "cloud_only.py").write_text("print('cloud')\n", encoding="utf-8")
+                client = FakeClient([
+                    {
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": "<function=Glob>\n<parameter=pattern>/*.py",
+                            },
+                            "finish_reason": "stop",
+                        }]
+                    }
+                ])
+                final = run_tool_orchestration(
+                    "/v1/chat/completions",
+                    {
+                        "model": "m",
+                        "messages": [{"role": "user", "content": "Please continue."}],
+                    },
+                    client,
+                )
+                choice = final["choices"][0]
+                self.assertEqual(choice.get("finish_reason"), "tool_calls")
+                tool_calls = choice["message"].get("tool_calls") or []
+                self.assertEqual(tool_calls[0]["function"]["name"], "Glob")
+                self.assertIn("*.py", tool_calls[0]["function"]["arguments"])
+                self.assertEqual(len(client.requests), 1)
+                self.assertNotIn("cloud_only.py", json.dumps(final))
+                self.assertNotIn("gateway_local_tool_fallback", json.dumps(final))
+            finally:
+                gateway.CONFIG_PATH = old_config
+                if old_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_root
+                if old_exec is None:
+                    os.environ.pop("GATEWAY_EXECUTE_USER_SIDE_TOOLS", None)
+                else:
+                    os.environ["GATEWAY_EXECUTE_USER_SIDE_TOOLS"] = old_exec
 
     def test_text_tool_adapter_compacts_huge_claude_code_payload_before_upstream(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2033,6 +3634,7 @@ class NativeGatewayTests(unittest.TestCase):
                             "description": "Get current weather",
                             "method": "GET",
                             "url": f"http://127.0.0.1:{httpd.server_address[1]}/weather",
+                            "allow_private_network": True,
                             "input_schema": {
                                 "type": "object",
                                 "properties": {"city": {"type": "string"}},
@@ -2043,15 +3645,6 @@ class NativeGatewayTests(unittest.TestCase):
                 }
                 gateway.save_config(cfg)
                 client = FakeClient([
-                    {
-                        "choices": [{
-                            "message": {
-                                "role": "assistant",
-                                "content": "<function=get_weather>\n<parameter=city>Shanghai</parameter>\n</function>",
-                            },
-                            "finish_reason": "stop",
-                        }]
-                    },
                     {"choices": [{"message": {"role": "assistant", "content": "Shanghai weather is sunny, 21C."}, "finish_reason": "stop"}]},
                 ])
                 final = run_tool_orchestration(
@@ -2059,18 +3652,151 @@ class NativeGatewayTests(unittest.TestCase):
                     {
                         "model": "m",
                         "messages": [{"role": "user", "content": "Weather in Shanghai?"}],
-                        "tools": [{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}],
                     },
                     client,
                 )
                 self.assertEqual(final["choices"][0]["message"]["content"], "Shanghai weather is sunny, 21C.")
                 self.assertEqual(WeatherHandler.seen[0]["city"], ["Shanghai"])
-                self.assertIn("temp_c", client.requests[1][1]["messages"][-1]["content"])
+                self.assertEqual(len(client.requests), 1)
+                self.assertIn("temp_c", client.requests[0][1]["messages"][-1]["content"])
+                self.assertNotIn("gateway_context", client.requests[0][1])
+                self.assertNotIn("gateway_agent_planner", client.requests[0][1])
+                self.assertEqual(final["gateway_context"]["agent_planner"]["workflow"], "gateway_owned_tool")
+                self.assertNotIn("tools", client.requests[0][1])
+                self.assertNotIn("tool_choice", client.requests[0][1])
             finally:
                 httpd.shutdown()
                 httpd.server_close()
                 thread.join(timeout=2)
                 gateway.CONFIG_PATH = old_config
+
+    def test_gateway_owned_builtin_calculator_preexecutes_without_request_tools(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                cfg = gateway._default_config()
+                cfg["gateway"]["tool_mode"] = "orchestrate"
+                cfg["upstream"]["tools_enabled"] = "adapter"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                gateway.save_config(cfg)
+                client = FakeClient([
+                    {"choices": [{"message": {"role": "assistant", "content": "The result is 42."}, "finish_reason": "stop"}]},
+                ])
+                final = run_tool_orchestration(
+                    "/v1/chat/completions",
+                    {
+                        "model": "m",
+                        "messages": [{"role": "user", "content": "Calculate 6*7 for me"}],
+                    },
+                    client,
+                )
+                self.assertEqual(final["choices"][0]["message"]["content"], "The result is 42.")
+                self.assertEqual(len(client.requests), 1)
+                sent = client.requests[0][1]
+                self.assertIn("42", sent["messages"][-1]["content"])
+                self.assertNotIn("gateway_context", sent)
+                self.assertNotIn("gateway_agent_planner", sent)
+                self.assertEqual(final["gateway_context"]["agent_planner"]["tool"], "calculator")
+                self.assertNotIn("tools", sent)
+                self.assertNotIn("tool_choice", sent)
+            finally:
+                gateway.CONFIG_PATH = old_config
+
+    def test_gateway_owned_multiple_builtin_tools_preexecute_without_request_tools(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                cfg = gateway._default_config()
+                cfg["gateway"]["tool_mode"] = "orchestrate"
+                cfg["upstream"]["tools_enabled"] = "adapter"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                gateway.save_config(cfg)
+                client = FakeClient([
+                    {"choices": [{"message": {"role": "assistant", "content": "The result is 42 and the time was included."}, "finish_reason": "stop"}]},
+                ])
+                final = run_tool_orchestration(
+                    "/v1/chat/completions",
+                    {
+                        "model": "m",
+                        "messages": [{"role": "user", "content": "Calculate 6*7 and tell current time"}],
+                    },
+                    client,
+                )
+                self.assertEqual(final["choices"][0]["message"]["content"], "The result is 42 and the time was included.")
+                self.assertEqual(len(client.requests), 1)
+                sent = client.requests[0][1]
+                tool_contents = "\n".join(
+                    str(message.get("content") or "")
+                    for message in sent["messages"]
+                    if isinstance(message, dict) and message.get("role") == "tool"
+                )
+                self.assertIn("42", tool_contents)
+                self.assertIn("+00:00", tool_contents)
+                self.assertNotIn("gateway_context", sent)
+                self.assertNotIn("gateway_agent_planner", sent)
+                planner_ctx = final["gateway_context"]["agent_planner"]
+                self.assertEqual(planner_ctx["workflow"], "gateway_owned_tool")
+                self.assertEqual(set(planner_ctx["tools"]), {"calculator", "get_current_time"})
+                self.assertIn(planner_ctx["tool"], planner_ctx["tools"])
+                self.assertNotIn("tools", sent)
+                self.assertNotIn("tool_choice", sent)
+            finally:
+                gateway.CONFIG_PATH = old_config
+
+    def test_gateway_owned_preexecute_records_runtime_events_by_remote_scope(self):
+        from src.gateway_agent_planner import list_runtime_events
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+            planner = None
+            try:
+                import src.gateway_agent_planner as planner
+                planner._STORE = None
+                cfg = gateway._default_config()
+                cfg["gateway"]["tool_mode"] = "orchestrate"
+                cfg["upstream"]["tools_enabled"] = "adapter"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                gateway.save_config(cfg)
+                client = FakeClient([
+                    {"choices": [{"message": {"role": "assistant", "content": "The result is 42."}, "finish_reason": "stop"}]},
+                ])
+                final = run_tool_orchestration(
+                    "/v1/chat/completions",
+                    {
+                        "model": "m",
+                        "metadata": {
+                            "session_id": "remote-calc-session",
+                            "user_id": json.dumps({"user_id": "remote-calc-user"}),
+                        },
+                        "messages": [{"role": "user", "content": "Calculate 6*7 for me"}],
+                    },
+                    client,
+                )
+                self.assertEqual(final["gateway_context"]["agent_planner"]["workflow"], "gateway_owned_tool")
+                events = list_runtime_events(10, tenant_contains="remote-calc-user", workflow="gateway_owned_tool")
+                event_types = [event["event_type"] for event in events]
+                self.assertIn("gateway_tool_execute", event_types)
+                self.assertIn("gateway_tool_result", event_types)
+                result_event = next(event for event in events if event["event_type"] == "gateway_tool_result")
+                self.assertEqual(result_event["metadata"]["tool"], "calculator")
+                self.assertTrue(result_event["metadata"]["success"])
+                self.assertIn("remote-calc-session", result_event["session_key"])
+            finally:
+                gateway.CONFIG_PATH = old_config
+                if old_runtime is None:
+                    os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+                else:
+                    os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+                if planner is not None:
+                    planner._STORE = None
 
     def test_context_fanout_splits_large_chat_then_synthesizes(self):
         with tempfile.TemporaryDirectory() as td:
@@ -2240,6 +3966,14 @@ class NativeGatewayTests(unittest.TestCase):
                 self.assertIn('name="cap_supports_vision"', page)
                 self.assertIn("上下文管理", page)
                 self.assertIn("/admin/upstream-models.json", page)
+                alias_page = urllib.request.urlopen(
+                    urllib.request.Request(
+                        f"http://127.0.0.1:{httpd.server_address[1]}/config",
+                        headers={"authorization": f"Basic {token}"},
+                    ),
+                    timeout=5,
+                ).read().decode("utf-8")
+                self.assertIn("Gateway Control Center", alias_page)
                 self.assertIn("/anthropic", page)
                 self.assertIn("claude_mnative()", page)
                 self.assertIn("ANTHROPIC_AUTH_TOKEN", page)
@@ -2629,6 +4363,61 @@ class NativeGatewayTests(unittest.TestCase):
                 httpd.shutdown()
                 httpd.server_close()
                 thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+
+    def test_admin_skill_delete_rejects_path_traversal_and_cross_origin(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_cwd = os.getcwd()
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.chdir(td)
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                gateway.save_config(gateway._default_config())
+                token = base64.b64encode(b"admin:admin").decode("ascii")
+                base_url = f"http://127.0.0.1:{httpd.server_address[1]}"
+                victim = pathlib.Path(td) / "outside-victim"
+                victim.mkdir()
+                (victim / "marker.txt").write_text("do-not-delete", encoding="utf-8")
+
+                traversal_body = json.dumps({"name": "../outside-victim"}).encode("utf-8")
+                req = urllib.request.Request(
+                    f"{base_url}/admin/skill-delete.json",
+                    data=traversal_body,
+                    headers={"authorization": f"Basic {token}", "content-type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as err:
+                    urllib.request.urlopen(req, timeout=5).read()
+                self.assertEqual(err.exception.code, 400)
+                self.assertTrue(victim.is_dir())
+                self.assertTrue((victim / "marker.txt").exists())
+
+                skill_dir = pathlib.Path(td) / "skills" / "safe-skill"
+                skill_dir.mkdir(parents=True)
+                (skill_dir / "SKILL.md").write_text("safe", encoding="utf-8")
+                cross_origin_body = json.dumps({"name": "safe-skill"}).encode("utf-8")
+                req = urllib.request.Request(
+                    f"{base_url}/admin/skill-delete.json",
+                    data=cross_origin_body,
+                    headers={
+                        "authorization": f"Basic {token}",
+                        "content-type": "application/json",
+                        "Origin": "https://evil.example",
+                    },
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as err:
+                    urllib.request.urlopen(req, timeout=5).read()
+                self.assertEqual(err.exception.code, 403)
+                self.assertTrue(skill_dir.is_dir())
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
+                os.chdir(old_cwd)
                 gateway.CONFIG_PATH = old_config
 
     def test_admin_post_rejects_malformed_origin_without_mutating_config(self):
@@ -3068,6 +4857,60 @@ class NativeGatewayTests(unittest.TestCase):
                 thread.join(timeout=2)
                 gateway.CONFIG_PATH = old_config
 
+    def test_streaming_post_passes_downstream_key_name_as_client_id(self):
+        captured = {}
+
+        def fake_stream(handler, path, body, client_id=None):
+            captured["path"] = path
+            captured["client_id"] = client_id
+            captured["stream"] = body.get("stream")
+            handler.send_response(200)
+            handler.send_header("content-type", "text/event-stream")
+            handler.end_headers()
+            handler.wfile.write(b"data: [DONE]\n\n")
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                cfg = gateway._default_config()
+                cfg["downstream_keys"] = [
+                    {
+                        "name": "stream-client",
+                        "key_hash": gateway._hash_secret("stream-key"),
+                        "prefix": "stream-k",
+                        "enabled": True,
+                        "protocols": ["chat_completions"],
+                    }
+                ]
+                gateway.save_config(cfg)
+                body = json.dumps(
+                    {
+                        "model": "m",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "Calculate 6*7"}],
+                    }
+                ).encode("utf-8")
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions",
+                    data=body,
+                    headers={"content-type": "application/json", "authorization": "Bearer stream-key"},
+                    method="POST",
+                )
+                with patch("src.gateway_streaming.run_streaming_orchestration", side_effect=fake_stream):
+                    urllib.request.urlopen(req, timeout=5).read()
+                self.assertEqual(captured["path"], "/v1/chat/completions")
+                self.assertTrue(captured["stream"])
+                self.assertEqual(captured["client_id"], "stream-client")
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+
     def test_fanout_synthesis_prompt_does_not_resend_full_original(self):
         original = "分析这套项目\n" + ("README line xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n" * 2000)
         partials = ["partial " + str(i) + " " + ("evidence " * 1000) for i in range(8)]
@@ -3315,32 +5158,42 @@ class NativeGatewayTests(unittest.TestCase):
 
     def test_orchestrates_responses_until_final(self):
         old_protocol = os.environ.get("UPSTREAM_PROTOCOL")
+        old_config = gateway.CONFIG_PATH
         os.environ["UPSTREAM_PROTOCOL"] = "openai_chat"
         try:
-            client = FakeClient(
-                [
-                    {
-                        "output": [
-                            {
-                                "type": "function_call",
-                                "call_id": "call_1",
-                                "name": "calculator",
-                                "arguments": "{\"expression\":\"5+5\"}",
-                            }
-                        ]
-                    },
-                    {"output": [{"type": "message", "content": [{"type": "output_text", "text": "10"}]}]},
-                ]
-            )
-            final = run_tool_orchestration("/v1/responses", {"model": "m", "input": "calc"}, client)
-            self.assertEqual(final["object"], "response")
-            self.assertTrue(final["id"].startswith("resp_"))
-            self.assertEqual(final["status"], "completed")
-            self.assertIn("usage", final)
-            self.assertEqual(final["output"][0]["type"], "message")
-            # Upstream request is in OpenAI Chat format, tool result content is a string
-            self.assertEqual(client.requests[1][1]["messages"][-1]["content"], "10")
+            with tempfile.TemporaryDirectory() as td:
+                gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+                cfg = gateway._default_config()
+                cfg["upstream"]["protocol"] = "openai_chat"
+                cfg["upstream"]["tools_enabled"] = "native"
+                cfg["upstream"]["capabilities"]["supports_tools"] = True
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = True
+                gateway.save_config(cfg)
+                client = FakeClient(
+                    [
+                        {
+                            "output": [
+                                {
+                                    "type": "function_call",
+                                    "call_id": "call_1",
+                                    "name": "calculator",
+                                    "arguments": "{\"expression\":\"5+5\"}",
+                                }
+                            ]
+                        },
+                        {"output": [{"type": "message", "content": [{"type": "output_text", "text": "10"}]}]},
+                    ]
+                )
+                final = run_tool_orchestration("/v1/responses", {"model": "m", "input": "calc"}, client)
+                self.assertEqual(final["object"], "response")
+                self.assertTrue(final["id"].startswith("resp_"))
+                self.assertEqual(final["status"], "completed")
+                self.assertIn("usage", final)
+                self.assertEqual(final["output"][0]["type"], "message")
+                # Upstream request is in OpenAI Chat format, tool result content is a string
+                self.assertEqual(client.requests[1][1]["messages"][-1]["content"], "10")
         finally:
+            gateway.CONFIG_PATH = old_config
             if old_protocol:
                 os.environ["UPSTREAM_PROTOCOL"] = old_protocol
             else:
@@ -3379,8 +5232,15 @@ class NativeGatewayTests(unittest.TestCase):
 
     def test_codex_responses_orchestrates_calc_alias_expr_until_final(self):
         old_protocol = os.environ.get("UPSTREAM_PROTOCOL")
+        old_config = gateway.CONFIG_PATH
         os.environ["UPSTREAM_PROTOCOL"] = "openai_chat"
-        try:
+        with tempfile.TemporaryDirectory() as td:
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            cfg = gateway._default_config()
+            cfg["upstream"]["tools_enabled"] = "native"
+            cfg["upstream"]["capabilities"]["supports_tools"] = True
+            cfg["upstream"]["capabilities"]["supports_function_calls"] = True
+            gateway.save_config(cfg)
             client = FakeClient(
                 [
                     {
@@ -3406,70 +5266,89 @@ class NativeGatewayTests(unittest.TestCase):
             self.assertIn('"tool_call_id": "call_calc_alias"', serialized)
             self.assertIn('"content": "4"', serialized)
             self.assertNotIn("tool_not_found", serialized)
-        finally:
-            if old_protocol:
-                os.environ["UPSTREAM_PROTOCOL"] = old_protocol
-            else:
-                os.environ.pop("UPSTREAM_PROTOCOL", None)
+        gateway.CONFIG_PATH = old_config
+        if old_protocol:
+            os.environ["UPSTREAM_PROTOCOL"] = old_protocol
+        else:
+            os.environ.pop("UPSTREAM_PROTOCOL", None)
 
     def test_claude_messages_orchestrates_calc_alias_expr_until_final(self):
-        client = FakeClient(
-            [
-                {
-                    "content": [
-                        {
-                            "type": "tool_use",
-                            "id": "toolu_calc_alias",
-                            "name": "calc",
-                            "input": {"expr": "2+2"},
-                        }
-                    ],
-                    "stop_reason": "tool_use",
-                },
-                {"content": [{"type": "text", "text": "4"}], "stop_reason": "end_turn"},
-            ]
-        )
-        final = run_tool_orchestration(
-            "/v1/messages",
-            {"model": "m", "max_tokens": 100, "messages": [{"role": "user", "content": "What is 2+2?"}]},
-            client,
-        )
-        self.assertEqual(final["content"][0]["text"], "4")
-        second_request = client.requests[1][1]
-        serialized = json.dumps(second_request, ensure_ascii=False)
-        self.assertIn("4", serialized)
-        self.assertNotIn("tool_not_found", serialized)
-
-    def test_orchestrates_messages_until_final(self):
-        # Set upstream to OpenAI Chat to match test expectation
-        old_protocol = os.environ.get("UPSTREAM_PROTOCOL")
-        os.environ["UPSTREAM_PROTOCOL"] = "openai_chat"
-        try:
+        old_config = gateway.CONFIG_PATH
+        with tempfile.TemporaryDirectory() as td:
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            cfg = gateway._default_config()
+            cfg["upstream"]["tools_enabled"] = "native"
+            cfg["upstream"]["capabilities"]["supports_tools"] = True
+            cfg["upstream"]["capabilities"]["supports_function_calls"] = True
+            gateway.save_config(cfg)
             client = FakeClient(
                 [
                     {
                         "content": [
                             {
                                 "type": "tool_use",
-                                "id": "toolu_1",
-                                "name": "calculator",
-                                "input": {"expression": "4+4"},
+                                "id": "toolu_calc_alias",
+                                "name": "calc",
+                                "input": {"expr": "2+2"},
                             }
                         ],
                         "stop_reason": "tool_use",
                     },
-                    {"content": [{"type": "text", "text": "8"}]},
+                    {"content": [{"type": "text", "text": "4"}], "stop_reason": "end_turn"},
                 ]
             )
             final = run_tool_orchestration(
                 "/v1/messages",
-                {"model": "m", "max_tokens": 100, "messages": [{"role": "user", "content": "calc"}]},
+                {"model": "m", "max_tokens": 100, "messages": [{"role": "user", "content": "What is 2+2?"}]},
                 client,
             )
-            self.assertEqual(final["content"][0]["text"], "8")
-            # Upstream request is in OpenAI Chat format, tool result content is a string
-            self.assertEqual(client.requests[1][1]["messages"][-1]["content"], "8")
+            self.assertEqual(final["content"][0]["text"], "4")
+            second_request = client.requests[1][1]
+            serialized = json.dumps(second_request, ensure_ascii=False)
+            self.assertIn("4", serialized)
+            self.assertNotIn("tool_not_found", serialized)
+        gateway.CONFIG_PATH = old_config
+
+    def test_orchestrates_messages_until_final(self):
+        # Set upstream to OpenAI Chat to match test expectation
+        old_protocol = os.environ.get("UPSTREAM_PROTOCOL")
+        old_config = gateway.CONFIG_PATH
+        os.environ["UPSTREAM_PROTOCOL"] = "openai_chat"
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+                cfg = gateway._default_config()
+                cfg["upstream"]["protocol"] = "openai_chat"
+                cfg["upstream"]["tools_enabled"] = "native"
+                cfg["upstream"]["capabilities"]["supports_tools"] = True
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = True
+                gateway.save_config(cfg)
+                client = FakeClient(
+                    [
+                        {
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "toolu_1",
+                                    "name": "calculator",
+                                    "input": {"expression": "4+4"},
+                                }
+                            ],
+                            "stop_reason": "tool_use",
+                        },
+                        {"content": [{"type": "text", "text": "8"}]},
+                    ]
+                )
+                final = run_tool_orchestration(
+                    "/v1/messages",
+                    {"model": "m", "max_tokens": 100, "messages": [{"role": "user", "content": "calc"}]},
+                    client,
+                )
+                self.assertEqual(final["content"][0]["text"], "8")
+                # Upstream request is in OpenAI Chat format, tool result content is a string
+                self.assertEqual(client.requests[1][1]["messages"][-1]["content"], "8")
         finally:
+            gateway.CONFIG_PATH = old_config
             if old_protocol:
                 os.environ["UPSTREAM_PROTOCOL"] = old_protocol
             else:
@@ -3560,6 +5439,184 @@ while True:
                 self.assertIn(legacy_name, names)
             finally:
                 gateway._mcp_close_sessions()
+                gateway.MCP_TOOL_CATALOG_CACHE.clear()
+                gateway.CONFIG_PATH = old_config
+                if old_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_root
+
+    def test_mcp_service_file_arguments_require_admin_opt_in(self):
+        script = r'''
+import json, sys
+def read_msg():
+    header = b""
+    while b"\r\n\r\n" not in header:
+        b = sys.stdin.buffer.read(1)
+        if not b:
+            return None
+        header += b
+    length = 0
+    for line in header.decode().splitlines():
+        if line.lower().startswith("content-length:"):
+            length = int(line.split(":", 1)[1].strip())
+    return json.loads(sys.stdin.buffer.read(length).decode())
+def write_msg(msg):
+    raw = json.dumps(msg).encode()
+    sys.stdout.buffer.write(f"Content-Length: {len(raw)}\r\n\r\n".encode() + raw)
+    sys.stdout.buffer.flush()
+while True:
+    msg = read_msg()
+    if msg is None:
+        break
+    method = msg.get("method")
+    if "id" not in msg:
+        continue
+    if method == "initialize":
+        write_msg({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}})
+    elif method == "tools/call":
+        path = msg.get("params", {}).get("arguments", {}).get("path", "")
+        write_msg({"jsonrpc":"2.0","id":msg["id"],"result":{"content":[{"type":"text","text":"path:" + path}]}})
+    else:
+        write_msg({"jsonrpc":"2.0","id":msg["id"],"result":{}})
+'''
+        with tempfile.TemporaryDirectory() as td:
+            script_path = pathlib.Path(td) / "fake_file_mcp.py"
+            script_path.write_text(script, encoding="utf-8")
+            old_config = gateway.CONFIG_PATH
+            old_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = td
+            try:
+                cfg = gateway._default_config()
+                cfg["mcp"] = {
+                    "enabled": True,
+                    "servers": [
+                        {
+                            "name": "files",
+                            "command": sys.executable,
+                            "args": [str(script_path)],
+                            "cwd": td,
+                            "enabled": True,
+                        }
+                    ],
+                }
+                gateway.save_config(cfg)
+                public_name = _mcp_public_name("files", "read_file")
+                blocked = _execute_tool_call(ToolCall("mcp-file-block", public_name, {"path": "/etc/passwd"}, {}))
+                self.assertFalse(blocked.success)
+                self.assertEqual(blocked.failure_type, "invalid_input")
+                self.assertIn("allow_service_file_arguments", blocked.content)
+                self.assertEqual(len(gateway.MCP_SESSIONS), 0)
+                blocked_generic = _execute_tool_call(
+                    ToolCall(
+                        "mcp-file-generic-block",
+                        "mcp_call_tool",
+                        {"server": "files", "name": "read_file", "arguments": {"path": "/etc/passwd"}},
+                        {},
+                    )
+                )
+                self.assertFalse(blocked_generic.success)
+                self.assertEqual(blocked_generic.failure_type, "invalid_input")
+                self.assertIn("allow_service_file_arguments", blocked_generic.content)
+                self.assertEqual(len(gateway.MCP_SESSIONS), 0)
+
+                cfg["mcp"]["servers"][0]["allow_service_file_arguments"] = True
+                gateway.save_config(cfg)
+                allowed = _execute_tool_call(ToolCall("mcp-file-allow", public_name, {"path": "/etc/passwd"}, {}))
+                self.assertTrue(allowed.success)
+                self.assertEqual(allowed.content, "path:/etc/passwd")
+            finally:
+                gateway._mcp_close_sessions()
+                gateway.MCP_TOOL_CATALOG_CACHE.clear()
+                gateway.CONFIG_PATH = old_config
+                if old_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_root
+
+    def test_configured_mcp_tool_preexecutes_without_request_tools(self):
+        script = r'''
+import json, sys
+def read_msg():
+    header = b""
+    while b"\r\n\r\n" not in header:
+        b = sys.stdin.buffer.read(1)
+        if not b:
+            return None
+        header += b
+    length = 0
+    for line in header.decode().splitlines():
+        if line.lower().startswith("content-length:"):
+            length = int(line.split(":", 1)[1].strip())
+    return json.loads(sys.stdin.buffer.read(length).decode())
+def write_msg(msg):
+    raw = json.dumps(msg).encode()
+    sys.stdout.buffer.write(f"Content-Length: {len(raw)}\r\n\r\n".encode() + raw)
+    sys.stdout.buffer.flush()
+while True:
+    msg = read_msg()
+    if msg is None:
+        break
+    method = msg.get("method")
+    if "id" not in msg:
+        continue
+    if method == "initialize":
+        write_msg({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1"}}})
+    elif method == "tools/list":
+        write_msg({"jsonrpc":"2.0","id":msg["id"],"result":{"tools":[{"name":"echo_mcp","description":"Echo via MCP","inputSchema":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"]}}]}})
+    elif method == "tools/call":
+        value = msg.get("params", {}).get("arguments", {}).get("value", "")
+        write_msg({"jsonrpc":"2.0","id":msg["id"],"result":{"content":[{"type":"text","text":"mcp:" + value}]}})
+    else:
+        write_msg({"jsonrpc":"2.0","id":msg["id"],"result":{}})
+'''
+        with tempfile.TemporaryDirectory() as td:
+            script_path = pathlib.Path(td) / "fake_mcp_preexec.py"
+            script_path.write_text(script, encoding="utf-8")
+            old_config = gateway.CONFIG_PATH
+            old_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = td
+            try:
+                cfg = gateway._default_config()
+                cfg["gateway"]["tool_mode"] = "orchestrate"
+                cfg["upstream"]["tools_enabled"] = "adapter"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                cfg["mcp"] = {
+                    "enabled": True,
+                    "servers": [{
+                        "name": "test",
+                        "command": sys.executable,
+                        "args": [str(script_path)],
+                        "cwd": td,
+                        "enabled": True,
+                    }],
+                }
+                gateway.save_config(cfg)
+                client = FakeClient([
+                    {"choices": [{"message": {"role": "assistant", "content": "MCP final ok."}, "finish_reason": "stop"}]},
+                ])
+                final = run_tool_orchestration(
+                    "/v1/chat/completions",
+                    {
+                        "model": "m",
+                        "messages": [{"role": "user", "content": "Echo via MCP value ok"}],
+                    },
+                    client,
+                )
+                self.assertEqual(final["choices"][0]["message"]["content"], "MCP final ok.")
+                self.assertEqual(len(client.requests), 1)
+                sent = client.requests[0][1]
+                self.assertIn("mcp:Echo via MCP value ok", sent["messages"][-1]["content"])
+                self.assertNotIn("gateway_context", sent)
+                self.assertNotIn("gateway_agent_planner", sent)
+                self.assertEqual(final["gateway_context"]["agent_planner"]["workflow"], "gateway_owned_tool")
+                self.assertNotIn("tools", sent)
+            finally:
+                gateway._mcp_close_sessions()
+                gateway.MCP_TOOL_CATALOG_CACHE.clear()
                 gateway.CONFIG_PATH = old_config
                 if old_root is None:
                     os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
@@ -3623,6 +5680,7 @@ while True:
                             "args": [str(script_path)],
                             "cwd": td,
                             "enabled": True,
+                            "allow_service_file_arguments": True,
                         }
                     ],
                 }
@@ -3750,6 +5808,1141 @@ while True:
                 else:
                     os.environ["GATEWAY_WORKSPACE_ROOT"] = old_root
 
+    def test_admin_agent_planner_endpoint_lists_runtime_sessions(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+            old_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = td
+            httpd = None
+            thread = None
+            try:
+                import src.gateway_agent_planner as planner
+                planner._STORE = None
+                cfg = gateway._default_config()
+                cfg["gateway"]["tool_mode"] = "orchestrate"
+                cfg["upstream"]["tools_enabled"] = "adapter"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                gateway.save_config(cfg)
+
+                planner._store().save(
+                    "/v1/messages:workspace:tenant:other-tenant:session:other-session",
+                    {
+                        "session_key": "/v1/messages:workspace:tenant:other-tenant:session:other-session",
+                        "workspace_key": "/client/other-workspace",
+                        "workflow": "fix_test",
+                        "current_step": "pytest",
+                        "completed_steps": ["pytest"],
+                        "evidence_count": 1,
+                        "evidence_summary": "bounded evidence preview",
+                    },
+                )
+
+                planned = run_tool_orchestration("/v1/messages", {
+                    "model": "weak",
+                    "metadata": {"session_id": "planner-admin-session", "user_id": json.dumps({"user_id": "planner-admin-user"})},
+                    "messages": [
+                        {"role": "system", "content": "Available skills:\n- codebase-onboarding"},
+                        {"role": "user", "content": "分析这套项目"},
+                    ],
+                    "tools": [{
+                        "name": "Skill",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"skill": {"type": "string"}, "args": {"type": "string"}},
+                            "required": ["skill"],
+                            "additionalProperties": False,
+                        },
+                    }],
+                })
+                self.assertEqual((planned.get("gateway_context") or {}).get("agent_planner", {}).get("workflow"), "project_analysis")
+
+                httpd = ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                token = base64.b64encode(b"admin:admin").decode("ascii")
+                base_url = f"http://127.0.0.1:{httpd.server_address[1]}/admin/agent-planner.json"
+
+                unauth_req = urllib.request.Request(f"{base_url}?limit=10")
+                with self.assertRaises(urllib.error.HTTPError) as err:
+                    urllib.request.urlopen(unauth_req, timeout=5)
+                self.assertEqual(err.exception.code, 401)
+
+                def fetch(query: str):
+                    req = urllib.request.Request(
+                        f"{base_url}?{query}",
+                        headers={"authorization": f"Basic {token}"},
+                    )
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        self.assertEqual(resp.status, 200)
+                        return json.loads(resp.read().decode("utf-8"))
+
+                payload = fetch("limit=10")
+                self.assertTrue(payload["sessions"])
+                session = payload["sessions"][0]
+                self.assertEqual(session["workflow"], "project_analysis")
+                self.assertEqual(session["current_step"], "codebase_onboarding")
+                self.assertIn("planner-admin-user", session["session_key"])
+                self.assertIn("planner-admin-session", session["session_key"])
+
+                filtered = fetch("limit=10&workflow=project_analysis&current_step=codebase_onboarding&session_contains=planner-admin-user")
+                self.assertEqual(len(filtered["sessions"]), 1)
+                self.assertEqual(filtered["sessions"][0]["workflow"], "project_analysis")
+                self.assertEqual(filtered["filters"]["workflow"], "project_analysis")
+                self.assertEqual(filtered["filters"]["current_step"], "codebase_onboarding")
+
+                tenant_filtered = fetch("limit=10&tenant_contains=other-tenant&has_evidence=1")
+                self.assertEqual(len(tenant_filtered["sessions"]), 1)
+                self.assertEqual(tenant_filtered["sessions"][0]["workflow"], "fix_test")
+                self.assertEqual(tenant_filtered["sessions"][0]["tenant_key"], "other-tenant")
+                self.assertEqual(tenant_filtered["sessions"][0]["evidence_count"], 1)
+                workspace_filtered = fetch("limit=10&workspace_contains=other-workspace")
+                self.assertEqual(len(workspace_filtered["sessions"]), 1)
+                self.assertEqual(workspace_filtered["sessions"][0]["workspace_key"], "/client/other-workspace")
+                self.assertEqual(workspace_filtered["filters"]["workspace_contains"], "other-workspace")
+
+                no_evidence = fetch("limit=10&has_evidence=0&session_contains=planner-admin-session")
+                self.assertEqual(len(no_evidence["sessions"]), 1)
+                self.assertEqual(no_evidence["sessions"][0]["workflow"], "project_analysis")
+            finally:
+                if httpd:
+                    httpd.shutdown()
+                    httpd.server_close()
+                if thread:
+                    thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+                if old_runtime is None:
+                    os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+                else:
+                    os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+                if old_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_root
+                planner._STORE = None
+
+    def test_admin_agent_runtime_endpoint_combines_planner_and_memory_scope(self):
+        from src.gateway_context import _sqlite_insert_memory
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+            old_ready = gateway.SQLITE_READY
+            old_sqlite = os.environ.get("GATEWAY_SQLITE_LOG_PATH")
+            old_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+            os.environ["GATEWAY_SQLITE_LOG_PATH"] = str(pathlib.Path(td) / "memory.sqlite3")
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = str(pathlib.Path(td) / "workspace")
+            pathlib.Path(os.environ["GATEWAY_WORKSPACE_ROOT"]).mkdir()
+            gateway.SQLITE_READY = False
+            httpd = None
+            thread = None
+            planner = None
+            try:
+                import src.gateway_agent_planner as planner
+                planner._STORE = None
+                gateway.save_config(gateway._default_config())
+                planner._store().save(
+                    "/v1/messages:/client/runtime:tenant:user-runtime:session_id:session-runtime",
+                    {
+                        "tenant_key": "user-runtime",
+                        "workspace_key": "/client/runtime",
+                        "workflow": "project_analysis",
+                        "current_step": "synthesis",
+                        "completed_steps": ["Skill", "Read"],
+                        "evidence_count": 3,
+                        "evidence_summary": "runtime evidence",
+                    },
+                )
+                planner._store().save(
+                    "/v1/messages:/client/other-runtime:tenant:user-runtime:session_id:session-runtime-other-workspace",
+                    {
+                        "tenant_key": "user-runtime",
+                        "workspace_key": "/client/other-runtime",
+                        "workflow": "project_analysis",
+                        "current_step": "synthesis",
+                        "completed_steps": ["Skill"],
+                        "evidence_count": 2,
+                        "evidence_summary": "other workspace evidence",
+                    },
+                )
+                _sqlite_insert_memory(
+                    "tenant:user-runtime:session:session-runtime",
+                    "/client/runtime",
+                    "session_rollup",
+                    "runtime rollup",
+                    ["runtime"],
+                    None,
+                    5,
+                )
+                _sqlite_insert_memory(
+                    "tenant:other-user:session:other-session",
+                    "/client/other",
+                    "session_rollup",
+                    "other rollup",
+                    ["other"],
+                    None,
+                    5,
+                )
+
+                httpd = ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                base_url = f"http://127.0.0.1:{httpd.server_address[1]}/admin/agent-runtime.json"
+                token = base64.b64encode(b"admin:admin").decode("ascii")
+
+                with self.assertRaises(urllib.error.HTTPError) as err:
+                    urllib.request.urlopen(urllib.request.Request(f"{base_url}?limit=10"), timeout=5)
+                self.assertEqual(err.exception.code, 401)
+
+                req = urllib.request.Request(
+                    f"{base_url}?limit=10&tenant_contains=user-runtime&workspace_contains=/client/runtime&session_contains=session-runtime&workflow=project_analysis&has_evidence=1&has_rollup=1",
+                    headers={"authorization": f"Basic {token}"},
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                    payload = json.loads(resp.read().decode("utf-8"))
+
+                runtime = payload["runtime"]
+                self.assertEqual(payload["filters"]["tenant_contains"], "user-runtime")
+                self.assertEqual(payload["filters"]["workspace_contains"], "/client/runtime")
+                self.assertEqual(payload["limit"], 10)
+                self.assertEqual(runtime["agent_planner"]["session_count"], 1)
+                self.assertEqual(runtime["agent_planner"]["sessions"][0]["workflow"], "project_analysis")
+                self.assertEqual(runtime["agent_planner"]["sessions"][0]["tenant_key"], "user-runtime")
+                self.assertEqual(runtime["agent_planner"]["sessions"][0]["workspace_key"], "/client/runtime")
+                self.assertEqual(runtime["memory"]["memory_count"], 1)
+                self.assertEqual(runtime["memory"]["rollup_count"], 1)
+                self.assertEqual(runtime["memory"]["memories"][0]["summary"], "runtime rollup")
+                self.assertGreaterEqual(runtime["events"]["event_count"], 1)
+                self.assertEqual(runtime["events"]["items"][0]["event_type"], "planner_state")
+                self.assertNotIn("other rollup", json.dumps(payload, ensure_ascii=False))
+                self.assertNotIn("other workspace evidence", json.dumps(payload, ensure_ascii=False))
+                self.assertEqual(runtime["capabilities"]["mode"], "remote_agent_planner")
+                self.assertEqual(runtime["capabilities"]["chat_only_upstream_role"], "synthesis_only")
+                self.assertIn("downstream_client", runtime["capabilities"]["ownership_model"])
+
+                events_req = urllib.request.Request(
+                    f"http://127.0.0.1:{httpd.server_address[1]}/admin/agent-runtime-events.json?limit=10&tenant_contains=user-runtime&event_type=memory_rollup",
+                    headers={"authorization": f"Basic {token}"},
+                )
+                with urllib.request.urlopen(events_req, timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                    events_payload = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(len(events_payload["events"]), 1)
+                self.assertEqual(events_payload["events"][0]["event_type"], "memory_rollup")
+                self.assertEqual(events_payload["events"][0]["tenant_key"], "user-runtime")
+                self.assertIn("runtime rollup", events_payload["events"][0]["summary"])
+            finally:
+                if httpd:
+                    httpd.shutdown()
+                    httpd.server_close()
+                if thread:
+                    thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+                if planner is not None:
+                    planner._STORE = None
+                gateway.SQLITE_READY = old_ready
+                if old_runtime is None:
+                    os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+                else:
+                    os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+                if old_sqlite is None:
+                    os.environ.pop("GATEWAY_SQLITE_LOG_PATH", None)
+                else:
+                    os.environ["GATEWAY_SQLITE_LOG_PATH"] = old_sqlite
+                if old_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_root
+
+    def test_admin_agent_capabilities_endpoint_exposes_ownership_model(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            httpd = None
+            thread = None
+            try:
+                cfg = gateway._default_config()
+                cfg["http_actions"] = {
+                    "enabled": True,
+                    "actions": [{
+                        "name": "get_weather",
+                        "description": "Get current weather",
+                        "method": "GET",
+                        "url": "https://weather.example.test/current",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"],
+                        },
+                    }],
+                }
+                gateway.save_config(cfg)
+                httpd = ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                token = base64.b64encode(b"admin:admin").decode("ascii")
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{httpd.server_address[1]}/admin/agent-capabilities.json",
+                    headers={"authorization": f"Basic {token}"},
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                    payload = json.loads(resp.read().decode("utf-8"))
+
+                self.assertEqual(payload["mode"], "remote_agent_planner")
+                self.assertEqual(payload["chat_only_upstream_role"], "synthesis_only")
+                workflow_names = {item["name"] for item in payload["workflows"]}
+                self.assertIn("project_analysis", workflow_names)
+                self.assertIn("chat_only_synthesis", workflow_names)
+                intent_kinds = {item["kind"] for item in payload["intents"]}
+                self.assertIn("project_analysis", intent_kinds)
+                self.assertIn("plain_chat", intent_kinds)
+                project_intent = next(item for item in payload["intents"] if item["kind"] == "project_analysis")
+                self.assertEqual(project_intent["workflow"], "project_analysis")
+                self.assertEqual(project_intent["dispatch"], "downstream_client")
+                project_workflow = next(item for item in payload["workflows"] if item["name"] == "project_analysis")
+                self.assertEqual(project_workflow["owner"], "agent_planner")
+                self.assertIn("core_flow_trace", project_workflow["steps"])
+                self.assertEqual(project_workflow["plan_items"][0]["status"], "in_progress")
+                transition_steps = [item["step"] for item in project_workflow["transitions"]]
+                self.assertEqual(transition_steps[:3], ["planner_progress", "codebase_onboarding", "project_structure"])
+                transition_builders = {item["builder"] for item in project_workflow["transitions"]}
+                self.assertIn("core_flow_trace", transition_builders)
+                self.assertIn("symbol_deep_dive", transition_builders)
+                fix_workflow = next(item for item in payload["workflows"] if item["name"] == "fix_loop")
+                fix_steps = [item["step"] for item in fix_workflow["transitions"]]
+                self.assertIn("diagnostic_read", fix_steps)
+                self.assertIn("source_followup_read", fix_steps)
+                qa_workflow = next(item for item in payload["workflows"] if item["name"] == "qa_loop")
+                qa_steps = [item["step"] for item in qa_workflow["transitions"]]
+                self.assertIn("validate_after_test", qa_steps)
+                self.assertIn("validate_after_build", qa_steps)
+                code_search_workflow = next(item for item in payload["workflows"] if item["name"] == "code_search")
+                code_search_transitions = code_search_workflow["transitions"]
+                self.assertEqual(code_search_transitions[0]["condition"], "code_search_without_existing_search")
+                self.assertEqual(code_search_transitions[0]["builder"], "code_search")
+                test_build_workflow = next(item for item in payload["workflows"] if item["name"] == "test_build")
+                test_build_steps = [item["step"] for item in test_build_workflow["transitions"]]
+                self.assertEqual(test_build_steps, ["run_test", "run_build"])
+                generic_workflow = next(item for item in payload["workflows"] if item["name"] == "generic_tool")
+                generic_steps = [item["step"] for item in generic_workflow["transitions"]]
+                self.assertEqual(generic_steps, ["skill_request", "shell_command", "read_file", "list_directory", "web_search", "custom_function"])
+                edit_workflow = next(item for item in payload["workflows"] if item["name"] == "edit")
+                edit_steps = [item["step"] for item in edit_workflow["transitions"]]
+                self.assertEqual(edit_steps, ["edit_file", "write_file"])
+                service_names = {item["name"] for item in payload["service_side"]}
+                downstream_names = {item["name"] for item in payload["downstream_owned"]}
+                self.assertIn("calculator", service_names)
+                self.assertIn("get_weather", service_names)
+                self.assertIn("image_generation", service_names)
+                self.assertIn("Read", downstream_names)
+                self.assertIn("Bash", downstream_names)
+                self.assertIn("computer_use", downstream_names)
+                self.assertNotIn("image_generation", downstream_names)
+                weather = next(item for item in payload["http_actions"] if item["name"] == "get_weather")
+                self.assertEqual(weather["owner"], "gateway_service")
+                self.assertEqual(weather["schema"]["required"], ["city"])
+                self.assertGreaterEqual(payload["counts"]["service_side"], 1)
+                self.assertGreaterEqual(payload["counts"]["intents"], 1)
+            finally:
+                if httpd:
+                    httpd.shutdown()
+                    httpd.server_close()
+                if thread:
+                    thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+
+    def test_admin_agent_runtime_audit_proves_scoped_remote_requirements(self):
+        from src.gateway_context import _sqlite_insert_memory
+        from src.gateway_agent_planner import record_runtime_event
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+            old_ready = gateway.SQLITE_READY
+            old_sqlite = os.environ.get("GATEWAY_SQLITE_LOG_PATH")
+            old_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+            os.environ["GATEWAY_SQLITE_LOG_PATH"] = str(pathlib.Path(td) / "memory.sqlite3")
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = str(pathlib.Path(td) / "service-workspace")
+            pathlib.Path(os.environ["GATEWAY_WORKSPACE_ROOT"]).mkdir()
+            gateway.SQLITE_READY = False
+            httpd = None
+            thread = None
+            try:
+                import src.gateway_agent_planner as planner
+                planner._STORE = None
+                cfg = gateway._default_config()
+                cfg["gateway"]["agent_planner_strict_every_turn"] = True
+                gateway.save_config(cfg)
+                session_key = "/v1/messages:/client/audit-workspace:tenant:audit-user:session_id:audit-session"
+                planner._store().save(
+                    session_key,
+                    {
+                        "tenant_key": "audit-user",
+                        "workspace_key": "/client/audit-workspace",
+                        "workflow": "project_analysis",
+                        "current_step": "synthesis",
+                        "completed_steps": ["Skill", "search_graph", "Read"],
+                        "evidence_count": 4,
+                        "evidence_summary": "audit scoped project evidence",
+                    },
+                )
+                for event_type, workflow, step, summary, metadata in (
+                    ("intent_classification", "project_analysis", "classify_intent", "project analysis selected", {"kind": "project_analysis"}),
+                    ("tool_dispatch", "project_analysis", "Read", "downstream client read requested", {"owner": "downstream_client", "tool": "Read"}),
+                    ("gateway_tool_execute", "gateway_owned_tool", "preexecute_gateway_owned_tool", "calculator running", {"owner": "gateway_service", "tool": "calculator"}),
+                    ("gateway_tool_result", "gateway_owned_tool", "preexecute_gateway_owned_tool", "calculator succeeded", {"owner": "gateway_service", "tool": "calculator", "success": True}),
+                    ("memory_rollup", "memory", "rollup", "audit rollup created", {"kind": "session_rollup"}),
+                    ("chat_only_synthesis_boundary", "chat_only_synthesis", "strip_upstream_tools", "non-streaming tools stripped", {"source": "non_streaming", "tool_authority_granted": False}),
+                    ("chat_only_synthesis_boundary", "chat_only_synthesis", "strip_upstream_tools", "streaming tools stripped", {"source": "streaming", "tool_authority_granted": False}),
+                    ("upstream_tool_attempt_ignored", "chat_only_synthesis", "strip_upstream_tools", "upstream pseudo tool ignored", {"tool_authority_granted": False}),
+                ):
+                    record_runtime_event(
+                        session_key=session_key,
+                        tenant_key="audit-user",
+                        workspace_key="/client/audit-workspace",
+                        event_type=event_type,
+                        workflow=workflow,
+                        step=step,
+                        summary=summary,
+                        metadata=metadata,
+                    )
+                record_runtime_event(
+                    session_key="/v1/messages:/client/other-audit:tenant:other-user:session_id:other-session",
+                    tenant_key="other-user",
+                    workspace_key="/client/other-audit",
+                    event_type="tool_dispatch",
+                    workflow="project_analysis",
+                    step="Read",
+                    summary="OTHER_TENANT_AUDIT_MARKER",
+                    metadata={"owner": "downstream_client"},
+                )
+                _sqlite_insert_memory(
+                    "tenant:audit-user:session:audit-session",
+                    "/client/audit-workspace",
+                    "session_rollup",
+                    "audit scoped rollup",
+                    ["audit"],
+                    None,
+                    5,
+                )
+                _sqlite_insert_memory(
+                    "tenant:other-user:session:other-session",
+                    "/client/other-audit",
+                    "session_rollup",
+                    "OTHER_TENANT_MEMORY_MARKER",
+                    ["other"],
+                    None,
+                    5,
+                )
+
+                httpd = ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                base_url = f"http://127.0.0.1:{httpd.server_address[1]}/admin/agent-runtime-audit.json"
+                token = base64.b64encode(b"admin:admin").decode("ascii")
+
+                with self.assertRaises(urllib.error.HTTPError) as err:
+                    urllib.request.urlopen(urllib.request.Request(f"{base_url}?limit=100"), timeout=5)
+                self.assertEqual(err.exception.code, 401)
+
+                req = urllib.request.Request(
+                    f"{base_url}?limit=100&tenant_contains=audit-user&workspace_contains=/client/audit-workspace&session_contains=audit-session",
+                    headers={"authorization": f"Basic {token}"},
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                    payload = json.loads(resp.read().decode("utf-8"))
+
+                audit = payload["audit"]
+                self.assertEqual(audit["mode"], "remote_agent_planner")
+                self.assertEqual(audit["overall_status"], "proven/current_scope")
+                self.assertEqual(audit["summary"]["missing"], 0)
+                requirements = audit["requirements"]
+                expected_keys = {
+                    "agent_planner_runtime_mode",
+                    "chat_only_upstream_config",
+                    "downstream_client_tool_execution_policy",
+                    "chat_only_upstream_synthesis_only",
+                    "planner_owns_intent_and_workflows",
+                    "strict_every_turn_planner_envelope",
+                    "downstream_client_workspace_tools",
+                    "gateway_owned_service_tools",
+                    "infinite_context_memory_rollup",
+                    "tenant_workspace_isolation",
+                    "streaming_nonstreaming_parity",
+                    "admin_observability",
+                }
+                self.assertEqual(set(requirements), expected_keys)
+                for key in expected_keys:
+                    self.assertEqual(requirements[key]["status"], "proven/current_scope", key)
+                self.assertFalse(requirements["agent_planner_runtime_mode"]["detail"]["legacy_gateway_passthrough"])
+                self.assertFalse(requirements["chat_only_upstream_config"]["detail"]["upstream_native_tool_authority"])
+                self.assertFalse(requirements["downstream_client_tool_execution_policy"]["detail"]["gateway_forces_local_user_side_tools"])
+                self.assertTrue(requirements["strict_every_turn_planner_envelope"]["detail"]["agent_planner_strict_every_turn"])
+                self.assertEqual(requirements["strict_every_turn_planner_envelope"]["detail"]["missing_session_count"], 0)
+                self.assertEqual(requirements["chat_only_upstream_synthesis_only"]["detail"]["tool_authority_granted"], False)
+                self.assertEqual(requirements["tenant_workspace_isolation"]["detail"]["filters"]["workspace_contains"], "/client/audit-workspace")
+                self.assertEqual(
+                    requirements["streaming_nonstreaming_parity"]["detail"]["seen_synthesis_sources"],
+                    ["non_streaming", "streaming"],
+                )
+                dumped = json.dumps(payload, ensure_ascii=False)
+                self.assertNotIn("OTHER_TENANT_AUDIT_MARKER", dumped)
+                self.assertNotIn("OTHER_TENANT_MEMORY_MARKER", dumped)
+                self.assertNotIn(str(pathlib.Path(td) / "service-workspace"), dumped)
+            finally:
+                if httpd:
+                    httpd.shutdown()
+                    httpd.server_close()
+                if thread:
+                    thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+                planner._STORE = None
+                gateway.SQLITE_READY = old_ready
+                if old_runtime is None:
+                    os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+                else:
+                    os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+                if old_sqlite is None:
+                    os.environ.pop("GATEWAY_SQLITE_LOG_PATH", None)
+                else:
+                    os.environ["GATEWAY_SQLITE_LOG_PATH"] = old_sqlite
+                if old_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_root
+
+    def test_agent_runtime_audit_ignores_stale_sessions_outside_event_window(self):
+        from src.gateway_http_handler import _agent_runtime_requirement_audit
+        from src.gateway_tool_runtime import planner_capability_catalog
+
+        stale_session = {
+            "id": 1,
+            "session_key": "/v1/messages:/client/old:tenant:old-user:session_id:old",
+            "tenant_key": "old-user",
+            "workspace_key": "/client/old",
+            "workflow": "chat_only_synthesis",
+            "current_step": "intent_classification",
+        }
+        current_session_key = "/v1/messages:/client/current:tenant:current-user:session_id:current"
+        current_session = {
+            "id": 2,
+            "session_key": current_session_key,
+            "tenant_key": "current-user",
+            "workspace_key": "/client/current",
+            "workflow": "project_analysis",
+            "current_step": "project_structure",
+        }
+
+        def event(event_type, workflow, *, source=None, owner=None, session_key=current_session_key):
+            metadata = {}
+            if source:
+                metadata["source"] = source
+            if owner:
+                metadata["owner"] = owner
+            return {
+                "id": len(events) + 1,
+                "session_key": session_key,
+                "tenant_key": "current-user",
+                "workspace_key": "/client/current",
+                "event_type": event_type,
+                "workflow": workflow,
+                "step": "step",
+                "summary": event_type,
+                "metadata": metadata,
+            }
+
+        events = []
+        events.append(event("intent_classification", "project_analysis"))
+        events.append(event("tool_dispatch", "project_analysis", owner="downstream_client"))
+        events.append(event("gateway_tool_execute", "gateway_owned_tool", owner="gateway_service"))
+        events.append(event("gateway_tool_result", "gateway_owned_tool", owner="gateway_service"))
+        events.append(event("memory_rollup", "memory"))
+        events.append(event("chat_only_synthesis_boundary", "chat_only_synthesis", source="non_streaming"))
+        events.append(event("chat_only_synthesis_boundary", "chat_only_synthesis", source="streaming"))
+
+        audit = _agent_runtime_requirement_audit(
+            capabilities=planner_capability_catalog(include_mcp_tools=False),
+            sessions=[stale_session, current_session],
+            memories=[{"id": 1, "kind": "session_rollup", "summary": "rollup", "memory_session_key": current_session_key}],
+            events=events,
+            filters={
+                "tenant_contains": "current-user",
+                "workspace_contains": "/client/current",
+                "session_contains": "current",
+                "workflow": None,
+                "current_step": None,
+                "memory_kind": None,
+                "event_type": None,
+            },
+            runtime_config={
+                "gateway_tool_mode": "orchestrate",
+                "agent_planner_strict_every_turn": True,
+                "gateway_execute_user_side_tools": False,
+                "gateway_delegate_tools_to_downstream": None,
+                "upstream_tools_enabled": "adapter",
+                "upstream_supports_tools": False,
+                "upstream_supports_function_calls": False,
+            },
+        )
+
+        requirements = audit["requirements"]
+        strict = requirements["strict_every_turn_planner_envelope"]
+        self.assertEqual(strict["status"], "proven/current_scope")
+        self.assertEqual(strict["detail"]["session_count"], 1)
+        self.assertEqual(strict["detail"]["stored_session_count"], 2)
+        self.assertEqual(strict["detail"]["missing_session_count"], 0)
+        self.assertEqual(requirements["tenant_workspace_isolation"]["status"], "proven/current_scope")
+        self.assertEqual(audit["summary"]["missing"], 0)
+        self.assertEqual(audit["overall_status"], "proven/current_scope")
+
+    def test_agent_runtime_audit_global_view_does_not_fail_on_unscoped_historical_anonymous_sessions(self):
+        from src.gateway_http_handler import _agent_runtime_requirement_audit
+        from src.gateway_tool_runtime import planner_capability_catalog
+
+        historical_key = "/v1/chat/completions:/service/anon:tenant:anonymous:anon:old"
+        audit = _agent_runtime_requirement_audit(
+            capabilities=planner_capability_catalog(include_mcp_tools=False),
+            sessions=[{
+                "id": 1,
+                "session_key": historical_key,
+                "tenant_key": "anonymous",
+                "workspace_key": "/service/anon",
+                "workflow": "chat_only_synthesis",
+                "current_step": "intent_classification",
+            }],
+            memories=[],
+            events=[{
+                "id": 1,
+                "session_key": historical_key,
+                "tenant_key": "anonymous",
+                "workspace_key": "/service/anon",
+                "event_type": "intent_classification",
+                "workflow": "chat_only_synthesis",
+                "step": "intent_classification",
+                "summary": "old anonymous plain chat classified before boundary instrumentation",
+                "metadata": {"intent": {"kind": "plain_chat"}},
+            }],
+            filters={
+                "tenant_contains": None,
+                "workspace_contains": None,
+                "session_contains": None,
+                "workflow": None,
+                "current_step": None,
+                "memory_kind": None,
+                "event_type": None,
+            },
+            runtime_config={
+                "gateway_tool_mode": "orchestrate",
+                "agent_planner_strict_every_turn": True,
+                "gateway_execute_user_side_tools": False,
+                "gateway_delegate_tools_to_downstream": None,
+                "upstream_tools_enabled": "adapter",
+                "upstream_supports_tools": False,
+                "upstream_supports_function_calls": False,
+            },
+        )
+
+        strict = audit["requirements"]["strict_every_turn_planner_envelope"]
+        self.assertEqual(strict["status"], "configured/static")
+        self.assertFalse(strict["detail"]["strict_runtime_scope"])
+        self.assertEqual(strict["detail"]["unscoped_intent_session_count"], 1)
+        self.assertEqual(strict["detail"]["missing_session_count"], 0)
+
+
+    def test_agent_runtime_audit_scope_contract_documents_non_conversation_exclusions(self):
+        from src.gateway_http_handler import _agent_runtime_requirement_audit
+        from src.gateway_tool_runtime import planner_capability_catalog
+
+        audit = _agent_runtime_requirement_audit(
+            capabilities=planner_capability_catalog(include_mcp_tools=False),
+            sessions=[],
+            memories=[],
+            events=[],
+            filters={
+                "tenant_contains": None,
+                "workspace_contains": None,
+                "session_contains": None,
+                "workflow": None,
+                "current_step": None,
+                "memory_kind": None,
+                "event_type": None,
+            },
+            runtime_config={
+                "gateway_tool_mode": "orchestrate",
+                "agent_planner_strict_every_turn": True,
+                "gateway_execute_user_side_tools": False,
+                "gateway_delegate_tools_to_downstream": None,
+                "upstream_tools_enabled": "adapter",
+                "upstream_supports_tools": False,
+                "upstream_supports_function_calls": False,
+            },
+        )
+
+        contract = audit["scope_contract"]
+        self.assertEqual(contract["strict_conversation_scope"], "supported_authenticated_public_api_paths")
+        self.assertIn("/v1/chat/completions", contract["conversation_paths"])
+        self.assertIn("/v1/messages", contract["conversation_paths"])
+        self.assertIn("/v1/responses", contract["conversation_paths"])
+        self.assertIn("/anthropic/v1/chat/completions", contract["conversation_paths"])
+        self.assertIn("/anthropic/v1/messages", contract["conversation_paths"])
+        self.assertIn("/anthropic/v1/responses", contract["conversation_paths"])
+        self.assertNotIn("/v1/assistants", contract["conversation_paths"])
+        self.assertNotIn("/v1/threads", contract["conversation_paths"])
+        self.assertIn("/v1/tools/call", contract["gateway_owned_service_paths"])
+        self.assertIn("/v1/models", contract["gateway_owned_service_paths"])
+        self.assertIn("/anthropic/v1/models", contract["gateway_owned_service_paths"])
+        self.assertIn("/v1/assistants", contract["gateway_owned_service_paths"])
+        self.assertIn("/v1/threads", contract["gateway_owned_service_paths"])
+        self.assertIn("/admin/agent-runtime-audit.json", contract["control_plane_paths_excluded"])
+        self.assertIn("/healthz", contract["control_plane_paths_excluded"])
+        self.assertIn("auth_failures", contract["security_layer_excluded"])
+        self.assertIn("unsupported_paths", contract["security_layer_excluded"])
+
+    def test_admin_agent_runtime_audit_flags_non_strict_every_turn_mode(self):
+        from src.gateway_http_handler import _agent_runtime_requirement_audit
+        from src.gateway_tool_runtime import planner_capability_catalog
+
+        session_key = "/v1/messages:/client/audit-workspace:tenant:audit-user:session_id:audit-session"
+        audit = _agent_runtime_requirement_audit(
+            capabilities=planner_capability_catalog(include_mcp_tools=False),
+            sessions=[{
+                "session_key": session_key,
+                "tenant_key": "audit-user",
+                "workspace_key": "/client/audit-workspace",
+                "workflow": "chat_only_synthesis",
+                "current_step": "synthesis",
+                "evidence_count": 0,
+            }],
+            memories=[],
+            events=[
+                {
+                    "session_key": session_key,
+                    "tenant_key": "audit-user",
+                    "workspace_key": "/client/audit-workspace",
+                    "event_type": "intent_classification",
+                    "workflow": "chat_only_synthesis",
+                    "step": "intent_classification",
+                    "summary": "plain chat classified",
+                    "metadata": {"intent": {"kind": "plain_chat"}},
+                }
+            ],
+            filters={"tenant_contains": "audit-user", "workspace_contains": "/client/audit-workspace", "session_contains": "audit-session"},
+            runtime_config={
+                "gateway_tool_mode": "orchestrate",
+                "agent_planner_strict_every_turn": False,
+                "upstream_tools_enabled": "adapter",
+                "upstream_supports_tools": False,
+                "upstream_supports_function_calls": False,
+                "gateway_execute_user_side_tools": False,
+                "gateway_delegate_tools_to_downstream": None,
+            },
+        )
+        req = audit["requirements"]["strict_every_turn_planner_envelope"]
+        self.assertEqual(req["status"], "missing/current_scope")
+        self.assertFalse(req["detail"]["agent_planner_strict_every_turn"])
+        self.assertEqual(audit["overall_status"], "needs_runtime_evidence")
+
+    def test_admin_agent_runtime_audit_flags_legacy_passthrough_mode(self):
+        from src.gateway_agent_planner import record_runtime_event
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+            httpd = None
+            thread = None
+            planner = None
+            try:
+                import src.gateway_agent_planner as planner
+                planner._STORE = None
+                cfg = gateway._default_config()
+                cfg["gateway"]["tool_mode"] = "passthrough"
+                gateway.save_config(cfg)
+                record_runtime_event(
+                    session_key="/v1/messages:/client/legacy:tenant:legacy-user:session_id:legacy-session",
+                    tenant_key="legacy-user",
+                    workspace_key="/client/legacy",
+                    event_type="planner_state",
+                    workflow="project_analysis",
+                    step="legacy_probe",
+                    summary="legacy mode should not pass agent runtime audit",
+                    metadata={"evidence_count": 1},
+                )
+
+                httpd = ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                token = base64.b64encode(b"admin:admin").decode("ascii")
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{httpd.server_address[1]}/admin/agent-runtime-audit.json?limit=20&tenant_contains=legacy-user&workspace_contains=/client/legacy&session_contains=legacy-session",
+                    headers={"authorization": f"Basic {token}"},
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                    payload = json.loads(resp.read().decode("utf-8"))
+
+                audit = payload["audit"]
+                mode_req = audit["requirements"]["agent_planner_runtime_mode"]
+                self.assertEqual(mode_req["status"], "missing/current_scope")
+                self.assertTrue(mode_req["detail"]["legacy_gateway_passthrough"])
+                self.assertEqual(mode_req["detail"]["gateway_tool_mode"], "passthrough")
+                self.assertEqual(audit["runtime_config"]["gateway_tool_mode"], "passthrough")
+                self.assertEqual(audit["overall_status"], "needs_runtime_evidence")
+                self.assertGreaterEqual(audit["summary"]["missing"], 1)
+            finally:
+                if httpd:
+                    httpd.shutdown()
+                    httpd.server_close()
+                if thread:
+                    thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+                if planner is not None:
+                    planner._STORE = None
+                if old_runtime is None:
+                    os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+                else:
+                    os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+
+    def test_admin_agent_runtime_audit_flags_upstream_native_tool_authority(self):
+        from src.gateway_agent_planner import record_runtime_event
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+            httpd = None
+            thread = None
+            planner = None
+            try:
+                import src.gateway_agent_planner as planner
+                planner._STORE = None
+                cfg = gateway._default_config()
+                cfg["gateway"]["tool_mode"] = "orchestrate"
+                cfg["upstream"]["tools_enabled"] = "auto"
+                cfg["upstream"]["capabilities"]["supports_tools"] = True
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = True
+                gateway.save_config(cfg)
+                record_runtime_event(
+                    session_key="/v1/messages:/client/native-upstream:tenant:native-user:session_id:native-session",
+                    tenant_key="native-user",
+                    workspace_key="/client/native-upstream",
+                    event_type="planner_state",
+                    workflow="project_analysis",
+                    step="native_probe",
+                    summary="native upstream should not pass chat-only audit",
+                    metadata={"evidence_count": 1},
+                )
+
+                httpd = ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                token = base64.b64encode(b"admin:admin").decode("ascii")
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{httpd.server_address[1]}/admin/agent-runtime-audit.json?limit=20&tenant_contains=native-user&workspace_contains=/client/native-upstream&session_contains=native-session",
+                    headers={"authorization": f"Basic {token}"},
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                    payload = json.loads(resp.read().decode("utf-8"))
+
+                audit = payload["audit"]
+                native_req = audit["requirements"]["chat_only_upstream_config"]
+                self.assertEqual(native_req["status"], "missing/current_scope")
+                self.assertTrue(native_req["detail"]["upstream_native_tool_authority"])
+                self.assertTrue(native_req["detail"]["upstream_supports_tools"])
+                self.assertTrue(native_req["detail"]["upstream_supports_function_calls"])
+                self.assertEqual(native_req["detail"]["upstream_tools_enabled"], "auto")
+                self.assertTrue(audit["runtime_config"]["upstream_native_tool_authority"])
+                self.assertEqual(audit["overall_status"], "needs_runtime_evidence")
+            finally:
+                if httpd:
+                    httpd.shutdown()
+                    httpd.server_close()
+                if thread:
+                    thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+                if planner is not None:
+                    planner._STORE = None
+                if old_runtime is None:
+                    os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+                else:
+                    os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+
+    def test_admin_agent_runtime_audit_flags_gateway_user_side_tool_execution(self):
+        from src.gateway_agent_planner import record_runtime_event
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+            httpd = None
+            thread = None
+            planner = None
+            try:
+                import src.gateway_agent_planner as planner
+                planner._STORE = None
+                cfg = gateway._default_config()
+                cfg["gateway"]["tool_mode"] = "orchestrate"
+                cfg["gateway"]["execute_user_side_tools_in_gateway"] = True
+                gateway.save_config(cfg)
+                record_runtime_event(
+                    session_key="/v1/messages:/client/local-tools:tenant:local-tools-user:session_id:local-tools-session",
+                    tenant_key="local-tools-user",
+                    workspace_key="/client/local-tools",
+                    event_type="tool_dispatch",
+                    workflow="generic_tool",
+                    step="read_file",
+                    summary="downstream tool event should not override unsafe local execution policy",
+                    metadata={"owner": "downstream_client", "tool": "Read"},
+                )
+
+                httpd = ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                token = base64.b64encode(b"admin:admin").decode("ascii")
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{httpd.server_address[1]}/admin/agent-runtime-audit.json?limit=20&tenant_contains=local-tools-user&workspace_contains=/client/local-tools&session_contains=local-tools-session",
+                    headers={"authorization": f"Basic {token}"},
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                    payload = json.loads(resp.read().decode("utf-8"))
+
+                audit = payload["audit"]
+                policy_req = audit["requirements"]["downstream_client_tool_execution_policy"]
+                self.assertEqual(policy_req["status"], "missing/current_scope")
+                self.assertTrue(policy_req["detail"]["gateway_execute_user_side_tools"])
+                self.assertTrue(policy_req["detail"]["gateway_forces_local_user_side_tools"])
+                self.assertTrue(audit["runtime_config"]["gateway_forces_local_user_side_tools"])
+                self.assertEqual(audit["overall_status"], "needs_runtime_evidence")
+            finally:
+                if httpd:
+                    httpd.shutdown()
+                    httpd.server_close()
+                if thread:
+                    thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+                if planner is not None:
+                    planner._STORE = None
+                if old_runtime is None:
+                    os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+                else:
+                    os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+
+    def test_admin_agent_runtime_audit_delegate_false_does_not_flag_cloud_local_user_side_execution(self):
+        from src.gateway_http_handler import _agent_runtime_requirement_audit
+
+        audit = _agent_runtime_requirement_audit(
+            capabilities={
+                "ownership_model": {"downstream_client": [], "gateway_service": []},
+                "downstream_owned": ["Read"],
+                "service_side": ["calculator"],
+                "workflows": ["generic_tool"],
+                "intents": ["tool_request"],
+                "chat_only_upstream_role": "synthesis_only",
+            },
+            sessions=[],
+            memories=[],
+            events=[],
+            filters={},
+            runtime_config={
+                "gateway_tool_mode": "orchestrate",
+                "agent_planner_strict_every_turn": False,
+                "gateway_execute_user_side_tools": False,
+                "gateway_delegate_tools_to_downstream": False,
+                "upstream_tools_enabled": "adapter",
+                "upstream_supports_tools": False,
+                "upstream_supports_function_calls": False,
+            },
+        )
+        policy_req = audit["requirements"]["downstream_client_tool_execution_policy"]
+        self.assertEqual(policy_req["status"], "configured/static")
+        self.assertFalse(policy_req["detail"]["gateway_execute_user_side_tools"])
+        self.assertFalse(policy_req["detail"]["gateway_forces_local_user_side_tools"])
+        self.assertFalse(audit["runtime_config"]["gateway_forces_local_user_side_tools"])
+
+    def test_admin_ui_renders_agent_runtime_events_table(self):
+        from src.gateway_agent_planner import record_runtime_event
+        from src.gateway_admin import _render_admin_ui
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+            planner = None
+            try:
+                import src.gateway_agent_planner as planner
+                planner._STORE = None
+                gateway.save_config(gateway._default_config())
+                record_runtime_event(
+                    session_key="/v1/messages:/client/admin-ui:tenant:ui-user:session_id:ui-session",
+                    tenant_key="ui-user",
+                    workspace_key="/client/admin-ui",
+                    event_type="gateway_tool_result",
+                    workflow="gateway_owned_tool",
+                    step="preexecute_gateway_owned_tool",
+                    summary="calculator succeeded for admin ui",
+                    metadata={"tool": "calculator", "success": True},
+                )
+
+                html = _render_admin_ui()
+
+                self.assertIn("Agent Runtime Events", html)
+                self.assertIn("gateway_tool_result", html)
+                self.assertIn("gateway_owned_tool", html)
+                self.assertIn("calculator succeeded for admin ui", html)
+                self.assertIn("ui-user", html)
+            finally:
+                gateway.CONFIG_PATH = old_config
+                if old_runtime is None:
+                    os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+                else:
+                    os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+                if planner is not None:
+                    planner._STORE = None
+
+    def test_admin_memories_endpoint_filters_remote_scope(self):
+        from src.gateway_context import _sqlite_insert_memory
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_ready = gateway.SQLITE_READY
+            old_sqlite = os.environ.get("GATEWAY_SQLITE_LOG_PATH")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_SQLITE_LOG_PATH"] = str(pathlib.Path(td) / "memory.sqlite3")
+            gateway.SQLITE_READY = False
+            httpd = None
+            thread = None
+            try:
+                gateway.save_config(gateway._default_config())
+                _sqlite_insert_memory(
+                    "tenant:user-a:session:session-a",
+                    "/client/workspace-a",
+                    "conversation_turn",
+                    "normal memory a",
+                    ["normal"],
+                    None,
+                    1,
+                )
+                _sqlite_insert_memory(
+                    "tenant:user-b:session:session-b",
+                    "/client/workspace-b",
+                    "session_rollup",
+                    "rollup memory b",
+                    ["rollup"],
+                    None,
+                    5,
+                )
+
+                httpd = ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                base_url = f"http://127.0.0.1:{httpd.server_address[1]}/admin/memories.json"
+                token = base64.b64encode(b"admin:admin").decode("ascii")
+
+                unauth = urllib.request.Request(f"{base_url}?limit=10")
+                with self.assertRaises(urllib.error.HTTPError) as err:
+                    urllib.request.urlopen(unauth, timeout=5)
+                self.assertEqual(err.exception.code, 401)
+
+                def fetch(query: str):
+                    req = urllib.request.Request(
+                        f"{base_url}?{query}",
+                        headers={"authorization": f"Basic {token}"},
+                    )
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        self.assertEqual(resp.status, 200)
+                        return json.loads(resp.read().decode("utf-8"))
+
+                rollups = fetch("limit=10&tenant_contains=user-b&has_rollup=1")
+                self.assertEqual(len(rollups["memories"]), 1)
+                self.assertEqual(rollups["memories"][0]["kind"], "session_rollup")
+                self.assertEqual(rollups["memories"][0]["tenant_key"], "user-b")
+                self.assertEqual(rollups["filters"]["tenant_contains"], "user-b")
+                self.assertTrue(rollups["filters"]["has_rollup"])
+
+                normal = fetch("limit=10&workspace_contains=workspace-a&session_contains=session-a&has_rollup=0")
+                self.assertEqual(len(normal["memories"]), 1)
+                self.assertEqual(normal["memories"][0]["summary"], "normal memory a")
+                self.assertEqual(normal["memories"][0]["workspace_key"], "/client/workspace-a")
+
+                kind_filtered = fetch("limit=10&kind=session_rollup")
+                self.assertEqual(len(kind_filtered["memories"]), 1)
+                self.assertEqual(kind_filtered["memories"][0]["summary"], "rollup memory b")
+            finally:
+                if httpd:
+                    httpd.shutdown()
+                    httpd.server_close()
+                if thread:
+                    thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+                gateway.SQLITE_READY = old_ready
+                if old_sqlite is None:
+                    os.environ.pop("GATEWAY_SQLITE_LOG_PATH", None)
+                else:
+                    os.environ["GATEWAY_SQLITE_LOG_PATH"] = old_sqlite
+
+    def test_agent_planner_store_migrates_and_indexes_runtime_sessions(self):
+        import sqlite3
+        from src.gateway_agent_planner import AgentPlannerStore
+
+        with tempfile.TemporaryDirectory() as td:
+            db_path = pathlib.Path(td) / "agent_planner.sqlite3"
+            legacy_state = {
+                "session_key": "/v1/messages:/client/workspace:tenant:legacy-tenant:session_id:legacy-session",
+                "workflow": "project_analysis",
+                "current_step": "codebase_onboarding",
+                "evidence_count": 0,
+            }
+            with sqlite3.connect(db_path) as con:
+                con.execute(
+                    "CREATE TABLE planner_sessions (session_key TEXT PRIMARY KEY, state_json TEXT NOT NULL, updated_at REAL NOT NULL)"
+                )
+                con.execute(
+                    "INSERT INTO planner_sessions(session_key, state_json, updated_at) VALUES(?,?,?)",
+                    (legacy_state["session_key"], json.dumps(legacy_state), 1.0),
+                )
+
+            store = AgentPlannerStore(db_path)
+            columns = {row[1] for row in sqlite3.connect(db_path).execute("PRAGMA table_info(planner_sessions)").fetchall()}
+            self.assertTrue({"tenant_key", "workspace_key", "workflow", "current_step", "evidence_count"}.issubset(columns))
+
+            migrated = store.list_recent(tenant_contains="legacy-tenant", workflow="project_analysis")
+            self.assertEqual(len(migrated), 1)
+            self.assertEqual(migrated[0]["tenant_key"], "legacy-tenant")
+            self.assertEqual(migrated[0]["workspace_key"], "/client/workspace")
+
+            store.save(
+                "/v1/messages:/ignored:tenant:not-used:session_id:indexed-session",
+                {
+                    "tenant_key": "explicit-tenant",
+                    "workspace_key": "/client/explicit",
+                    "workflow": "fix_test",
+                    "current_step": "pytest",
+                    "evidence_count": 2,
+                    "evidence_summary": "bounded",
+                },
+            )
+            indexed = store.list_recent(tenant_contains="explicit-tenant", workflow="fix_test", has_evidence=True)
+            self.assertEqual(len(indexed), 1)
+            self.assertEqual(indexed[0]["tenant_key"], "explicit-tenant")
+            self.assertEqual(indexed[0]["workspace_key"], "/client/explicit")
+            self.assertEqual(indexed[0]["current_step"], "pytest")
+
     def test_http_action_exposes_schema_and_executes_real_http(self):
         class EchoHandler(BaseHTTPRequestHandler):
             def log_message(self, fmt, *args):
@@ -3789,6 +6982,7 @@ while True:
                                     "description": "Echo through real HTTP action",
                                     "method": "POST",
                                     "url": f"http://127.0.0.1:{httpd.server_address[1]}/echo",
+                                    "allow_private_network": True,
                                     "input_schema": {
                                         "type": "object",
                                         "properties": {"value": {"type": "string"}},
@@ -3864,6 +7058,7 @@ while True:
                             "description": "Lookup through HTTP action",
                             "method": "GET",
                             "url": f"http://127.0.0.1:{httpd.server_address[1]}/lookup",
+                            "allow_private_network": True,
                             "headers": {"authorization": "${LOOKUP_TOKEN}"},
                         }
                     ],
@@ -3929,6 +7124,7 @@ while True:
                             "name": "failing_http",
                             "method": "POST",
                             "url": f"http://127.0.0.1:{httpd.server_address[1]}/fail",
+                            "allow_private_network": True,
                         }
                     ],
                 }
@@ -3979,6 +7175,7 @@ while True:
                             "name": "large_http",
                             "method": "POST",
                             "url": f"http://127.0.0.1:{httpd.server_address[1]}/large",
+                            "allow_private_network": True,
                             "max_bytes": 16,
                         }
                     ],
@@ -4010,6 +7207,99 @@ while True:
                 self.assertIn(result.failure_type, {"invalid_input", "http_action_failed"})
             finally:
                 gateway.CONFIG_PATH = old_config
+
+    def test_http_action_private_network_url_requires_admin_opt_in(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                cfg = gateway._default_config()
+                cfg["http_actions"] = {
+                    "enabled": True,
+                    "actions": [
+                        {
+                            "name": "metadata_http",
+                            "method": "GET",
+                            "url": "http://127.0.0.1:9/metadata",
+                        }
+                    ],
+                }
+                gateway.save_config(cfg)
+                result = _execute_tool_call(ToolCall("http_private", "metadata_http", {}, {}))
+                self.assertFalse(result.success)
+                self.assertEqual(result.failure_type, "invalid_input")
+                self.assertIn("allow_private_network", result.content)
+            finally:
+                gateway.CONFIG_PATH = old_config
+
+    def test_http_action_dns_private_target_requires_admin_opt_in(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                cfg = gateway._default_config()
+                cfg["http_actions"] = {
+                    "enabled": True,
+                    "actions": [
+                        {
+                            "name": "metadata_dns_http",
+                            "method": "GET",
+                            "url": "http://metadata.example.test/metadata",
+                        }
+                    ],
+                }
+                gateway.save_config(cfg)
+                with patch(
+                    "src.gateway_http_actions.socket.getaddrinfo",
+                    return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", 80))],
+                ):
+                    result = _execute_tool_call(ToolCall("http_dns_private", "metadata_dns_http", {}, {}))
+                self.assertFalse(result.success)
+                self.assertEqual(result.failure_type, "invalid_input")
+                self.assertIn("allow_private_network", result.content)
+            finally:
+                gateway.CONFIG_PATH = old_config
+
+    def test_http_action_redirect_to_private_network_requires_admin_opt_in(self):
+        from src.gateway_http_actions import _HttpActionRedirectHandler
+
+        handler = _HttpActionRedirectHandler({})
+        req = urllib.request.Request("https://safe.example.test/start")
+        with self.assertRaises(Exception) as cm:
+            handler.redirect_request(req, None, 302, "Found", {}, "http://127.0.0.1:9/metadata")
+        self.assertEqual(getattr(cm.exception, "failure_type", None), "invalid_input")
+        self.assertIn("allow_private_network", str(cm.exception))
+
+    def test_webfetch_private_network_url_requires_admin_opt_in(self):
+        result = _execute_tool_call(ToolCall("webfetch-private", "WebFetch", {"url": "http://127.0.0.1:9/metadata"}, {}))
+        self.assertFalse(result.success)
+        self.assertEqual(result.failure_type, "invalid_input")
+        self.assertIn("allow_private_network", result.content)
+
+    def test_webfetch_dns_private_target_requires_admin_opt_in(self):
+        with patch(
+            "src.gateway_http_actions.socket.getaddrinfo",
+            return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", 80))],
+        ):
+            result = _execute_tool_call(
+                ToolCall("webfetch-dns-private", "WebFetch", {"url": "http://metadata.example.test/metadata"}, {})
+            )
+        self.assertFalse(result.success)
+        self.assertEqual(result.failure_type, "invalid_input")
+        self.assertIn("allow_private_network", result.content)
+
+    def test_websearch_private_search_url_requires_admin_opt_in(self):
+        result = _execute_tool_call(
+            ToolCall(
+                "websearch-private",
+                "WebSearch",
+                {"query": "metadata", "search_url": "http://127.0.0.1:9/search"},
+                {},
+            )
+        )
+        self.assertFalse(result.success)
+        self.assertEqual(result.failure_type, "invalid_input")
+        self.assertIn("allow_private_network", result.content)
 
     def test_streaming_chat_request_returns_sse_without_upstream_stream_in_orchestrate_mode(self):
         class UpstreamHandler(BaseHTTPRequestHandler):
@@ -4365,6 +7655,73 @@ while True:
                     os.environ["GATEWAY_UPSTREAM_STREAM_AGGREGATE"] = old_force
 
 
+    def test_conversation_memory_store_migrates_and_indexes_remote_scope(self):
+        import sqlite3
+        from src.gateway_context import _sqlite_insert_memory, _sqlite_recall_memories, _sqlite_tail_memories
+
+        with tempfile.TemporaryDirectory() as td:
+            old_ready = gateway.SQLITE_READY
+            old_sqlite = os.environ.get("GATEWAY_SQLITE_LOG_PATH")
+            db_path = pathlib.Path(td) / "memory.sqlite3"
+            os.environ["GATEWAY_SQLITE_LOG_PATH"] = str(db_path)
+            gateway.SQLITE_READY = False
+            legacy_session = "tenant:user-a:session:session-a"
+            legacy_workspace = "/client/workspace-a"
+            try:
+                with sqlite3.connect(db_path) as con:
+                    con.execute(
+                        """
+                        CREATE TABLE conversation_memories (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            ts TEXT NOT NULL,
+                            session_key TEXT NOT NULL,
+                            workspace_root TEXT NOT NULL,
+                            kind TEXT NOT NULL,
+                            summary TEXT NOT NULL,
+                            keywords_json TEXT NOT NULL DEFAULT '[]',
+                            source_request_id TEXT,
+                            importance INTEGER NOT NULL DEFAULT 1,
+                            last_used_at TEXT
+                        )
+                        """
+                    )
+                    con.execute(
+                        """
+                        INSERT INTO conversation_memories
+                            (ts, session_key, workspace_root, kind, summary, keywords_json, source_request_id, importance, last_used_at)
+                        VALUES ('2026-01-01T00:00:00+00:00', ?, ?, 'conversation_turn', 'legacy gateway memory', '["gateway"]', NULL, 3, NULL)
+                        """,
+                        (legacy_session, legacy_workspace),
+                    )
+
+                recalled = _sqlite_recall_memories(legacy_session, legacy_workspace, ["gateway"], 5)
+                self.assertEqual(len(recalled), 1)
+                self.assertIn("legacy gateway memory", recalled[0]["summary"])
+
+                _sqlite_insert_memory(
+                    "tenant:user-b:session:session-b",
+                    "/client/workspace-b",
+                    "session_rollup",
+                    "new indexed rollup",
+                    ["rollup"],
+                    None,
+                    5,
+                )
+                tail = _sqlite_tail_memories(10)
+                indexed_new = next(item for item in tail if item["summary"] == "new indexed rollup")
+                self.assertEqual(indexed_new["tenant_key"], "user-b")
+                self.assertEqual(indexed_new["workspace_key"], "/client/workspace-b")
+                self.assertEqual(indexed_new["memory_session_key"], "session:session-b")
+                indexed_legacy = next(item for item in tail if item["summary"] == "legacy gateway memory")
+                self.assertEqual(indexed_legacy["tenant_key"], "user-a")
+                self.assertEqual(indexed_legacy["workspace_key"], legacy_workspace)
+            finally:
+                gateway.SQLITE_READY = old_ready
+                if old_sqlite is None:
+                    os.environ.pop("GATEWAY_SQLITE_LOG_PATH", None)
+                else:
+                    os.environ["GATEWAY_SQLITE_LOG_PATH"] = old_sqlite
+
     def test_conversation_memory_recalls_same_session_workspace_only(self):
         with tempfile.TemporaryDirectory() as td:
             old_config = gateway.CONFIG_PATH
@@ -4374,7 +7731,10 @@ while True:
             os.environ["GATEWAY_SQLITE_LOG_PATH"] = str(pathlib.Path(td) / "memory.sqlite3")
             gateway.SQLITE_READY = False
             try:
+                workspace = pathlib.Path(td) / "client-workspace"
+                workspace.mkdir()
                 cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = str(workspace)
                 cfg["context"]["memory_enabled"] = True
                 cfg["context"]["memory_summary_max_chars"] = 500
                 cfg["context"]["memory_recall_limit"] = 5
@@ -4418,6 +7778,124 @@ while True:
                 else:
                     os.environ["GATEWAY_SQLITE_LOG_PATH"] = old_sqlite
 
+    def test_responses_conversation_memory_is_injected_into_input(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_ready = gateway.SQLITE_READY
+            old_sqlite = os.environ.get("GATEWAY_SQLITE_LOG_PATH")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_SQLITE_LOG_PATH"] = str(pathlib.Path(td) / "memory.sqlite3")
+            gateway.SQLITE_READY = False
+            try:
+                workspace = pathlib.Path(td) / "client-workspace"
+                workspace.mkdir()
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = str(workspace)
+                cfg["context"]["memory_enabled"] = True
+                cfg["context"]["memory_summary_max_chars"] = 500
+                cfg["context"]["memory_recall_limit"] = 5
+                cfg["upstream"]["tools_enabled"] = "off"
+                cfg["gateway"]["local_planner_enabled"] = False
+                gateway.save_config(cfg)
+
+                metadata = {"session_id": "responses-memory-session", "user_id": json.dumps({"user_id": "responses-user"})}
+                first_client = FakeClient([{"choices": [{"message": {"role": "assistant", "content": "Recorded Responses API decision."}}]}])
+                run_tool_orchestration(
+                    "/v1/responses",
+                    {"model": "m", "metadata": metadata, "input": "Remember Responses API uses client workspace memory marker ALPHA-RSP"},
+                    first_client,
+                )
+
+                recall_client = FakeClient([{"choices": [{"message": {"role": "assistant", "content": "Using Responses recalled memory."}}]}])
+                run_tool_orchestration(
+                    "/v1/responses",
+                    {"model": "m", "metadata": metadata, "input": "What Responses API marker did we record?"},
+                    recall_client,
+                )
+                sent = recall_client.requests[0][1]
+                serialized = json.dumps(sent, ensure_ascii=False)
+                self.assertIn("Gateway recalled memory", serialized)
+                self.assertIn("ALPHA-RSP", serialized)
+                self.assertIn("messages", sent)
+            finally:
+                gateway.CONFIG_PATH = old_config
+                gateway.SQLITE_READY = old_ready
+                if old_sqlite is None:
+                    os.environ.pop("GATEWAY_SQLITE_LOG_PATH", None)
+                else:
+                    os.environ["GATEWAY_SQLITE_LOG_PATH"] = old_sqlite
+
+    def test_streaming_responses_conversation_memory_is_injected_before_upstream(self):
+        from src.gateway_context import _context_config
+        from src.gateway_streaming import _run_streaming_orchestration_scoped
+
+        events = []
+
+        class FakeHandler:
+            class wfile:
+                @staticmethod
+                def write(data):
+                    events.append(data.decode("utf-8") if isinstance(data, bytes) else data)
+
+                @staticmethod
+                def flush():
+                    pass
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_ready = gateway.SQLITE_READY
+            old_sqlite = os.environ.get("GATEWAY_SQLITE_LOG_PATH")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_SQLITE_LOG_PATH"] = str(pathlib.Path(td) / "memory.sqlite3")
+            gateway.SQLITE_READY = False
+            try:
+                workspace = pathlib.Path(td) / "client-workspace"
+                workspace.mkdir()
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = str(workspace)
+                cfg["context"]["memory_enabled"] = True
+                cfg["context"]["memory_summary_max_chars"] = 500
+                cfg["context"]["memory_recall_limit"] = 5
+                cfg["gateway"]["local_planner_enabled"] = False
+                cfg["upstream"]["tools_enabled"] = "off"
+                cfg["upstream"]["protocol"] = "openai_chat"
+                gateway.save_config(cfg)
+
+                metadata = {"session_id": "stream-responses-memory", "user_id": json.dumps({"user_id": "stream-rsp-user"})}
+                first_client = FakeClient([{"choices": [{"message": {"role": "assistant", "content": "Recorded STREAM-RSP-MARKER."}}]}])
+                run_tool_orchestration(
+                    "/v1/responses",
+                    {"model": "m", "workspace_root": str(workspace), "metadata": metadata, "input": "Remember streaming responses marker STREAM-RSP-MARKER"},
+                    first_client,
+                )
+
+                upstream = FakeClient([{"choices": [{"message": {"role": "assistant", "content": "Streaming recall used memory."}, "finish_reason": "stop"}]}])
+                _run_streaming_orchestration_scoped(
+                    FakeHandler(),
+                    "/v1/responses",
+                    {"model": "m", "workspace_root": str(workspace), "metadata": metadata, "input": "What streaming responses marker did we record?", "stream": True},
+                    mode="orchestrate",
+                    upstream_protocol="openai_chat",
+                    gateway_cfg=cfg["gateway"],
+                    max_rounds=4,
+                    upstream=upstream,
+                    context_cfg=_context_config(),
+                )
+
+                self.assertTrue(upstream.requests)
+                sent = upstream.requests[0][1]
+                serialized = json.dumps(sent, ensure_ascii=False)
+                self.assertIn("Gateway recalled memory", serialized)
+                self.assertIn("STREAM-RSP-MARKER", serialized)
+                self.assertIn("Streaming recall used memory", "".join(events))
+            finally:
+                gateway.CONFIG_PATH = old_config
+                gateway.SQLITE_READY = old_ready
+                if old_sqlite is None:
+                    os.environ.pop("GATEWAY_SQLITE_LOG_PATH", None)
+                else:
+                    os.environ["GATEWAY_SQLITE_LOG_PATH"] = old_sqlite
+
     def test_conversation_memory_compacts_huge_turns_in_sqlite(self):
         with tempfile.TemporaryDirectory() as td:
             old_config = gateway.CONFIG_PATH
@@ -4443,6 +7921,59 @@ while True:
                 self.assertEqual(len(memories), 1)
                 self.assertLessEqual(len(memories[0]["summary"]), 900)
                 self.assertIn("gateway context compacted", memories[0]["summary"])
+            finally:
+                gateway.CONFIG_PATH = old_config
+                gateway.SQLITE_READY = old_ready
+                if old_sqlite is None:
+                    os.environ.pop("GATEWAY_SQLITE_LOG_PATH", None)
+                else:
+                    os.environ["GATEWAY_SQLITE_LOG_PATH"] = old_sqlite
+
+    def test_conversation_memory_periodic_rollup_is_recalled(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_ready = gateway.SQLITE_READY
+            old_sqlite = os.environ.get("GATEWAY_SQLITE_LOG_PATH")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_SQLITE_LOG_PATH"] = str(pathlib.Path(td) / "memory.sqlite3")
+            gateway.SQLITE_READY = False
+            try:
+                cfg = gateway._default_config()
+                cfg["context"]["memory_enabled"] = True
+                cfg["context"]["memory_rollup_every_turns"] = 2
+                cfg["context"]["memory_rollup_max_chars"] = 1200
+                cfg["context"]["memory_inject_max_chars"] = 4000
+                cfg["gateway"]["local_planner_enabled"] = False
+                gateway.save_config(cfg)
+
+                base_body = {"model": "m", "metadata": {"session_id": "rollup-session"}}
+                first_client = FakeClient([
+                    {"choices": [{"message": {"role": "assistant", "content": "Alpha decision recorded."}}]},
+                    {"choices": [{"message": {"role": "assistant", "content": "Beta decision recorded."}}]},
+                ])
+                for text in ("Remember alpha architecture decision", "Remember beta test decision"):
+                    body = dict(base_body)
+                    body["messages"] = [{"role": "user", "content": text}]
+                    run_tool_orchestration("/v1/chat/completions", body, first_client)
+
+                memories = gateway._sqlite_tail_memories(10)
+                rollups = [mem for mem in memories if mem["kind"] == "session_rollup"]
+                self.assertEqual(len(rollups), 1)
+                self.assertIn("Periodic conversation summary", rollups[0]["summary"])
+                self.assertIn("alpha", rollups[0]["summary"].lower())
+                self.assertIn("beta", rollups[0]["summary"].lower())
+
+                recall_client = FakeClient([
+                    {"choices": [{"message": {"role": "assistant", "content": "Using recalled rollup."}}]},
+                ])
+                recall_body = dict(base_body)
+                recall_body["messages"] = [{"role": "user", "content": "What did we decide earlier?"}]
+                run_tool_orchestration("/v1/chat/completions", recall_body, recall_client)
+                sent = recall_client.requests[0][1]
+                serialized = json.dumps(sent["messages"], ensure_ascii=False)
+                self.assertIn("Periodic conversation summary", serialized)
+                self.assertIn("alpha", serialized.lower())
+                self.assertIn("beta", serialized.lower())
             finally:
                 gateway.CONFIG_PATH = old_config
                 gateway.SQLITE_READY = old_ready
@@ -4480,9 +8011,9 @@ while True:
                 self.assertIn("42", parallel["content"])
                 self.assertIn("tools", parallel["content"])
 
-                memory = execute_direct_tool_call({"tool": "SaveMemory", "arguments": {"action": "write", "summary": "top tool aliases verified", "keywords": ["top-tools"]}})
+                memory = execute_direct_tool_call({"workspace_root": td, "tool": "SaveMemory", "arguments": {"action": "write", "summary": "top tool aliases verified", "keywords": ["top-tools"]}})
                 self.assertTrue(memory["success"])
-                recalled = execute_direct_tool_call({"tool": "RecallMemory", "arguments": {"action": "list", "limit": 5}})
+                recalled = execute_direct_tool_call({"workspace_root": td, "tool": "RecallMemory", "arguments": {"action": "list", "limit": 5}})
                 self.assertTrue(recalled["success"])
                 self.assertIn("top tool aliases verified", recalled["content"])
 
@@ -4761,6 +8292,77 @@ class AnthropicSSEFormatTests(unittest.TestCase):
         self.assertIn('"stop_reason"', all_text)
 
 
+    def test_streaming_entry_sets_remote_runtime_scope_from_request_body(self):
+        from src.gateway_streaming import run_streaming_orchestration
+        from src.gateway_builtin_tools import _runtime_scope_key, _workspace_root
+
+        events = []
+
+        class FakeHandler:
+            class wfile:
+                @staticmethod
+                def write(data):
+                    events.append(data.decode("utf-8") if isinstance(data, bytes) else data)
+
+                @staticmethod
+                def flush():
+                    pass
+
+            def send_response(self, status):
+                events.append(f"STATUS:{status}\n")
+
+            def send_header(self, key, value):
+                events.append(f"HEADER:{key}:{value}\n")
+
+            def end_headers(self):
+                events.append("END_HEADERS\n")
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_mode = os.environ.get("GATEWAY_TOOL_MODE")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            captured = {}
+            try:
+                workspace = pathlib.Path(td) / "client-workspace"
+                workspace.mkdir()
+                os.environ.pop("GATEWAY_TOOL_MODE", None)
+                cfg = gateway._default_config()
+                cfg["gateway"]["tool_mode"] = "orchestrate"
+                gateway.save_config(cfg)
+
+                def fake_scoped(*args, **kwargs):
+                    captured["scope"] = _runtime_scope_key()
+                    captured["workspace"] = str(_workspace_root())
+
+                with patch("src.gateway_streaming._run_streaming_orchestration_scoped", side_effect=fake_scoped):
+                    run_streaming_orchestration(
+                        FakeHandler(),
+                        "/v1/chat/completions",
+                        {
+                            "model": "m",
+                            "stream": True,
+                            "workspace_root": str(workspace),
+                            "metadata": {
+                                "session_id": "stream-session",
+                                "user_id": json.dumps({"user_id": "stream-user"}),
+                            },
+                            "messages": [{"role": "user", "content": "hi"}],
+                        },
+                    )
+
+                self.assertEqual(captured["workspace"], str(workspace.resolve()))
+                self.assertIn("tenant:stream-user", captured["scope"])
+                self.assertIn("session:stream-session", captured["scope"])
+                self.assertIn("workspace:", captured["scope"])
+                self.assertNotIn("workspace:no-workspace", captured["scope"])
+            finally:
+                gateway.CONFIG_PATH = old_config
+                if old_mode is None:
+                    os.environ.pop("GATEWAY_TOOL_MODE", None)
+                else:
+                    os.environ["GATEWAY_TOOL_MODE"] = old_mode
+
+
     def test_streaming_adapter_direct_file_read_surfaces_downstream_tool_without_upstream(self):
         from src.gateway_streaming import run_streaming_orchestration
 
@@ -4834,6 +8436,81 @@ class AnthropicSSEFormatTests(unittest.TestCase):
                 else:
                     os.environ["GATEWAY_TOOL_MODE"] = old_mode
 
+    def test_streaming_text_tool_fallback_surfaces_declared_user_side_tool(self):
+        from src.gateway_streaming import run_streaming_orchestration
+
+        events = []
+
+        class FakeHandler:
+            class wfile:
+                @staticmethod
+                def write(data):
+                    events.append(data.decode("utf-8") if isinstance(data, bytes) else data)
+
+                @staticmethod
+                def flush():
+                    pass
+
+            def send_response(self, status):
+                events.append(f"STATUS:{status}\n")
+
+            def send_header(self, key, value):
+                events.append(f"HEADER:{key}:{value}\n")
+
+            def end_headers(self):
+                events.append("END_HEADERS\n")
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_mode = os.environ.get("GATEWAY_TOOL_MODE")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                os.environ.pop("GATEWAY_TOOL_MODE", None)
+                cfg = gateway._default_config()
+                cfg["gateway"]["tool_mode"] = "orchestrate"
+                cfg["upstream"]["protocol"] = "openai_chat"
+                cfg["upstream"]["tools_enabled"] = "adapter"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                gateway.save_config(cfg)
+                client = FakeClient([
+                    {
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": "<function=Bash>\n<parameter=command>pwd</parameter>\n</function>",
+                            },
+                            "finish_reason": "stop",
+                        }]
+                    }
+                ])
+                with patch("src.gateway_proxy.NativeProxyClient", return_value=client):
+                    run_streaming_orchestration(
+                        FakeHandler(),
+                        "/v1/chat/completions",
+                        {
+                            "model": "m",
+                            "stream": True,
+                            "messages": [{"role": "user", "content": "Please continue."}],
+                            "tools": [{"type": "function", "function": {"name": "Bash", "parameters": {"type": "object"}}}],
+                        },
+                    )
+
+                text = "".join(events)
+                self.assertEqual(len(client.requests), 1)
+                self.assertIn('"tool_calls"', text)
+                self.assertIn('"name": "Bash"', text)
+                self.assertIn('\\"command\\": \\"pwd\\"', text)
+                self.assertIn('"finish_reason": "tool_calls"', text)
+                self.assertNotIn("event: error", text)
+                self.assertNotIn("tool_start", text)
+            finally:
+                gateway.CONFIG_PATH = old_config
+                if old_mode is None:
+                    os.environ.pop("GATEWAY_TOOL_MODE", None)
+                else:
+                    os.environ["GATEWAY_TOOL_MODE"] = old_mode
+
     def test_streaming_adapter_explicit_bash_request_surfaces_downstream_tool(self):
         from src.gateway_streaming import run_streaming_orchestration
 
@@ -4894,6 +8571,9 @@ class AnthropicSSEFormatTests(unittest.TestCase):
                 self.assertIn('"name": "Bash"', text)
                 self.assertIn("printf STREAM-BASH-OK", text)
                 self.assertIn('"stop_reason": "tool_use"', text)
+                self.assertIn('"gateway_context"', text)
+                self.assertIn('"intent": {"kind": "shell_command"', text)
+                self.assertIn('"workflow": "generic_tool"', text)
                 self.assertNotIn("event: error", text)
                 self.assertIn("message_stop", text)
             finally:
@@ -4976,6 +8656,740 @@ class AnthropicSSEFormatTests(unittest.TestCase):
                 else:
                     os.environ["GATEWAY_WORKSPACE_ROOT"] = old_workspace_root
 
+    def test_streaming_gateway_owned_http_action_preexecutes_before_upstream(self):
+        from src.gateway_streaming import run_streaming_orchestration
+
+        class WeatherHandler(BaseHTTPRequestHandler):
+            seen = []
+
+            def log_message(self, fmt, *args):
+                return
+
+            def do_GET(self):  # noqa: N802
+                parsed = urllib.parse.urlparse(self.path)
+                WeatherHandler.seen.append(urllib.parse.parse_qs(parsed.query))
+                payload = b'{"temp_c":21,"condition":"sunny"}'
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        events = []
+
+        class FakeHandler:
+            class wfile:
+                @staticmethod
+                def write(data):
+                    events.append(data.decode("utf-8") if isinstance(data, bytes) else data)
+
+                @staticmethod
+                def flush():
+                    pass
+
+            def send_response(self, status):
+                events.append(f"STATUS:{status}\n")
+
+            def send_header(self, key, value):
+                events.append(f"HEADER:{key}:{value}\n")
+
+            def end_headers(self):
+                events.append("END_HEADERS\n")
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_mode = os.environ.get("GATEWAY_TOOL_MODE")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), WeatherHandler)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                os.environ.pop("GATEWAY_TOOL_MODE", None)
+                cfg = gateway._default_config()
+                cfg["gateway"]["tool_mode"] = "orchestrate"
+                cfg["upstream"]["protocol"] = "openai_chat"
+                cfg["upstream"]["tools_enabled"] = "adapter"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                cfg["http_actions"] = {
+                    "enabled": True,
+                    "actions": [{
+                        "name": "get_weather",
+                        "description": "Get current weather",
+                        "method": "GET",
+                        "url": f"http://127.0.0.1:{httpd.server_address[1]}/weather",
+                        "allow_private_network": True,
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"],
+                        },
+                    }],
+                }
+                gateway.save_config(cfg)
+                client = FakeClient([
+                    {"choices": [{"message": {"role": "assistant", "content": "Shanghai weather is sunny, 21C."}, "finish_reason": "stop"}]},
+                ])
+                with patch("src.gateway_proxy.NativeProxyClient", return_value=client):
+                    run_streaming_orchestration(
+                        FakeHandler(),
+                        "/v1/chat/completions",
+                        {
+                            "model": "m",
+                            "stream": True,
+                            "messages": [{"role": "user", "content": "Weather in Shanghai?"}],
+                        },
+                    )
+
+                self.assertEqual(WeatherHandler.seen[0]["city"], ["Shanghai"])
+                self.assertEqual(len(client.requests), 1)
+                self.assertIn("temp_c", client.requests[0][1]["messages"][-1]["content"])
+                self.assertNotIn("tools", client.requests[0][1])
+                text = "".join(events)
+                self.assertIn("Shanghai weather is sunny, 21C.", text)
+                self.assertIn("[DONE]", text)
+                self.assertNotIn("event: error", text)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
+                gateway.CONFIG_PATH = old_config
+                if old_mode is None:
+                    os.environ.pop("GATEWAY_TOOL_MODE", None)
+                else:
+                    os.environ["GATEWAY_TOOL_MODE"] = old_mode
+
+    def test_streaming_gateway_owned_builtin_calculator_preexecutes_before_upstream(self):
+        from src.gateway_streaming import run_streaming_orchestration
+        from src.gateway_agent_planner import list_runtime_events
+
+        events = []
+
+        class FakeHandler:
+            class wfile:
+                @staticmethod
+                def write(data):
+                    events.append(data.decode("utf-8") if isinstance(data, bytes) else data)
+
+                @staticmethod
+                def flush():
+                    pass
+
+            def send_response(self, status):
+                events.append(f"STATUS:{status}\n")
+
+            def send_header(self, key, value):
+                events.append(f"HEADER:{key}:{value}\n")
+
+            def end_headers(self):
+                events.append("END_HEADERS\n")
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_mode = os.environ.get("GATEWAY_TOOL_MODE")
+            old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+            planner = None
+            try:
+                import src.gateway_agent_planner as planner
+                planner._STORE = None
+                os.environ.pop("GATEWAY_TOOL_MODE", None)
+                cfg = gateway._default_config()
+                cfg["gateway"]["tool_mode"] = "orchestrate"
+                cfg["upstream"]["protocol"] = "openai_chat"
+                cfg["upstream"]["tools_enabled"] = "adapter"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                gateway.save_config(cfg)
+                client = FakeClient([
+                    {"choices": [{"message": {"role": "assistant", "content": "The result is 42."}, "finish_reason": "stop"}]},
+                ])
+                with patch("src.gateway_proxy.NativeProxyClient", return_value=client):
+                    run_streaming_orchestration(
+                        FakeHandler(),
+                        "/v1/chat/completions",
+                        {
+                            "model": "m",
+                            "stream": True,
+                            "metadata": {
+                                "session_id": "stream-client-calc-session",
+                                "user_id": json.dumps({"user_id": "stream-client-calc-user"}),
+                            },
+                            "messages": [{"role": "user", "content": "Calculate 6*7 for me"}],
+                        },
+                        client_id="stream-client-key",
+                    )
+
+                self.assertEqual(len(client.requests), 1)
+                sent = client.requests[0][1]
+                self.assertIn("42", sent["messages"][-1]["content"])
+                self.assertNotIn("gateway_context", sent)
+                self.assertNotIn("gateway_agent_planner", sent)
+                self.assertNotIn("tools", sent)
+                text = "".join(events)
+                self.assertIn("The result is 42.", text)
+                self.assertIn('"gateway_context"', text)
+                self.assertIn('"tool": "calculator"', text)
+                self.assertIn("[DONE]", text)
+                self.assertNotIn("event: error", text)
+                runtime_events = list_runtime_events(
+                    10,
+                    tenant_contains="stream-client-calc-user",
+                    event_type="gateway_tool_execute",
+                )
+                self.assertEqual(len(runtime_events), 1)
+                self.assertTrue(runtime_events[0]["metadata"]["client_id_present"])
+            finally:
+                gateway.CONFIG_PATH = old_config
+                if old_mode is None:
+                    os.environ.pop("GATEWAY_TOOL_MODE", None)
+                else:
+                    os.environ["GATEWAY_TOOL_MODE"] = old_mode
+                if old_runtime is None:
+                    os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+                else:
+                    os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+                if planner is not None:
+                    planner._STORE = None
+
+    def test_streaming_configured_mcp_tool_preexecutes_without_request_tools(self):
+        from src.gateway_streaming import run_streaming_orchestration
+
+        events = []
+
+        class FakeHandler:
+            class wfile:
+                @staticmethod
+                def write(data):
+                    events.append(data.decode("utf-8") if isinstance(data, bytes) else data)
+
+                @staticmethod
+                def flush():
+                    pass
+
+            def send_response(self, status):
+                events.append(f"STATUS:{status}\n")
+
+            def send_header(self, key, value):
+                events.append(f"HEADER:{key}:{value}\n")
+
+            def end_headers(self):
+                events.append("END_HEADERS\n")
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_mode = os.environ.get("GATEWAY_TOOL_MODE")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                os.environ.pop("GATEWAY_TOOL_MODE", None)
+                cfg = gateway._default_config()
+                cfg["gateway"]["tool_mode"] = "orchestrate"
+                cfg["upstream"]["protocol"] = "openai_chat"
+                cfg["upstream"]["tools_enabled"] = "adapter"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                gateway.save_config(cfg)
+                client = FakeClient([
+                    {"choices": [{"message": {"role": "assistant", "content": "MCP streaming final ok."}, "finish_reason": "stop"}]},
+                ])
+                with patch("src.gateway_proxy.NativeProxyClient", return_value=client), \
+                    patch("src.gateway_tool_runtime._enabled_mcp_servers", return_value=[{"name": "test", "enabled": True}]), \
+                    patch("src.gateway_tool_runtime._mcp_list_server_tools", return_value=[{
+                        "name": "echo_mcp",
+                        "description": "Echo via MCP",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"value": {"type": "string"}},
+                            "required": ["value"],
+                        },
+                    }]), \
+                    patch("src.gateway_tool_runtime._mcp_server_by_name", return_value={"name": "test"}), \
+                    patch("src.gateway_tool_runtime._mcp_call_tool", side_effect=lambda _server, _tool, args: "mcp:" + str(args.get("value", ""))):
+                    run_streaming_orchestration(
+                        FakeHandler(),
+                        "/v1/chat/completions",
+                        {
+                            "model": "m",
+                            "stream": True,
+                            "messages": [{"role": "user", "content": "Echo via MCP value ok"}],
+                        },
+                    )
+
+                self.assertEqual(len(client.requests), 1)
+                sent = client.requests[0][1]
+                self.assertIn("mcp:Echo via MCP value ok", sent["messages"][-1]["content"])
+                self.assertNotIn("tools", sent)
+                text = "".join(events)
+                self.assertIn("MCP streaming final ok.", text)
+                self.assertIn("[DONE]", text)
+                self.assertNotIn("event: error", text)
+            finally:
+                gateway.CONFIG_PATH = old_config
+                if old_mode is None:
+                    os.environ.pop("GATEWAY_TOOL_MODE", None)
+                else:
+                    os.environ["GATEWAY_TOOL_MODE"] = old_mode
+
+    def test_streaming_agent_planner_multiround_project_analysis_surfaces_next_tools(self):
+        from src.gateway_streaming import run_streaming_orchestration
+
+        def run_once(body):
+            events = []
+
+            class FakeHandler:
+                class wfile:
+                    @staticmethod
+                    def write(data):
+                        events.append(data.decode("utf-8") if isinstance(data, bytes) else data)
+
+                    @staticmethod
+                    def flush():
+                        pass
+
+                def send_response(self, status):
+                    events.append(f"STATUS:{status}\n")
+
+                def send_header(self, key, value):
+                    events.append(f"HEADER:{key}:{value}\n")
+
+                def end_headers(self):
+                    events.append("END_HEADERS\n")
+
+            run_streaming_orchestration(FakeHandler(), "/v1/messages", body)
+            return "".join(events)
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_mode = os.environ.get("GATEWAY_TOOL_MODE")
+            old_workspace_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            old_project = os.environ.get("GATEWAY_CODEBASE_MEMORY_PROJECT")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                workspace = pathlib.Path(td) / "workspace"
+                workspace.mkdir()
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = str(workspace)
+                os.environ["GATEWAY_CODEBASE_MEMORY_PROJECT"] = "Users-sanbo-Desktop-ai_tool_functioncall"
+                os.environ.pop("GATEWAY_TOOL_MODE", None)
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = str(workspace)
+                cfg["gateway"]["tool_mode"] = "orchestrate"
+                cfg["upstream"]["tools_enabled"] = "adapter"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                gateway.save_config(cfg)
+
+                base_tools = [{
+                    "name": "Skill",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"skill": {"type": "string"}, "args": {"type": "string"}},
+                        "required": ["skill"],
+                        "additionalProperties": False,
+                    },
+                }, {
+                    "name": "mcp__codebase_memory_mcp__search_graph",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"project": {"type": "string"}, "query": {"type": "string"}},
+                        "required": ["project", "query"],
+                        "additionalProperties": False,
+                    },
+                }]
+                user_text = f"分析这套项目 streaming planner {uuid.uuid4().hex}"
+                first = run_once({
+                    "model": "m",
+                    "stream": True,
+                    "messages": [
+                        {"role": "system", "content": "Available skills:\n- codebase-onboarding"},
+                        {"role": "user", "content": user_text},
+                    ],
+                    "tools": base_tools,
+                    "max_tokens": 256,
+                })
+                self.assertIn('"type": "tool_use"', first)
+                self.assertIn('"name": "Skill"', first)
+                self.assertIn("codebase-onboarding", first)
+                self.assertIn('"stop_reason": "tool_use"', first)
+                self.assertNotIn("event: error", first)
+
+                second = run_once({
+                    "model": "m",
+                    "stream": True,
+                    "messages": [
+                        {"role": "system", "content": "Available skills:\n- codebase-onboarding"},
+                        {"role": "user", "content": user_text},
+                        {"role": "assistant", "content": [
+                            {"type": "tool_use", "id": "planner_codebase_onboarding_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "name": "Skill", "input": {"skill": "codebase-onboarding"}},
+                        ]},
+                        {"role": "user", "content": [
+                            {"type": "tool_result", "tool_use_id": "planner_codebase_onboarding_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "content": "Successfully loaded skill"},
+                        ]},
+                    ],
+                    "tools": base_tools,
+                    "max_tokens": 256,
+                })
+                self.assertIn('"type": "tool_use"', second)
+                self.assertIn('"name": "mcp__codebase_memory_mcp__search_graph"', second)
+                self.assertIn("Users-sanbo-Desktop-ai_tool_functioncall", second)
+                self.assertIn("architecture", second)
+                self.assertIn('"stop_reason": "tool_use"', second)
+                self.assertNotIn("event: error", second)
+
+                third = run_once({
+                    "model": "m",
+                    "stream": True,
+                    "messages": [
+                        {"role": "system", "content": "Available skills:\n- codebase-onboarding"},
+                        {"role": "user", "content": user_text},
+                        {"role": "assistant", "content": [
+                            {"type": "tool_use", "id": "planner_codebase_onboarding_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "name": "Skill", "input": {"skill": "codebase-onboarding"}},
+                        ]},
+                        {"role": "user", "content": [
+                            {"type": "tool_result", "tool_use_id": "planner_codebase_onboarding_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "content": "Successfully loaded skill"},
+                        ]},
+                        {"role": "assistant", "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "planner_project_structure_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                                "name": "mcp__codebase_memory_mcp__search_graph",
+                                "input": {"project": "Users-sanbo-Desktop-ai_tool_functioncall", "query": "project architecture"},
+                            },
+                        ]},
+                        {"role": "user", "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "planner_project_structure_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                                "content": "Architecture: gateway_http_handler -> gateway_tool_runtime",
+                            },
+                        ]},
+                    ],
+                    "tools": base_tools,
+                    "max_tokens": 256,
+                })
+                self.assertIn('"type": "tool_use"', third)
+                self.assertIn('"name": "mcp__codebase_memory_mcp__search_graph"', third)
+                self.assertIn("request flow", third)
+                self.assertIn('"stop_reason": "tool_use"', third)
+                self.assertNotIn("event: error", third)
+            finally:
+                gateway.CONFIG_PATH = old_config
+                if old_mode is None:
+                    os.environ.pop("GATEWAY_TOOL_MODE", None)
+                else:
+                    os.environ["GATEWAY_TOOL_MODE"] = old_mode
+                if old_workspace_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_workspace_root
+                if old_project is None:
+                    os.environ.pop("GATEWAY_CODEBASE_MEMORY_PROJECT", None)
+                else:
+                    os.environ["GATEWAY_CODEBASE_MEMORY_PROJECT"] = old_project
+
+    def test_streaming_agent_planner_evidence_survives_context_compaction(self):
+        from src.gateway_streaming import _run_streaming_orchestration_scoped
+
+        events = []
+
+        class FakeHandler:
+            class wfile:
+                @staticmethod
+                def write(data):
+                    events.append(data.decode("utf-8") if isinstance(data, bytes) else data)
+
+                @staticmethod
+                def flush():
+                    pass
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_cwd = os.getcwd()
+            old_workspace_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            try:
+                workspace = pathlib.Path(td) / "workspace"
+                workspace.mkdir()
+                os.chdir(workspace)
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = str(workspace)
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = str(workspace)
+                cfg["gateway"]["tool_mode"] = "orchestrate"
+                cfg["upstream"]["tools_enabled"] = "adapter"
+                cfg["upstream"]["protocol"] = "openai_chat"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                gateway.save_config(cfg)
+
+                upstream = FakeClient([{
+                    "id": "c_stream",
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "stream final synthesis"},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                }])
+                body = {
+                    "model": "weak",
+                    "stream": True,
+                    "messages": [
+                        {"role": "system", "content": "large streaming harness\n" + ("STREAM-CONTEXT " * 1000)},
+                        {"role": "user", "content": "分析这套项目\n" + ("user context " * 1000)},
+                        {"role": "assistant", "content": [
+                            {"type": "tool_use", "id": "bash_1", "name": "Bash", "input": {"command": "find ."}},
+                        ]},
+                        {"role": "user", "content": [
+                            {"type": "tool_result", "tool_use_id": "bash_1", "content": "--- files ---\nREADME.md\nsrc/streaming_agent.py\n"},
+                        ]},
+                    ],
+                    "tools": [{
+                        "name": "Bash",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"command": {"type": "string"}},
+                            "required": ["command"],
+                            "additionalProperties": False,
+                        },
+                    }],
+                    "max_tokens": 256,
+                }
+
+                _run_streaming_orchestration_scoped(
+                    FakeHandler(),
+                    "/v1/messages",
+                    body,
+                    mode="orchestrate",
+                    upstream_protocol="openai_chat",
+                    gateway_cfg=cfg["gateway"],
+                    max_rounds=4,
+                    upstream=upstream,
+                    context_cfg={
+                        "enabled": True,
+                        "fanout_enabled": False,
+                        "max_input_tokens": 80,
+                        "summary_max_chars": 500,
+                    },
+                )
+
+                self.assertEqual(len(upstream.requests), 1)
+                request_body = upstream.requests[0][1]
+                full_prompt = json.dumps(request_body, ensure_ascii=False)
+                self.assertIn("Gateway Agent Planner evidence", full_prompt)
+                self.assertIn("src/streaming_agent.py", full_prompt)
+                self.assertNotIn("gateway_context", request_body)
+                self.assertNotIn("gateway_agent_planner", request_body)
+                text = "".join(events)
+                self.assertIn("stream final synthesis", text)
+                self.assertIn('"gateway_context"', text)
+                self.assertIn('"compacted": true', text)
+                self.assertIn("message_stop", text)
+                self.assertNotIn("event: error", text)
+            finally:
+                gateway.CONFIG_PATH = old_config
+                os.chdir(old_cwd)
+                if old_workspace_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_workspace_root
+
+    def test_streaming_agent_planner_synthesizes_after_symbol_deep_dive(self):
+        from src.gateway_streaming import _run_streaming_orchestration_scoped
+        from src.gateway_agent_planner import list_runtime_events
+
+        events = []
+
+        class FakeHandler:
+            class wfile:
+                @staticmethod
+                def write(data):
+                    events.append(data.decode("utf-8") if isinstance(data, bytes) else data)
+
+                @staticmethod
+                def flush():
+                    pass
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_cwd = os.getcwd()
+            old_workspace_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            old_project = os.environ.get("GATEWAY_CODEBASE_MEMORY_PROJECT")
+            old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            planner = None
+            try:
+                import src.gateway_agent_planner as planner
+                planner._STORE = None
+                workspace = pathlib.Path(td) / "workspace"
+                workspace.mkdir()
+                os.chdir(workspace)
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = str(workspace)
+                os.environ["GATEWAY_CODEBASE_MEMORY_PROJECT"] = "Users-sanbo-Desktop-ai_tool_functioncall"
+                os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = str(workspace)
+                cfg["gateway"]["tool_mode"] = "orchestrate"
+                cfg["upstream"]["tools_enabled"] = "adapter"
+                cfg["upstream"]["protocol"] = "openai_chat"
+                cfg["upstream"]["capabilities"]["supports_tools"] = False
+                cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+                gateway.save_config(cfg)
+
+                upstream = FakeClient([{
+                    "id": "c_symbol_stream",
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": (
+                                "stream symbol synthesis\n"
+                                "```json\n"
+                                '{"name":"Edit","arguments":{"file_path":"README.md","old_string":"A","new_string":"B"}}'
+                                "\n```"
+                            ),
+                        },
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                }])
+                body = {
+                    "model": "weak",
+                    "stream": True,
+                    "metadata": {
+                        "session_id": "stream-ignored-upstream-tool-session",
+                        "user_id": json.dumps({"user_id": "stream-ignored-upstream-tool-user"}),
+                    },
+                    "messages": [
+                        {"role": "system", "content": "Available skills:\n- codebase-onboarding\n" + ("STREAM-SYMBOL-CONTEXT " * 500)},
+                        {"role": "user", "content": "分析这套项目 streaming symbol final\n" + ("user context " * 500)},
+                        {"role": "assistant", "content": [
+                            {"type": "tool_use", "id": "planner_project_structure_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "name": "mcp__codebase_memory_mcp__search_graph", "input": {"project": "Users-sanbo-Desktop-ai_tool_functioncall", "query": "project architecture"}},
+                        ]},
+                        {"role": "user", "content": [
+                            {"type": "tool_result", "tool_use_id": "planner_project_structure_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "content": "Architecture evidence"},
+                        ]},
+                        {"role": "assistant", "content": [
+                            {"type": "tool_use", "id": "planner_core_flow_trace_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "name": "mcp__codebase_memory_mcp__search_graph", "input": {"project": "Users-sanbo-Desktop-ai_tool_functioncall", "query": "core request flow"}},
+                        ]},
+                        {"role": "user", "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "planner_core_flow_trace_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                                "content": (
+                                    '{"results":[{"qualified_name":'
+                                    '"Users-sanbo-Desktop-ai_tool_functioncall.src.gateway_tool_runtime.run_tool_orchestration"}]}'
+                                ),
+                            },
+                        ]},
+                        {"role": "assistant", "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "planner_symbol_deep_dive_cccccccccccccccccccccccccccccccc",
+                                "name": "mcp__codebase_memory_mcp__get_code_snippet",
+                                "input": {
+                                    "project": "Users-sanbo-Desktop-ai_tool_functioncall",
+                                    "qualified_name": "Users-sanbo-Desktop-ai_tool_functioncall.src.gateway_tool_runtime.run_tool_orchestration",
+                                },
+                            },
+                        ]},
+                        {"role": "user", "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "planner_symbol_deep_dive_cccccccccccccccccccccccccccccccc",
+                                "content": "def run_tool_orchestration(path, body, client=None):\n    return _run_tool_orchestration_scoped(path, body, client)",
+                            },
+                        ]},
+                    ],
+                    "tools": [{
+                        "name": "mcp__codebase_memory_mcp__search_graph",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"project": {"type": "string"}, "query": {"type": "string"}},
+                            "required": ["project", "query"],
+                            "additionalProperties": False,
+                        },
+                    }, {
+                        "name": "mcp__codebase_memory_mcp__get_code_snippet",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"project": {"type": "string"}, "qualified_name": {"type": "string"}},
+                            "required": ["project", "qualified_name"],
+                            "additionalProperties": False,
+                        },
+                    }],
+                    "max_tokens": 256,
+                }
+
+                _run_streaming_orchestration_scoped(
+                    FakeHandler(),
+                    "/v1/messages",
+                    body,
+                    mode="orchestrate",
+                    upstream_protocol="openai_chat",
+                    gateway_cfg=cfg["gateway"],
+                    max_rounds=4,
+                    upstream=upstream,
+                    context_cfg={
+                        "enabled": True,
+                        "fanout_enabled": False,
+                        "max_input_tokens": 120,
+                        "summary_max_chars": 700,
+                    },
+                )
+
+                self.assertEqual(len(upstream.requests), 1)
+                request_body = upstream.requests[0][1]
+                full_prompt = json.dumps(request_body, ensure_ascii=False)
+                self.assertIn("Gateway Agent Planner evidence", full_prompt)
+                self.assertIn("run_tool_orchestration", full_prompt)
+                self.assertIn("symbol_deep_dive", full_prompt)
+                self.assertNotIn("tools", request_body)
+                self.assertNotIn("tool_choice", request_body)
+                self.assertNotIn("gateway_context", request_body)
+                self.assertNotIn("gateway_agent_planner", request_body)
+                text = "".join(events)
+                self.assertIn("stream symbol synthesis", text)
+                self.assertIn('"gateway_context"', text)
+                self.assertIn('"chat_only_synthesis": true', text)
+                self.assertIn('"upstream_tools_stripped": true', text)
+                self.assertIn("message_stop", text)
+                self.assertNotIn('"stop_reason": "tool_use"', text)
+                self.assertNotIn("event: error", text)
+                boundary_events = list_runtime_events(
+                    10,
+                    tenant_contains="stream-ignored-upstream-tool-user",
+                    event_type="chat_only_synthesis_boundary",
+                )
+                self.assertEqual(len(boundary_events), 1)
+                self.assertEqual(boundary_events[0]["workflow"], "chat_only_synthesis")
+                self.assertEqual(boundary_events[0]["step"], "strip_upstream_tools")
+                self.assertEqual(boundary_events[0]["metadata"]["source"], "streaming")
+                self.assertFalse(boundary_events[0]["metadata"]["tool_authority_granted"])
+                runtime_events = list_runtime_events(
+                    10,
+                    tenant_contains="stream-ignored-upstream-tool-user",
+                    event_type="upstream_tool_attempt_ignored",
+                )
+                self.assertEqual(len(runtime_events), 1)
+                self.assertEqual(runtime_events[0]["metadata"]["source"], "streaming")
+                self.assertEqual(runtime_events[0]["metadata"]["calls"][0]["name"], "Edit")
+                self.assertFalse(runtime_events[0]["metadata"]["tool_authority_granted"])
+            finally:
+                gateway.CONFIG_PATH = old_config
+                os.chdir(old_cwd)
+                if old_workspace_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_workspace_root
+                if old_project is None:
+                    os.environ.pop("GATEWAY_CODEBASE_MEMORY_PROJECT", None)
+                else:
+                    os.environ["GATEWAY_CODEBASE_MEMORY_PROJECT"] = old_project
+                if old_runtime is None:
+                    os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+                else:
+                    os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+                if planner is not None:
+                    planner._STORE = None
+
     def test_stream_final_response_emits_thinking_blocks(self):
         from src.gateway_streaming import _stream_final_response
         events = []
@@ -5043,6 +9457,66 @@ class AnthropicSSEFormatTests(unittest.TestCase):
         self.assertLess(all_text.index("response.output_item.added"), all_text.index("response.output_text.delta"))
         self.assertIn("CODEX-STREAM-OK", all_text)
 
+    def test_stream_final_response_carries_gateway_context_metadata(self):
+        from src.gateway_streaming import _stream_final_response
+
+        def collect(path, response):
+            events = []
+
+            class FakeHandler:
+                class wfile:
+                    @staticmethod
+                    def write(data):
+                        events.append(data.decode("utf-8") if isinstance(data, bytes) else data)
+
+                    @staticmethod
+                    def flush():
+                        pass
+
+            _stream_final_response(FakeHandler(), path, response)
+            return "".join(events)
+
+        context = {
+            "agent_planner": {"workflow": "project_analysis", "step": "final_synthesis"},
+            "strategy": "agent_planner_final_synthesis",
+            "planner_evidence_chars": 1234,
+        }
+        chat_stream = collect(
+            "/v1/chat/completions",
+            {
+                "id": "chat_ctx",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "gateway_context": context,
+            },
+        )
+        self.assertIn('"gateway_context"', chat_stream)
+        self.assertIn('"final_synthesis"', chat_stream)
+
+        messages_stream = collect(
+            "/v1/messages",
+            {
+                "id": "msg_ctx",
+                "model": "m",
+                "content": [{"type": "text", "text": "ok"}],
+                "gateway_context": context,
+            },
+        )
+        self.assertIn('"gateway_context"', messages_stream)
+        self.assertIn('"agent_planner"', messages_stream)
+
+        responses_stream = collect(
+            "/v1/responses",
+            {
+                "id": "resp_ctx",
+                "object": "response",
+                "model": "m",
+                "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]}],
+                "gateway_context": context,
+            },
+        )
+        self.assertIn('"gateway_context"', responses_stream)
+        self.assertIn('"planner_evidence_chars": 1234', responses_stream)
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -5106,6 +9580,15 @@ class StreamingToolEventTests(unittest.TestCase):
         self.assertEqual(calls[0]["call_id"], "call_1")
         self.assertEqual(calls[0]["name"], "echo_probe")
         self.assertEqual(calls[0]["arguments"], "{}")
+
+    def test_detect_openai_legacy_function_call_delta(self):
+        """OpenAI legacy function_call delta fragment → call_id + name + args."""
+        line = 'data: {"id":"c","choices":[{"delta":{"function_call":{"name":"calculator","arguments":"{\\"expression\\":\\"6*7\\"}"}}}]})'
+        _, data = gateway._parse_sse_line(line)
+        calls = gateway._detect_streaming_tool_calls_from_sse("/v1/chat/completions", None, data)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["name"], "calculator")
+        self.assertIn("6*7", calls[0]["arguments"])
 
     def test_detect_openai_arguments_fragment(self):
         """OpenAI arguments arrive in a separate delta chunk."""
@@ -5217,6 +9700,26 @@ class StreamingToolEventTests(unittest.TestCase):
         self.assertEqual(calls[0]["call_id"], "call_xyz")
         self.assertEqual(calls[0]["name"], "calc")
         self.assertTrue(calls[0].get("_initial"))
+
+    def test_detect_responses_custom_tool_call_item(self):
+        """Responses custom_tool_call streaming item → parsed like non-streaming Responses."""
+        line = 'event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"type":"custom_tool_call","id":"ctc_abc","call_id":"call_custom","name":"calculator","input":"40+2"}}'
+        event, data = gateway._parse_sse_line(line)
+        calls = gateway._detect_streaming_tool_calls_from_sse("/v1/responses", event, data)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["call_id"], "call_custom")
+        self.assertEqual(calls[0]["name"], "calculator")
+        self.assertEqual(calls[0]["arguments"], '{"input": "40+2"}')
+
+    def test_detect_responses_codex_builtin_tool_call_item(self):
+        """Responses local_shell_call streaming item → parsed as a programmable tool call."""
+        line = 'event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"type":"local_shell_call","id":"lsc_abc","call_id":"call_shell","action":{"command":"pwd"}}}'
+        event, data = gateway._parse_sse_line(line)
+        calls = gateway._detect_streaming_tool_calls_from_sse("/v1/responses", event, data)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["call_id"], "call_shell")
+        self.assertEqual(calls[0]["name"], "local_shell")
+        self.assertEqual(json.loads(calls[0]["arguments"]), {"command": "pwd"})
 
     def test_detect_responses_partial_args(self):
         """Responses function_call_arguments.delta → partial result."""
@@ -5598,6 +10101,30 @@ class ProtocolConversionTests(unittest.TestCase):
         self.assertIn("line 1", result[0]["content"])
         self.assertIn("line 2", result[0]["content"])
 
+    def test_anthropic_tool_result_error_roundtrips_through_chat_marker(self):
+        from src.gateway_protocol import _convert_anthropic_messages_to_openai, _openai_messages_to_anthropic
+
+        messages = [{
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_error",
+                "content": "permission denied",
+                "is_error": True,
+            }],
+        }]
+
+        chat_messages, _, _ = _convert_anthropic_messages_to_openai(messages)
+        self.assertEqual(chat_messages[0]["role"], "tool")
+        self.assertIn("[gateway_tool_result_error]", chat_messages[0]["content"])
+
+        anthropic_messages, _ = _openai_messages_to_anthropic(chat_messages)
+        tool_result = anthropic_messages[0]["content"][0]
+        self.assertEqual(tool_result["type"], "tool_result")
+        self.assertEqual(tool_result["tool_use_id"], "toolu_error")
+        self.assertEqual(tool_result["content"], "permission denied")
+        self.assertTrue(tool_result["is_error"])
+
     def test_convert_thinking_block(self):
         from src.gateway_app import _convert_anthropic_messages_to_openai
         messages = [
@@ -5630,6 +10157,83 @@ class ProtocolConversionTests(unittest.TestCase):
         self.assertEqual(len(result[0]["tool_calls"]), 2)
         self.assertEqual(result[0]["tool_calls"][0]["function"]["name"], "read")
         self.assertEqual(result[0]["tool_calls"][1]["function"]["name"], "write")
+
+    def test_openai_chat_legacy_function_call_response_to_anthropic_tool_use(self):
+        from src.gateway_protocol import _from_openai_chat_response
+
+        result = _from_openai_chat_response("/v1/messages", {
+            "id": "chatcmpl_legacy_fn",
+            "model": "weak",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "function_call": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"README.md\"}",
+                    },
+                },
+                "finish_reason": "function_call",
+            }],
+        })
+
+        self.assertEqual(result["stop_reason"], "tool_use")
+        tool_use = [block for block in result["content"] if block.get("type") == "tool_use"]
+        self.assertEqual(len(tool_use), 1)
+        self.assertEqual(tool_use[0]["name"], "read_file")
+        self.assertEqual(tool_use[0]["input"], {"path": "README.md"})
+
+    def test_openai_chat_tool_call_non_object_arguments_wrap_for_anthropic(self):
+        from src.gateway_protocol import _from_openai_chat_response
+
+        result = _from_openai_chat_response("/v1/messages", {
+            "id": "chatcmpl_custom_args",
+            "model": "weak",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_custom",
+                        "type": "function",
+                        "function": {
+                            "name": "custom_text_tool",
+                            "arguments": "search README for setup",
+                        },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        })
+
+        tool_use = [block for block in result["content"] if block.get("type") == "tool_use"]
+        self.assertEqual(tool_use[0]["input"], {"input": "search README for setup"})
+
+    def test_openai_chat_legacy_function_history_converts_to_responses(self):
+        from src.gateway_protocol import _openai_chat_to_responses_payload
+
+        converted = _openai_chat_to_responses_payload({
+            "model": "weak",
+            "messages": [
+                {"role": "user", "content": "calc"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "function_call": {
+                        "name": "calculator",
+                        "arguments": "{\"expression\":\"6*7\"}",
+                    },
+                },
+                {"role": "function", "name": "calculator", "content": "42"},
+            ],
+        })
+
+        function_call = converted["input"][1]
+        function_output = converted["input"][2]
+        self.assertEqual(function_call["type"], "function_call")
+        self.assertEqual(function_call["name"], "calculator")
+        self.assertEqual(function_output["type"], "function_call_output")
+        self.assertEqual(function_output["call_id"], function_call["call_id"])
+        self.assertEqual(function_output["output"], "42")
 
     def test_convert_user_text_and_tool_result_mixed(self):
         from src.gateway_app import _convert_anthropic_messages_to_openai
@@ -5895,6 +10499,106 @@ class ContextSummarizationTests(unittest.TestCase):
         result = _summarize_via_llm(test_msgs)
         self.assertEqual(result, "cached summary")
 
+    def test_compact_request_for_upstream_injects_periodic_summary(self):
+        """Long chat history should become summary + recent messages, not raw truncation only."""
+        from src.gateway_context import _compact_request_for_upstream
+        body = {
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "old user detail " * 200},
+                {"role": "assistant", "content": "old assistant detail " * 200},
+                {"role": "user", "content": "recent question"},
+                {"role": "assistant", "content": "recent answer"},
+            ],
+        }
+        with patch("src.gateway_context._summarize_via_llm", return_value="old-turn-summary"):
+            result = _compact_request_for_upstream(
+                "/v1/chat/completions",
+                body,
+                {"keep_recent_messages": 2, "summary_max_chars": 500},
+                reason="over_limit",
+            )
+        messages = result["messages"]
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertIn("[Previous conversation summary]", messages[0]["content"])
+        self.assertIn("old-turn-summary", messages[0]["content"])
+        self.assertEqual(messages[-2]["content"], "recent question")
+        self.assertEqual(messages[-1]["content"], "recent answer")
+        self.assertNotIn("old user detail " * 20, json.dumps(messages, ensure_ascii=False))
+
+    def test_messages_compaction_moves_summary_into_system_field(self):
+        """Anthropic messages should not receive a synthetic system role message."""
+        from src.gateway_context import _compact_request_for_upstream
+        body = {
+            "model": "m",
+            "system": "original system",
+            "messages": [
+                {"role": "user", "content": "old user detail " * 200},
+                {"role": "assistant", "content": "old assistant detail " * 200},
+                {"role": "user", "content": "recent question"},
+            ],
+        }
+        with patch("src.gateway_context._summarize_via_llm", return_value="anthropic-old-summary"):
+            result = _compact_request_for_upstream(
+                "/v1/messages",
+                body,
+                {"keep_recent_messages": 1, "summary_max_chars": 500},
+                reason="over_limit",
+            )
+        self.assertIn("[gateway context compacted]", result["system"])
+        self.assertIn("original system", result["system"])
+        self.assertIn("anthropic-old-summary", result["system"])
+        self.assertEqual(result["messages"], [{"role": "user", "content": "recent question"}])
+        self.assertFalse(any(m.get("role") == "system" for m in result["messages"]))
+
+    def test_responses_input_list_compaction_trims_large_recent_item_content(self):
+        """Responses current input item must be shrunk for tiny upstream windows."""
+        from src.gateway_context import _compact_request_for_upstream
+        huge_recent = "recent responses payload " * 500
+        body = {
+            "model": "m",
+            "input": [
+                {"role": "user", "content": "old user detail " * 200},
+                {"role": "assistant", "content": "old assistant detail " * 200},
+                {"role": "user", "content": huge_recent},
+            ],
+        }
+        with patch("src.gateway_context._summarize_via_llm", return_value="responses-old-summary"):
+            result = _compact_request_for_upstream(
+                "/v1/responses",
+                body,
+                {"keep_recent_messages": 1, "summary_max_chars": 500},
+                reason="over_limit",
+            )
+        recent = result["input"][-1]
+        self.assertEqual(recent["role"], "user")
+        self.assertIn("...(truncated)", recent["content"])
+        self.assertLess(len(recent["content"]), len(huge_recent))
+        self.assertNotIn("recent responses payload " * 100, json.dumps(result, ensure_ascii=False))
+
+    def test_responses_input_list_compaction_keeps_summary_and_recent_items(self):
+        """Responses input arrays should also get rolling summary compaction."""
+        from src.gateway_context import _compact_request_for_upstream
+        body = {
+            "model": "m",
+            "input": [
+                {"role": "user", "content": "old user detail " * 200},
+                {"role": "assistant", "content": "old assistant detail " * 200},
+                {"role": "user", "content": "recent question"},
+            ],
+        }
+        with patch("src.gateway_context._summarize_via_llm", return_value="responses-old-summary"):
+            result = _compact_request_for_upstream(
+                "/v1/responses",
+                body,
+                {"keep_recent_messages": 1, "summary_max_chars": 500},
+                reason="over_limit",
+            )
+        self.assertIn("[gateway context compacted]", result["instructions"])
+        self.assertEqual(result["input"][0]["role"], "system")
+        self.assertIn("responses-old-summary", result["input"][0]["content"])
+        self.assertEqual(result["input"][-1], {"role": "user", "content": "recent question"})
+
 
 class WeakUpstreamToolRoundSurfacingTests(unittest.TestCase):
     """Regression: weak upstreams that return no tool calls must still surface
@@ -5914,7 +10618,14 @@ class WeakUpstreamToolRoundSurfacingTests(unittest.TestCase):
         old_config = gateway.CONFIG_PATH
         old_cwd = os.getcwd()
         old_ws = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+        old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+        old_strict = os.environ.get("GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN")
+        planner = None
         try:
+            import src.gateway_agent_planner as planner
+            planner._STORE = None
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+            os.environ["GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN"] = "1"
             gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
             cfg = gateway._default_config()
             cfg["gateway"]["workspace_root"] = td
@@ -5945,15 +10656,29 @@ class WeakUpstreamToolRoundSurfacingTests(unittest.TestCase):
                              "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
 
             client = FakeClient([weak_resp])
+            body = dict(body)
+            metadata = dict(body.get("metadata") or {})
+            metadata.setdefault("workspace", td)
+            body["metadata"] = metadata
             result = run_tool_orchestration(path, body, client)
             return result
         finally:
             gateway.CONFIG_PATH = old_config
             os.chdir(old_cwd)
+            if planner is not None:
+                planner._STORE = None
             if old_ws is None:
                 os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
             else:
                 os.environ["GATEWAY_WORKSPACE_ROOT"] = old_ws
+            if old_runtime is None:
+                os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+            else:
+                os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+            if old_strict is None:
+                os.environ.pop("GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN", None)
+            else:
+                os.environ["GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN"] = old_strict
 
     def test_chat_completions_surfaces_tool_rounds(self):
         result = self._run("/v1/chat/completions", {
@@ -5967,6 +10692,68 @@ class WeakUpstreamToolRoundSurfacingTests(unittest.TestCase):
         self.assertTrue(bool(msg.get("tool_calls")), "should have tool_calls")
         self.assertEqual(choice.get("finish_reason"), "tool_calls")
         self.assertEqual((result.get("gateway_context") or {}).get("strategy"), "gateway_downstream_tool_request")
+
+    def test_direct_downstream_fallback_records_remote_runtime_event(self):
+        from src.gateway_agent_planner import list_runtime_events
+
+        td = self._setup_workspace()
+        old_config = gateway.CONFIG_PATH
+        old_cwd = os.getcwd()
+        old_ws = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+        old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+        planner = None
+        try:
+            import src.gateway_agent_planner as planner
+            planner._STORE = None
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            cfg = gateway._default_config()
+            cfg["gateway"]["workspace_root"] = td
+            cfg["gateway"]["tool_mode"] = "orchestrate"
+            cfg["gateway"]["agent_planner_strict_every_turn"] = True
+            cfg["upstream"]["tools_enabled"] = "adapter"
+            cfg["upstream"]["capabilities"]["supports_tools"] = False
+            cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+            gateway.save_config(cfg)
+            os.chdir(td)
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = td
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+
+            client = FakeClient([])
+            result = run_tool_orchestration("/v1/messages", {
+                "model": "weak",
+                "metadata": {
+                    "session_id": "remote-project-session",
+                    "user_id": json.dumps({"user_id": "remote-project-user"}),
+                },
+                "messages": [{"role": "user", "content": "分析这套项目"}],
+                "max_tokens": 4096,
+            }, client)
+
+            self.assertEqual(result.get("stop_reason"), "tool_use")
+            self.assertEqual(client.requests, [])
+            events = list_runtime_events(
+                10,
+                tenant_contains="remote-project-user",
+                workflow="direct_downstream_tool_request",
+            )
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["event_type"], "tool_dispatch")
+            self.assertEqual(events[0]["step"], "surface_user_side_tools")
+            self.assertIn(events[0]["metadata"]["calls"][0]["name"], {"LS", "Glob"})
+            self.assertIn("remote-project-session", events[0]["session_key"])
+        finally:
+            gateway.CONFIG_PATH = old_config
+            os.chdir(old_cwd)
+            if old_ws is None:
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+            else:
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = old_ws
+            if old_runtime is None:
+                os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+            else:
+                os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+            if planner is not None:
+                planner._STORE = None
 
     def test_messages_surfaces_tool_use_blocks(self):
         result = self._run("/v1/messages", {
@@ -5983,6 +10770,2438 @@ class WeakUpstreamToolRoundSurfacingTests(unittest.TestCase):
         # stop_reason must be tool_use to signal client to send tool_result back
         self.assertEqual(result.get("stop_reason"), "tool_use")
         self.assertEqual((result.get("gateway_context") or {}).get("strategy"), "gateway_downstream_tool_request")
+
+    def test_chat_only_project_analysis_without_path_surfaces_native_tool_fanout_before_upstream(self):
+        from src.gateway_config import save_config
+        from src.gateway_tool_runtime import run_tool_orchestration
+
+        td = self._setup_workspace()
+        old_config = gateway.CONFIG_PATH
+        old_cwd = os.getcwd()
+        old_ws = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+        old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+        old_strict = os.environ.get("GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN")
+        planner = None
+        try:
+            import src.gateway_agent_planner as planner
+            planner._STORE = None
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+            os.environ["GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN"] = "1"
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            cfg = gateway._default_config()
+            cfg["gateway"]["workspace_root"] = td
+            cfg["gateway"]["tool_mode"] = "orchestrate"
+            cfg["gateway"]["agent_planner_strict_every_turn"] = True
+            cfg["upstream"]["tools_enabled"] = "adapter"
+            cfg["upstream"]["capabilities"]["supports_tools"] = False
+            cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+            save_config(cfg)
+            os.chdir(td)
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = td
+
+            client = FakeClient([])
+            result = run_tool_orchestration("/v1/messages", {
+                "model": "weak",
+                "messages": [{"role": "user", "content": "分析这套项目"}],
+                "max_tokens": 4096,
+            }, client)
+
+            self.assertEqual(client.requests, [], "chat-only upstream must not be asked to see local files before tools run")
+            self.assertEqual(result.get("stop_reason"), "tool_use")
+            self.assertEqual((result.get("gateway_context") or {}).get("strategy"), "gateway_downstream_tool_request")
+            tool_names = [b.get("name") for b in (result.get("content") or []) if b.get("type") == "tool_use"]
+            self.assertIn("LS", tool_names)
+            self.assertIn("Glob", tool_names)
+        finally:
+            gateway.CONFIG_PATH = old_config
+            os.chdir(old_cwd)
+            if planner is not None:
+                planner._STORE = None
+            if old_ws is None:
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+            else:
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = old_ws
+            if old_runtime is None:
+                os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+            else:
+                os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+            if old_strict is None:
+                os.environ.pop("GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN", None)
+            else:
+                os.environ["GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN"] = old_strict
+
+    def test_chat_only_project_analysis_uses_declared_shell_tool_when_ls_glob_absent(self):
+        result = self._run("/v1/responses", {
+            "model": "weak",
+            "input": "分析这套项目",
+            "tools": [{
+                "type": "function",
+                "name": "exec_command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"cmd": {"type": "string"}},
+                    "required": ["cmd"],
+                    "additionalProperties": False,
+                },
+            }],
+        })
+
+        calls = [o for o in (result.get("output") or []) if o.get("type") == "function_call"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].get("name"), "exec_command")
+        args = json.loads(calls[0].get("arguments") or "{}")
+        self.assertIn("find", args.get("cmd", ""))
+        self.assertNotIn("command", args)
+
+    def test_chat_only_project_analysis_prefers_codebase_onboarding_skill_when_available(self):
+        result = self._run("/v1/messages", {
+            "model": "weak",
+            "messages": [
+                {"role": "system", "content": "Available skills:\\n- codebase-onboarding\\n- codebase-memory"},
+                {"role": "user", "content": "分析这套项目"},
+            ],
+            "tools": [{
+                "name": "Skill",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"skill": {"type": "string"}, "args": {"type": "string"}},
+                    "required": ["skill"],
+                    "additionalProperties": False,
+                },
+            }],
+            "max_tokens": 4096,
+        })
+
+        tool_use = [b for b in (result.get("content") or []) if b.get("type") == "tool_use"]
+        self.assertEqual(tool_use[0].get("name"), "Skill")
+        self.assertEqual(tool_use[0].get("input"), {"skill": "codebase-onboarding"})
+        self.assertEqual((result.get("gateway_context") or {}).get("agent_planner", {}).get("step"), "codebase_onboarding")
+
+    def test_agent_planner_emits_update_plan_before_project_tools_when_declared(self):
+        result = self._run("/v1/messages", {
+            "model": "weak",
+            "messages": [
+                {"role": "system", "content": "Available skills:\\n- codebase-onboarding"},
+                {"role": "user", "content": "分析这套项目"},
+            ],
+            "tools": [
+                {
+                    "name": "update_plan",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "plan": {"type": "array"},
+                            "explanation": {"type": "string"},
+                        },
+                        "required": ["plan"],
+                        "additionalProperties": False,
+                    },
+                },
+                {
+                    "name": "Skill",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"skill": {"type": "string"}, "args": {"type": "string"}},
+                        "required": ["skill"],
+                        "additionalProperties": False,
+                    },
+                },
+            ],
+            "max_tokens": 4096,
+        })
+
+        tool_use = [b for b in (result.get("content") or []) if b.get("type") == "tool_use"]
+        self.assertEqual(tool_use[0].get("name"), "update_plan")
+        plan = tool_use[0].get("input", {}).get("plan") or []
+        self.assertEqual(plan[0].get("status"), "in_progress")
+        self.assertIn("项目", plan[0].get("step", ""))
+        self.assertEqual((result.get("gateway_context") or {}).get("agent_planner", {}).get("step"), "planner_progress")
+
+    def test_agent_planner_continues_to_skill_after_update_plan_result(self):
+        result = self._run("/v1/messages", {
+            "model": "weak",
+            "messages": [
+                {"role": "system", "content": "Available skills:\\n- codebase-onboarding"},
+                {"role": "user", "content": "分析这套项目"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "plan_1", "name": "update_plan", "input": {
+                        "plan": [{"step": "加载项目分析技能/上下文规则", "status": "in_progress"}],
+                    }},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "plan_1", "content": "{\"ok\":true}"},
+                ]},
+            ],
+            "tools": [
+                {
+                    "name": "update_plan",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"plan": {"type": "array"}},
+                        "required": ["plan"],
+                        "additionalProperties": False,
+                    },
+                },
+                {
+                    "name": "Skill",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"skill": {"type": "string"}, "args": {"type": "string"}},
+                        "required": ["skill"],
+                        "additionalProperties": False,
+                    },
+                },
+            ],
+            "max_tokens": 4096,
+        })
+
+        tool_use = [b for b in (result.get("content") or []) if b.get("type") == "tool_use"]
+        self.assertEqual(tool_use[0].get("name"), "Skill")
+        self.assertEqual(tool_use[0].get("input"), {"skill": "codebase-onboarding"})
+        self.assertEqual((result.get("gateway_context") or {}).get("agent_planner", {}).get("step"), "codebase_onboarding")
+
+    def test_agent_planner_continues_after_codebase_onboarding_skill_result(self):
+        result = self._run("/v1/messages", {
+            "model": "weak",
+            "messages": [
+                {"role": "system", "content": "Available skills:\\n- codebase-onboarding"},
+                {"role": "user", "content": "分析这套项目"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "skill_1", "name": "Skill", "input": {"skill": "codebase-onboarding"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "skill_1", "content": "Successfully loaded skill"},
+                ]},
+            ],
+            "tools": [{
+                "name": "Bash",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                    "additionalProperties": False,
+                },
+            }],
+            "max_tokens": 4096,
+        })
+
+        tool_use = [b for b in (result.get("content") or []) if b.get("type") == "tool_use"]
+        self.assertEqual(tool_use[0].get("name"), "Bash")
+        self.assertIn("find", tool_use[0].get("input", {}).get("command", ""))
+        self.assertEqual((result.get("gateway_context") or {}).get("agent_planner", {}).get("step"), "project_structure")
+        state = (result.get("gateway_context") or {}).get("agent_planner", {}).get("state") or {}
+        self.assertEqual(state.get("workflow"), "project_analysis")
+        self.assertEqual(state.get("current_step"), "project_structure")
+        self.assertGreaterEqual(state.get("evidence_count", 0), 1)
+
+    def test_agent_planner_prefers_codebase_search_graph_for_project_structure(self):
+        old_project = os.environ.get("GATEWAY_CODEBASE_MEMORY_PROJECT")
+        try:
+            os.environ["GATEWAY_CODEBASE_MEMORY_PROJECT"] = "Users-sanbo-Desktop-ai_tool_functioncall"
+            result = self._run("/v1/messages", {
+                "model": "weak",
+                "metadata": {"session_id": "synthesis-boundary-session", "user_id": json.dumps({"user_id": "synthesis-boundary-user"})},
+                "messages": [
+                    {"role": "system", "content": "Available skills:\\n- codebase-onboarding"},
+                    {"role": "user", "content": "分析这套项目"},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "skill_1", "name": "Skill", "input": {"skill": "codebase-onboarding"}},
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "skill_1", "content": "Successfully loaded skill"},
+                    ]},
+                ],
+                "tools": [{
+                    "name": "mcp__codebase_memory_mcp__search_graph",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "project": {"type": "string"},
+                            "query": {"type": "string"},
+                        },
+                        "required": ["project", "query"],
+                        "additionalProperties": False,
+                    },
+                }, {
+                    "name": "Bash",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                }],
+                "max_tokens": 4096,
+            })
+        finally:
+            if old_project is None:
+                os.environ.pop("GATEWAY_CODEBASE_MEMORY_PROJECT", None)
+            else:
+                os.environ["GATEWAY_CODEBASE_MEMORY_PROJECT"] = old_project
+
+        tool_use = [b for b in (result.get("content") or []) if b.get("type") == "tool_use"]
+        self.assertEqual(tool_use[0].get("name"), "mcp__codebase_memory_mcp__search_graph")
+        self.assertEqual(tool_use[0].get("input", {}).get("project"), "Users-sanbo-Desktop-ai_tool_functioncall")
+        self.assertIn("architecture", tool_use[0].get("input", {}).get("query", ""))
+        self.assertEqual((result.get("gateway_context") or {}).get("agent_planner", {}).get("step"), "project_structure")
+
+    def test_agent_planner_traces_core_flow_after_planner_structure_step(self):
+        old_project = os.environ.get("GATEWAY_CODEBASE_MEMORY_PROJECT")
+        try:
+            os.environ["GATEWAY_CODEBASE_MEMORY_PROJECT"] = "Users-sanbo-Desktop-ai_tool_functioncall"
+            result = self._run("/v1/messages", {
+                "model": "weak",
+                "messages": [
+                    {"role": "system", "content": "Available skills:\n- codebase-onboarding"},
+                    {"role": "user", "content": "分析这套项目"},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "skill_1", "name": "Skill", "input": {"skill": "codebase-onboarding"}},
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "skill_1", "content": "Successfully loaded skill"},
+                    ]},
+                    {"role": "assistant", "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "planner_project_structure_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "name": "mcp__codebase_memory_mcp__get_architecture",
+                            "input": {"project": "Users-sanbo-Desktop-ai_tool_functioncall"},
+                        },
+                    ]},
+                    {"role": "user", "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "planner_project_structure_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "content": "Architecture: src/gateway_http_handler.py routes requests into src/gateway_tool_runtime.py",
+                        },
+                    ]},
+                ],
+                "tools": [{
+                    "name": "mcp__codebase_memory_mcp__search_graph",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "project": {"type": "string"},
+                            "query": {"type": "string"},
+                        },
+                        "required": ["project", "query"],
+                        "additionalProperties": False,
+                    },
+                }, {
+                    "name": "Read",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                        "required": ["file_path"],
+                        "additionalProperties": False,
+                    },
+                }],
+                "max_tokens": 4096,
+            })
+        finally:
+            if old_project is None:
+                os.environ.pop("GATEWAY_CODEBASE_MEMORY_PROJECT", None)
+            else:
+                os.environ["GATEWAY_CODEBASE_MEMORY_PROJECT"] = old_project
+
+        tool_use = [b for b in (result.get("content") or []) if b.get("type") == "tool_use"]
+        self.assertEqual(tool_use[0].get("name"), "mcp__codebase_memory_mcp__search_graph")
+        self.assertEqual(tool_use[0].get("input", {}).get("project"), "Users-sanbo-Desktop-ai_tool_functioncall")
+        self.assertIn("request flow", tool_use[0].get("input", {}).get("query", ""))
+        self.assertEqual((result.get("gateway_context") or {}).get("agent_planner", {}).get("step"), "core_flow_trace")
+        state = (result.get("gateway_context") or {}).get("agent_planner", {}).get("state") or {}
+        self.assertIn("project_structure", state.get("completed_steps") or [])
+        self.assertEqual(state.get("current_step"), "core_flow_trace")
+
+    def test_agent_planner_deep_dives_symbol_after_core_flow_trace(self):
+        old_project = os.environ.get("GATEWAY_CODEBASE_MEMORY_PROJECT")
+        try:
+            os.environ["GATEWAY_CODEBASE_MEMORY_PROJECT"] = "Users-sanbo-Desktop-ai_tool_functioncall"
+            result = self._run("/v1/messages", {
+                "model": "weak",
+                "messages": [
+                    {"role": "user", "content": "分析这套项目"},
+                    {"role": "assistant", "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "planner_project_structure_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "name": "mcp__codebase_memory_mcp__get_architecture",
+                            "input": {"project": "Users-sanbo-Desktop-ai_tool_functioncall"},
+                        },
+                    ]},
+                    {"role": "user", "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "planner_project_structure_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "content": "Architecture evidence",
+                        },
+                    ]},
+                    {"role": "assistant", "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "planner_core_flow_trace_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                            "name": "mcp__codebase_memory_mcp__search_graph",
+                            "input": {
+                                "project": "Users-sanbo-Desktop-ai_tool_functioncall",
+                                "query": "core request flow",
+                            },
+                        },
+                    ]},
+                    {"role": "user", "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "planner_core_flow_trace_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                            "content": (
+                                '{"results":[{"qualified_name":'
+                                '"Users-sanbo-Desktop-ai_tool_functioncall.src.gateway_tool_runtime.run_tool_orchestration",'
+                                '"name":"run_tool_orchestration"}]}'
+                            ),
+                        },
+                    ]},
+                ],
+                "tools": [{
+                    "name": "mcp__codebase_memory_mcp__get_code_snippet",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "project": {"type": "string"},
+                            "qualified_name": {"type": "string"},
+                            "include_neighbors": {"type": "boolean"},
+                        },
+                        "required": ["project", "qualified_name"],
+                        "additionalProperties": False,
+                    },
+                }, {
+                    "name": "mcp__codebase_memory_mcp__trace_path",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "project": {"type": "string"},
+                            "function_name": {"type": "string"},
+                            "direction": {"type": "string"},
+                            "mode": {"type": "string"},
+                            "depth": {"type": "integer"},
+                        },
+                        "required": ["project", "function_name"],
+                        "additionalProperties": False,
+                    },
+                }, {
+                    "name": "Read",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                        "required": ["file_path"],
+                        "additionalProperties": False,
+                    },
+                }],
+                "max_tokens": 4096,
+            })
+        finally:
+            if old_project is None:
+                os.environ.pop("GATEWAY_CODEBASE_MEMORY_PROJECT", None)
+            else:
+                os.environ["GATEWAY_CODEBASE_MEMORY_PROJECT"] = old_project
+
+        tool_use = [b for b in (result.get("content") or []) if b.get("type") == "tool_use"]
+        names = [b.get("name") for b in tool_use]
+        self.assertIn("mcp__codebase_memory_mcp__get_code_snippet", names)
+        self.assertIn("mcp__codebase_memory_mcp__trace_path", names)
+        snippet = next(b for b in tool_use if b.get("name") == "mcp__codebase_memory_mcp__get_code_snippet")
+        self.assertEqual(snippet.get("input", {}).get("project"), "Users-sanbo-Desktop-ai_tool_functioncall")
+        self.assertEqual(
+            snippet.get("input", {}).get("qualified_name"),
+            "Users-sanbo-Desktop-ai_tool_functioncall.src.gateway_tool_runtime.run_tool_orchestration",
+        )
+        trace = next(b for b in tool_use if b.get("name") == "mcp__codebase_memory_mcp__trace_path")
+        self.assertEqual(trace.get("input", {}).get("function_name"), "run_tool_orchestration")
+        self.assertEqual((result.get("gateway_context") or {}).get("agent_planner", {}).get("step"), "symbol_deep_dive")
+
+    def test_agent_planner_injects_compact_evidence_before_final_upstream_synthesis(self):
+        from src.gateway_config import save_config
+        from src.gateway_tool_runtime import run_tool_orchestration
+
+        td = self._setup_workspace()
+        old_config = gateway.CONFIG_PATH
+        old_cwd = os.getcwd()
+        old_ws = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+        old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+        planner = None
+        try:
+            import src.gateway_agent_planner as planner
+            planner._STORE = None
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            cfg = gateway._default_config()
+            cfg["gateway"]["workspace_root"] = td
+            cfg["gateway"]["tool_mode"] = "orchestrate"
+            cfg["upstream"]["tools_enabled"] = "adapter"
+            cfg["upstream"]["protocol"] = "openai_chat"
+            cfg["upstream"]["capabilities"]["supports_tools"] = False
+            cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+            save_config(cfg)
+            os.chdir(td)
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = td
+
+            weak_resp = {"id": "c1", "choices": [{"message": {"role": "assistant", "content": "final analysis"},
+                                                   "finish_reason": "stop"}],
+                         "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+            client = FakeClient([weak_resp])
+            result = run_tool_orchestration("/v1/messages", {
+                "model": "weak",
+                "metadata": {"session_id": "synthesis-boundary-session", "user_id": json.dumps({"user_id": "synthesis-boundary-user"})},
+                "messages": [
+                    {"role": "user", "content": "分析这套项目"},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "bash_1", "name": "Bash", "input": {"command": "find ."}},
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "bash_1", "content": "--- files ---\nREADME.md\nsrc/gateway_tool_runtime.py"},
+                    ]},
+                ],
+                "tools": [{
+                    "name": "Bash",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                }],
+                "max_tokens": 4096,
+            }, client)
+
+            self.assertEqual(result.get("content", [{}])[0].get("text"), "final analysis")
+            self.assertEqual(len(client.requests), 1)
+            upstream_body = client.requests[0][1]
+            system_text = (upstream_body.get("messages") or [{}])[0].get("content", "")
+            self.assertIn("Gateway Agent Planner evidence", system_text)
+            self.assertIn("src/gateway_tool_runtime.py", system_text)
+            self.assertNotIn("tools", upstream_body)
+            self.assertNotIn("tool_choice", upstream_body)
+            self.assertNotIn("gateway_context", upstream_body)
+            self.assertNotIn("gateway_agent_planner", upstream_body)
+            final_ctx = result.get("gateway_context") or {}
+            self.assertEqual(final_ctx.get("strategy"), "agent_planner_final_synthesis")
+            self.assertTrue(final_ctx.get("chat_only_synthesis"))
+            self.assertTrue(final_ctx.get("upstream_tools_stripped"))
+            state = (final_ctx.get("agent_planner") or {}).get("state") or {}
+            self.assertEqual(state.get("current_step"), "synthesis")
+            self.assertGreaterEqual(state.get("evidence_summary_chars", 0), len("src/gateway_tool_runtime.py"))
+            self.assertIn("src/gateway_tool_runtime.py", state.get("evidence_summary_preview", ""))
+            from src.gateway_agent_planner import list_runtime_events
+            events = list_runtime_events(
+                20,
+                tenant_contains="synthesis-boundary-user",
+                event_type="chat_only_synthesis_boundary",
+            )
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["workflow"], "chat_only_synthesis")
+            self.assertEqual(events[0]["step"], "strip_upstream_tools")
+            self.assertFalse(events[0]["metadata"]["tool_authority_granted"])
+            self.assertTrue(events[0]["metadata"]["upstream_tools_stripped"])
+            self.assertIn("synthesis-boundary-session", events[0]["session_key"])
+        finally:
+            gateway.CONFIG_PATH = old_config
+            os.chdir(old_cwd)
+            if old_ws is None:
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+            else:
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = old_ws
+            if old_runtime is None:
+                os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+            else:
+                os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+            if planner is not None:
+                planner._STORE = None
+
+    def test_agent_planner_does_not_leak_chat_only_refusal_after_evidence(self):
+        from src.gateway_config import save_config
+        from src.gateway_tool_runtime import run_tool_orchestration
+
+        td = self._setup_workspace()
+        old_config = gateway.CONFIG_PATH
+        old_cwd = os.getcwd()
+        old_ws = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+        old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+        planner = None
+        try:
+            import src.gateway_agent_planner as planner
+            planner._STORE = None
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            cfg = gateway._default_config()
+            cfg["gateway"]["workspace_root"] = td
+            cfg["gateway"]["tool_mode"] = "orchestrate"
+            cfg["upstream"]["tools_enabled"] = "adapter"
+            cfg["upstream"]["protocol"] = "openai_chat"
+            cfg["upstream"]["capabilities"]["supports_tools"] = False
+            cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+            save_config(cfg)
+            os.chdir(td)
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = td
+
+            weak_refusal = {
+                "id": "c_refusal",
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hello, I can't answer this question for now. Let's talk about something else.",
+                    },
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            }
+            client = FakeClient([weak_refusal])
+            result = run_tool_orchestration("/v1/messages", {
+                "model": "weak",
+                "metadata": {"session_id": "refusal-fallback-session", "user_id": json.dumps({"user_id": "refusal-fallback-user"})},
+                "messages": [
+                    {"role": "user", "content": "分析这套项目"},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "bash_1", "name": "Bash", "input": {"command": "find ."}},
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "bash_1", "content": "--- files ---\nREADME.md\nsrc/gateway_tool_runtime.py"},
+                    ]},
+                ],
+                "tools": [{
+                    "name": "Bash",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                }],
+                "max_tokens": 4096,
+            }, client)
+
+            text = result.get("content", [{}])[0].get("text", "")
+            self.assertNotIn("Let's talk about something else", text)
+            self.assertIn("Gateway 已改用 planner 证据生成兜底结论", text)
+            self.assertIn("README.md", text)
+            self.assertTrue((result.get("gateway_agent_planner") or {}).get("synthesis_refusal_fallback"))
+            self.assertFalse((result.get("gateway_agent_planner") or {}).get("synthesis_scope_fallback"))
+            self.assertFalse((result.get("gateway_agent_planner") or {}).get("synthesis_nonanswer_fallback"))
+            self.assertEqual((result.get("gateway_context") or {}).get("strategy"), "agent_planner_final_synthesis")
+        finally:
+            gateway.CONFIG_PATH = old_config
+            os.chdir(old_cwd)
+            if old_ws is None:
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+            else:
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = old_ws
+            if old_runtime is None:
+                os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+            else:
+                os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+            if planner is not None:
+                planner._STORE = None
+
+    def test_agent_planner_does_not_leak_cross_session_path_drift_after_evidence(self):
+        from src.gateway_config import save_config
+        from src.gateway_tool_runtime import run_tool_orchestration
+
+        td = self._setup_workspace()
+        old_config = gateway.CONFIG_PATH
+        old_cwd = os.getcwd()
+        old_ws = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+        old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+        planner = None
+        try:
+            import src.gateway_agent_planner as planner
+            planner._STORE = None
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            cfg = gateway._default_config()
+            cfg["gateway"]["workspace_root"] = td
+            cfg["gateway"]["tool_mode"] = "orchestrate"
+            cfg["upstream"]["tools_enabled"] = "adapter"
+            cfg["upstream"]["protocol"] = "openai_chat"
+            cfg["upstream"]["capabilities"]["supports_tools"] = False
+            cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+            save_config(cfg)
+            os.chdir(td)
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = td
+
+            weak_drift = {
+                "id": "c_scope_drift",
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": (
+                            "根据上一个 session 的记录，你的项目是 `chatgpt2api`，位于 "
+                            "`/Users/sanbo/Desktop/api/chatgpt2api`，让我用正确的路径来分析。"
+                        ),
+                    },
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            }
+            client = FakeClient([weak_drift])
+            result = run_tool_orchestration("/v1/messages", {
+                "model": "weak",
+                "metadata": {"session_id": "scope-drift-session", "user_id": json.dumps({"user_id": "scope-drift-user"})},
+                "messages": [
+                    {"role": "user", "content": "分析这套项目"},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "readme_1", "name": "Read", "input": {"file_path": "README.md"}},
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "readme_1", "content": "# Current Gateway\nsrc/gateway_tool_runtime.py"},
+                    ]},
+                ],
+                "tools": [{
+                    "name": "Read",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                        "required": ["file_path"],
+                        "additionalProperties": False,
+                    },
+                }],
+                "max_tokens": 4096,
+            }, client)
+
+            text = result.get("content", [{}])[0].get("text", "")
+            self.assertNotIn("/Users/sanbo/Desktop/api/chatgpt2api", text)
+            self.assertIn("Gateway 已改用 planner 证据生成兜底结论", text)
+            self.assertIn("Current Gateway", text)
+            self.assertFalse((result.get("gateway_agent_planner") or {}).get("synthesis_refusal_fallback"))
+            self.assertTrue((result.get("gateway_agent_planner") or {}).get("synthesis_scope_fallback"))
+            self.assertFalse((result.get("gateway_agent_planner") or {}).get("synthesis_nonanswer_fallback"))
+            self.assertEqual((result.get("gateway_context") or {}).get("strategy"), "agent_planner_final_synthesis")
+        finally:
+            gateway.CONFIG_PATH = old_config
+            os.chdir(old_cwd)
+            if old_ws is None:
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+            else:
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = old_ws
+            if old_runtime is None:
+                os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+            else:
+                os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+            if planner is not None:
+                planner._STORE = None
+
+    def test_agent_planner_does_not_leak_final_synthesis_nonanswer_after_evidence(self):
+        from src.gateway_config import save_config
+        from src.gateway_tool_runtime import run_tool_orchestration
+
+        td = self._setup_workspace()
+        old_config = gateway.CONFIG_PATH
+        old_cwd = os.getcwd()
+        old_ws = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+        old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+        planner = None
+        try:
+            import src.gateway_agent_planner as planner
+            planner._STORE = None
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            cfg = gateway._default_config()
+            cfg["gateway"]["workspace_root"] = td
+            cfg["gateway"]["tool_mode"] = "orchestrate"
+            cfg["upstream"]["tools_enabled"] = "adapter"
+            cfg["upstream"]["protocol"] = "openai_chat"
+            cfg["upstream"]["capabilities"]["supports_tools"] = False
+            cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+            save_config(cfg)
+            os.chdir(td)
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = td
+
+            weak_nonanswer = {
+                "id": "c_nonanswer",
+                "choices": [{
+                    "message": {"role": "assistant", "content": "Let me first see what's actually in that directory."},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            }
+            client = FakeClient([weak_nonanswer])
+            result = run_tool_orchestration("/v1/messages", {
+                "model": "weak",
+                "metadata": {"session_id": "nonanswer-session", "user_id": json.dumps({"user_id": "nonanswer-user"})},
+                "messages": [
+                    {"role": "user", "content": "分析这套项目"},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "bash_1", "name": "Bash", "input": {"command": "find ."}},
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "bash_1", "content": "--- files ---\nREADME.md\nsrc/gateway_agent_planner.py"},
+                    ]},
+                ],
+                "tools": [{
+                    "name": "Bash",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                }],
+                "max_tokens": 4096,
+            }, client)
+
+            text = result.get("content", [{}])[0].get("text", "")
+            self.assertNotIn("Let me first", text)
+            self.assertIn("Gateway 已改用 planner 证据生成兜底结论", text)
+            self.assertIn("src/gateway_agent_planner.py", text)
+            self.assertFalse((result.get("gateway_agent_planner") or {}).get("synthesis_refusal_fallback"))
+            self.assertFalse((result.get("gateway_agent_planner") or {}).get("synthesis_scope_fallback"))
+            self.assertTrue((result.get("gateway_agent_planner") or {}).get("synthesis_nonanswer_fallback"))
+            self.assertEqual((result.get("gateway_context") or {}).get("strategy"), "agent_planner_final_synthesis")
+        finally:
+            gateway.CONFIG_PATH = old_config
+            os.chdir(old_cwd)
+            if old_ws is None:
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+            else:
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = old_ws
+            if old_runtime is None:
+                os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+            else:
+                os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+            if planner is not None:
+                planner._STORE = None
+
+    def test_agent_planner_ignores_client_injected_user_reminders_for_intent(self):
+        from src.gateway_config import save_config
+        from src.gateway_tool_runtime import run_tool_orchestration
+
+        td = self._setup_workspace()
+        old_config = gateway.CONFIG_PATH
+        old_cwd = os.getcwd()
+        old_ws = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+        old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+        old_strict = os.environ.get("GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN")
+        planner = None
+        try:
+            import src.gateway_agent_planner as planner
+            planner._STORE = None
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+            os.environ["GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN"] = "1"
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            cfg = gateway._default_config()
+            cfg["gateway"]["workspace_root"] = td
+            cfg["gateway"]["tool_mode"] = "orchestrate"
+            cfg["gateway"]["agent_planner_strict_every_turn"] = True
+            cfg["upstream"]["tools_enabled"] = "adapter"
+            cfg["upstream"]["protocol"] = "openai_chat"
+            cfg["upstream"]["capabilities"]["supports_tools"] = False
+            cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+            save_config(cfg)
+            os.chdir(td)
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = td
+
+            client = FakeClient([{
+                "id": "c_plain",
+                "choices": [{
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            }])
+            result = run_tool_orchestration("/v1/messages", {
+                "model": "weak",
+                "metadata": {"session_id": "injected-reminder-session", "user_id": "injected-reminder-user"},
+                "messages": [
+                    {"role": "user", "content": [{
+                        "type": "text",
+                        "text": (
+                            "<system-reminder>\n"
+                            "As you answer the user's questions, you can use the following context:\n"
+                            "# claudeMd\n"
+                            "Run lint, typecheck, tests, and static analysis after changes.\n"
+                        ),
+                    }]},
+                    {"role": "system", "content": "SessionStart:startup hook success: Previous session summary: run tests"},
+                ],
+                "tools": [{
+                    "name": "Bash",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                }],
+                "max_tokens": 128,
+            }, client)
+
+            self.assertEqual(result.get("stop_reason"), "end_turn")
+            text = result.get("content", [{}])[0].get("text", "")
+            self.assertEqual(text, "ok")
+            self.assertEqual(len(client.requests), 1)
+            ctx = result.get("gateway_context") or {}
+            intent = (((ctx.get("agent_planner") or {}).get("intent")) or {})
+            self.assertEqual(intent.get("kind"), "plain_chat")
+            self.assertEqual(intent.get("workflow"), "chat_only_synthesis")
+        finally:
+            gateway.CONFIG_PATH = old_config
+            os.chdir(old_cwd)
+            if old_ws is None:
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+            else:
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = old_ws
+            if old_runtime is None:
+                os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+            else:
+                os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+            if old_strict is None:
+                os.environ.pop("GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN", None)
+            else:
+                os.environ["GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN"] = old_strict
+            if planner is not None:
+                planner._STORE = None
+
+    def test_plain_chat_is_wrapped_by_agent_planner_envelope(self):
+        from src.gateway_config import save_config
+        from src.gateway_tool_runtime import run_tool_orchestration
+        from src.gateway_agent_planner import list_runtime_events
+
+        td = self._setup_workspace()
+        old_config = gateway.CONFIG_PATH
+        old_cwd = os.getcwd()
+        old_ws = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+        old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+        old_strict = os.environ.get("GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN")
+        planner = None
+        try:
+            import src.gateway_agent_planner as planner
+            planner._STORE = None
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+            os.environ["GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN"] = "1"
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            cfg = gateway._default_config()
+            cfg["gateway"]["workspace_root"] = td
+            cfg["gateway"]["tool_mode"] = "orchestrate"
+            cfg["gateway"]["agent_planner_strict_every_turn"] = True
+            cfg["upstream"]["tools_enabled"] = "adapter"
+            cfg["upstream"]["protocol"] = "openai_chat"
+            cfg["upstream"]["capabilities"]["supports_tools"] = False
+            cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+            save_config(cfg)
+            os.chdir(td)
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = td
+
+            weak_resp = {"id": "plain", "choices": [{"message": {"role": "assistant", "content": "hi there"},
+                                                       "finish_reason": "stop"}],
+                         "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+            client = FakeClient([weak_resp])
+            result = run_tool_orchestration("/v1/messages", {
+                "model": "weak",
+                "metadata": {"session_id": "plain-planner-session", "user_id": json.dumps({"user_id": "plain-planner-user"})},
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{
+                    "name": "Bash",
+                    "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}},
+                }],
+                "max_tokens": 4096,
+            }, client)
+
+            self.assertEqual(result.get("content", [{}])[0].get("text"), "hi there")
+            ctx = result.get("gateway_context") or {}
+            self.assertEqual(ctx.get("strategy"), "agent_planner_final_synthesis")
+            self.assertTrue(ctx.get("chat_only_synthesis"))
+            planner_ctx = ctx.get("agent_planner") or {}
+            self.assertEqual(planner_ctx.get("workflow"), "chat_only_synthesis")
+            self.assertEqual((planner_ctx.get("intent") or {}).get("kind"), "plain_chat")
+            upstream_body = client.requests[0][1]
+            self.assertNotIn("tools", upstream_body)
+            system_text = (upstream_body.get("messages") or [{}])[0].get("content", "")
+            self.assertIn("Gateway Agent Planner evidence/envelope", system_text)
+            self.assertIn('"kind": "plain_chat"', system_text)
+            events = list_runtime_events(20, tenant_contains="plain-planner-user")
+            event_types = [event.get("event_type") for event in events]
+            self.assertIn("intent_classification", event_types)
+            self.assertIn("chat_only_synthesis_boundary", event_types)
+        finally:
+            gateway.CONFIG_PATH = old_config
+            os.chdir(old_cwd)
+            if old_ws is None:
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+            else:
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = old_ws
+            if old_runtime is None:
+                os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+            else:
+                os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+            if old_strict is None:
+                os.environ.pop("GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN", None)
+            else:
+                os.environ["GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN"] = old_strict
+            if planner is not None:
+                planner._STORE = None
+
+    def test_chat_only_final_synthesis_ignores_upstream_json_tool_request(self):
+        from src.gateway_config import save_config
+        from src.gateway_tool_runtime import run_tool_orchestration
+        from src.gateway_agent_planner import list_runtime_events
+
+        td = self._setup_workspace()
+        old_config = gateway.CONFIG_PATH
+        old_cwd = os.getcwd()
+        old_ws = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+        old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+        planner = None
+        try:
+            import src.gateway_agent_planner as planner
+            planner._STORE = None
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            cfg = gateway._default_config()
+            cfg["gateway"]["workspace_root"] = td
+            cfg["gateway"]["tool_mode"] = "orchestrate"
+            cfg["upstream"]["tools_enabled"] = "adapter"
+            cfg["upstream"]["protocol"] = "openai_chat"
+            cfg["upstream"]["capabilities"]["supports_tools"] = False
+            cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+            save_config(cfg)
+            os.chdir(td)
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = td
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+
+            fake_tool_json = '{"name":"Edit","arguments":{"file_path":"README.md","old_string":"A","new_string":"B"}}'
+            client = FakeClient([{
+                "id": "c1",
+                "choices": [{"message": {"role": "assistant", "content": fake_tool_json}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            }])
+            result = run_tool_orchestration("/v1/messages", {
+                "model": "weak",
+                "metadata": {
+                    "session_id": "ignored-upstream-tool-session",
+                    "user_id": json.dumps({"user_id": "ignored-upstream-tool-user"}),
+                },
+                "messages": [
+                    {"role": "user", "content": "分析这套项目"},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "read_1", "name": "Read", "input": {"file_path": "README.md"}},
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "read_1", "content": "# TestProject\nA"},
+                    ]},
+                ],
+                "tools": [{
+                    "name": "Edit",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"},
+                        },
+                        "required": ["file_path", "old_string", "new_string"],
+                    },
+                }],
+                "max_tokens": 4096,
+            }, client)
+
+            self.assertEqual(len(client.requests), 1)
+            upstream_body = client.requests[0][1]
+            self.assertNotIn("tools", upstream_body)
+            self.assertNotIn("gateway_context", upstream_body)
+            self.assertNotIn("gateway_agent_planner", upstream_body)
+            content = result.get("content") or []
+            self.assertEqual(content[0].get("type"), "text")
+            self.assertIn('"name":"Edit"', content[0].get("text", ""))
+            self.assertFalse([block for block in content if block.get("type") == "tool_use"])
+            self.assertTrue((result.get("gateway_context") or {}).get("chat_only_synthesis"))
+            events = list_runtime_events(
+                10,
+                tenant_contains="ignored-upstream-tool-user",
+                event_type="upstream_tool_attempt_ignored",
+            )
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["workflow"], "chat_only_synthesis")
+            self.assertEqual(events[0]["step"], "ignore_upstream_tool_attempt")
+            self.assertFalse(events[0]["metadata"]["tool_authority_granted"])
+            self.assertEqual(events[0]["metadata"]["calls"][0]["name"], "Edit")
+            self.assertIn("ignored-upstream-tool-session", events[0]["session_key"])
+        finally:
+            gateway.CONFIG_PATH = old_config
+            os.chdir(old_cwd)
+            if old_ws is None:
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+            else:
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = old_ws
+            if old_runtime is None:
+                os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+            else:
+                os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+            if planner is not None:
+                planner._STORE = None
+
+    def test_intent_detection_does_not_treat_files_to_as_ls_tool(self):
+        from src.gateway_tool_runtime import _detect_intent_tool_calls
+
+        body = {
+            "model": "weak",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"name": "Bash", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}}],
+        }
+        response = {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Let me gather the project structure and key files to analyze this project."}],
+            "stop_reason": "end_turn",
+        }
+
+        self.assertEqual(_detect_intent_tool_calls("/v1/messages", response, body), [])
+
+    def test_intent_detection_falls_back_to_declared_bash_when_ls_absent(self):
+        from src.gateway_tool_runtime import _detect_intent_tool_calls
+
+        body = {
+            "model": "weak",
+            "messages": [{"role": "user", "content": "列出当前目录"}],
+            "tools": [{"name": "Bash", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}}],
+        }
+        response = {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ls ."}],
+            "stop_reason": "end_turn",
+        }
+
+        calls = _detect_intent_tool_calls("/v1/messages", response, body)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "Bash")
+        self.assertEqual(calls[0].arguments.get("command"), "ls .")
+
+    def test_intent_detection_gather_project_followup_uses_declared_bash(self):
+        from src.gateway_tool_runtime import _detect_intent_tool_calls
+
+        body = {
+            "model": "weak",
+            "messages": [
+                {"role": "user", "content": "分析这套项目"},
+                {"role": "assistant", "content": [{"type": "tool_use", "name": "Skill", "input": {"skill": "codebase-onboarding"}}]},
+                {"role": "user", "content": [{"type": "tool_result", "content": "Successfully loaded skill", "tool_use_id": "x"}]},
+            ],
+            "tools": [{"name": "Bash", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}}],
+        }
+        response = {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Let me gather the project structure and key files to analyze this project."}],
+            "stop_reason": "end_turn",
+        }
+
+        calls = _detect_intent_tool_calls("/v1/messages", response, body)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].name, "Bash")
+        self.assertIn("find", calls[0].arguments.get("command", ""))
+
+    def test_chat_only_read_uses_declared_read_file_path_schema(self):
+        result = self._run("/v1/messages", {
+            "model": "weak",
+            "messages": [{"role": "user", "content": "读取 README.md"}],
+            "tools": [{
+                "name": "Read",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                    "additionalProperties": False,
+                },
+            }],
+            "max_tokens": 4096,
+        })
+
+        tool_use = [b for b in (result.get("content") or []) if b.get("type") == "tool_use"]
+        self.assertEqual(tool_use[0].get("name"), "Read")
+        self.assertTrue(str(tool_use[0].get("input", {}).get("file_path", "")).endswith("/README.md"))
+
+    def test_agent_planner_does_not_repeat_read_after_tool_result(self):
+        result = self._run("/v1/messages", {
+            "model": "weak",
+            "messages": [
+                {"role": "user", "content": "读取 README.md"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "planner_read_file_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "name": "Read", "input": {"file_path": "README.md"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "planner_read_file_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "content": "# TestProject\n\nThis is a test."},
+                ]},
+            ],
+            "tools": [{
+                "name": "Read",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                    "additionalProperties": False,
+                },
+            }],
+            "max_tokens": 4096,
+        })
+
+        self.assertNotEqual(result.get("stop_reason"), "tool_use")
+        self.assertFalse([b for b in (result.get("content") or []) if isinstance(b, dict) and b.get("type") == "tool_use"])
+
+    def test_agent_planner_does_not_repeat_responses_read_after_function_output(self):
+        result = self._run("/v1/responses", {
+            "model": "weak",
+            "input": [
+                {"role": "user", "content": "Read README.md"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_read_1",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "sed -n '1,240p' README.md"}),
+                },
+                {"type": "function_call_output", "call_id": "call_read_1", "output": "# TestProject\n\nThis is a test."},
+            ],
+            "tools": [{
+                "type": "function",
+                "name": "exec_command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"cmd": {"type": "string"}},
+                    "required": ["cmd"],
+                    "additionalProperties": False,
+                },
+            }],
+            "max_tokens": 4096,
+        }, upstream_protocol="openai_responses")
+
+        self.assertFalse([o for o in (result.get("output") or []) if isinstance(o, dict) and o.get("type") == "function_call"])
+        self.assertEqual(result.get("status"), "completed")
+
+    def test_chat_only_skill_uses_declared_claude_code_skill_schema(self):
+        result = self._run("/v1/messages", {
+            "model": "weak",
+            "messages": [{"role": "user", "content": "Read skill live-skill"}],
+            "tools": [{
+                "name": "Skill",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"skill": {"type": "string"}, "args": {"type": "string"}},
+                    "required": ["skill"],
+                    "additionalProperties": False,
+                },
+            }],
+            "max_tokens": 4096,
+        })
+
+        tool_use = [b for b in (result.get("content") or []) if b.get("type") == "tool_use"]
+        self.assertEqual(tool_use[0].get("name"), "Skill")
+        self.assertEqual(tool_use[0].get("input"), {"skill": "live-skill"})
+
+    def test_chat_only_web_search_uses_declared_downstream_tool_name(self):
+        from src.gateway_config import save_config
+        from src.gateway_tool_runtime import run_tool_orchestration
+
+        td = self._setup_workspace()
+        old_config = gateway.CONFIG_PATH
+        try:
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            cfg = gateway._default_config()
+            cfg["gateway"]["workspace_root"] = td
+            cfg["gateway"]["tool_mode"] = "orchestrate"
+            cfg["upstream"]["tools_enabled"] = "adapter"
+            cfg["upstream"]["capabilities"]["supports_tools"] = False
+            cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+            save_config(cfg)
+
+            client = FakeClient([])
+            result = run_tool_orchestration("/v1/chat/completions", {
+                "model": "weak",
+                "messages": [{"role": "user", "content": "请联网搜索 python pathlib latest docs"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"query": {"type": "string"}},
+                            "required": ["query"],
+                        },
+                    },
+                }],
+            }, client)
+
+            self.assertEqual(client.requests, [])
+            choice = (result.get("choices") or [{}])[0]
+            call = ((choice.get("message") or {}).get("tool_calls") or [{}])[0]
+            self.assertEqual(call.get("function", {}).get("name"), "web_search")
+            self.assertIn("pathlib", call.get("function", {}).get("arguments", ""))
+            self.assertEqual(choice.get("finish_reason"), "tool_calls")
+            self.assertEqual((result.get("gateway_context") or {}).get("agent_planner", {}).get("step"), "web_search")
+        finally:
+            gateway.CONFIG_PATH = old_config
+
+    def test_chat_only_declared_calculator_collision_surfaces_downstream_tool(self):
+        from src.gateway_config import save_config
+        from src.gateway_tool_runtime import run_tool_orchestration
+
+        td = self._setup_workspace()
+        old_config = gateway.CONFIG_PATH
+        try:
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            cfg = gateway._default_config()
+            cfg["gateway"]["workspace_root"] = td
+            cfg["gateway"]["tool_mode"] = "orchestrate"
+            cfg["upstream"]["tools_enabled"] = "adapter"
+            cfg["upstream"]["capabilities"]["supports_tools"] = False
+            cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+            save_config(cfg)
+
+            client = FakeClient([])
+            result = run_tool_orchestration("/v1/chat/completions", {
+                "model": "weak",
+                "messages": [{"role": "user", "content": "Calculate 6*7 for me"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "calculator",
+                        "description": "Client-side calculator function",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"expression": {"type": "string"}},
+                            "required": ["expression"],
+                        },
+                    },
+                }],
+            }, client)
+
+            self.assertEqual(client.requests, [])
+            choice = (result.get("choices") or [{}])[0]
+            call = ((choice.get("message") or {}).get("tool_calls") or [{}])[0]
+            self.assertEqual(call.get("function", {}).get("name"), "calculator")
+            self.assertIn("6*7", call.get("function", {}).get("arguments", ""))
+            self.assertEqual(choice.get("finish_reason"), "tool_calls")
+            self.assertEqual((result.get("gateway_context") or {}).get("agent_planner", {}).get("step"), "custom_function")
+        finally:
+            gateway.CONFIG_PATH = old_config
+
+    def test_chat_only_custom_function_call_is_surfaced_without_upstream_native_support(self):
+        from src.gateway_config import save_config
+        from src.gateway_tool_runtime import run_tool_orchestration
+
+        td = self._setup_workspace()
+        old_config = gateway.CONFIG_PATH
+        try:
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            cfg = gateway._default_config()
+            cfg["gateway"]["workspace_root"] = td
+            cfg["gateway"]["tool_mode"] = "orchestrate"
+            cfg["upstream"]["tools_enabled"] = "adapter"
+            cfg["upstream"]["capabilities"]["supports_tools"] = False
+            cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+            save_config(cfg)
+
+            client = FakeClient([])
+            result = run_tool_orchestration("/v1/chat/completions", {
+                "model": "weak",
+                "messages": [{"role": "user", "content": "What's the weather in San Francisco today?"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get current weather for a location",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"location": {"type": "string"}},
+                            "required": ["location"],
+                        },
+                    },
+                }],
+            }, client)
+
+            self.assertEqual(client.requests, [])
+            choice = (result.get("choices") or [{}])[0]
+            call = ((choice.get("message") or {}).get("tool_calls") or [{}])[0]
+            self.assertEqual(call.get("function", {}).get("name"), "get_weather")
+            self.assertIn("San Francisco", call.get("function", {}).get("arguments", ""))
+            self.assertEqual(choice.get("finish_reason"), "tool_calls")
+            self.assertEqual((result.get("gateway_context") or {}).get("agent_planner", {}).get("step"), "custom_function")
+        finally:
+            gateway.CONFIG_PATH = old_config
+
+    def test_chat_only_custom_function_call_infers_json_schema_arguments(self):
+        from src.gateway_config import save_config
+        from src.gateway_tool_runtime import run_tool_orchestration
+
+        td = self._setup_workspace()
+        old_config = gateway.CONFIG_PATH
+        try:
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            cfg = gateway._default_config()
+            cfg["gateway"]["workspace_root"] = td
+            cfg["gateway"]["tool_mode"] = "orchestrate"
+            cfg["upstream"]["tools_enabled"] = "adapter"
+            cfg["upstream"]["capabilities"]["supports_tools"] = False
+            cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+            save_config(cfg)
+
+            client = FakeClient([])
+            result = run_tool_orchestration("/v1/chat/completions", {
+                "model": "weak",
+                "messages": [{
+                    "role": "user",
+                    "content": (
+                        "Please create_ticket with "
+                        '{"title":"API tool bug","priority":"high","estimate":3,'
+                        '"tags":["codex","tool"],"metadata":{"source":"claude-code"}}'
+                    ),
+                }],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "create_ticket",
+                        "description": "Create a support ticket",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string"},
+                                "priority": {"type": "string", "enum": ["low", "medium", "high"]},
+                                "estimate": {"type": "integer"},
+                                "tags": {"type": "array", "items": {"type": "string"}},
+                                "metadata": {
+                                    "type": "object",
+                                    "properties": {"source": {"type": "string"}},
+                                    "required": ["source"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                            "required": ["title", "priority", "estimate", "tags", "metadata"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }],
+            }, client)
+
+            self.assertEqual(client.requests, [])
+            choice = (result.get("choices") or [{}])[0]
+            call = ((choice.get("message") or {}).get("tool_calls") or [{}])[0]
+            self.assertEqual(call.get("function", {}).get("name"), "create_ticket")
+            args = json.loads(call.get("function", {}).get("arguments") or "{}")
+            self.assertEqual(args, {
+                "title": "API tool bug",
+                "priority": "high",
+                "estimate": 3,
+                "tags": ["codex", "tool"],
+                "metadata": {"source": "claude-code"},
+            })
+            self.assertEqual(choice.get("finish_reason"), "tool_calls")
+            self.assertEqual((result.get("gateway_context") or {}).get("agent_planner", {}).get("step"), "custom_function")
+        finally:
+            gateway.CONFIG_PATH = old_config
+
+    def test_agent_planner_periodically_compacts_evidence_with_llm_summary(self):
+        from unittest import mock
+        from src.gateway_agent_planner import PlannerToolEvidence, _update_state_with_evidence
+
+        evidence = [
+            PlannerToolEvidence(f"call_{idx}", "Bash", f"tool output {idx} src/file_{idx}.py")
+            for idx in range(4)
+        ]
+        with mock.patch("src.gateway_agent_planner._summarize_planner_evidence_via_llm", return_value="LLM COMPACT SUMMARY") as summarizer:
+            state = _update_state_with_evidence({}, evidence)
+
+        summarizer.assert_called_once()
+        self.assertEqual(state.get("evidence_summary"), "LLM COMPACT SUMMARY")
+        self.assertEqual(state.get("compaction_count"), 1)
+        self.assertEqual(state.get("llm_compaction_count"), 1)
+
+    def test_agent_runtime_events_record_dispatch_result_and_compaction(self):
+        from src.gateway_agent_planner import (
+            PlannerToolEvidence,
+            _update_state_with_evidence,
+            list_runtime_events,
+            plan_downstream_tool_request,
+            planner_state_snapshot,
+        )
+
+        td = self._setup_workspace()
+        old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+        old_ws = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+        old_every = os.environ.get("GATEWAY_AGENT_PLANNER_SUMMARY_EVERY")
+        old_llm = os.environ.get("GATEWAY_AGENT_PLANNER_LLM_SUMMARY")
+        try:
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = td
+            os.environ["GATEWAY_AGENT_PLANNER_SUMMARY_EVERY"] = "1"
+            os.environ["GATEWAY_AGENT_PLANNER_LLM_SUMMARY"] = "0"
+            import src.gateway_agent_planner as planner
+            planner._STORE = None
+            body = {
+                "model": "weak",
+                "metadata": {"session_id": "timeline-session", "user_id": json.dumps({"user_id": "timeline-user"})},
+                "messages": [
+                    {"role": "system", "content": "Available skills:\n- codebase-onboarding"},
+                    {"role": "user", "content": "分析这套项目"},
+                ],
+                "tools": [{
+                    "name": "Skill",
+                    "input_schema": {"type": "object", "properties": {"skill": {"type": "string"}}, "required": ["skill"]},
+                }],
+            }
+            decision = plan_downstream_tool_request("/v1/messages", body)
+            self.assertIsNotNone(decision)
+            self.assertTrue(decision.calls)
+            snapshot = planner_state_snapshot(decision.state)
+            self.assertEqual(snapshot["intent"]["kind"], "project_analysis")
+            self.assertEqual(snapshot["intent"]["workflow"], "project_analysis")
+            self.assertIn("declared_tools", snapshot["intent"]["signals"])
+            self.assertEqual(snapshot["last_decision"]["workflow"], "project_analysis")
+            self.assertEqual(snapshot["last_decision"]["step"], "codebase_onboarding")
+            self.assertEqual(snapshot["last_decision"]["calls"][0]["name"], decision.calls[0].name)
+            persisted = planner._store().list_recent(10, tenant_contains="timeline-user")
+            self.assertEqual(persisted[0]["intent"]["kind"], "project_analysis")
+            self.assertEqual(persisted[0]["last_decision"]["step"], "codebase_onboarding")
+            state = _update_state_with_evidence(
+                decision.state,
+                [PlannerToolEvidence(decision.calls[0].call_id, decision.calls[0].name, "loaded onboarding", False)],
+            )
+            self.assertEqual(state.get("evidence_count"), 1)
+
+            events = list_runtime_events(20, tenant_contains="timeline-user")
+            event_types = {event["event_type"] for event in events}
+            self.assertIn("intent_classification", event_types)
+            self.assertIn("tool_dispatch", event_types)
+            self.assertIn("tool_result", event_types)
+            self.assertIn("evidence_compaction", event_types)
+            intent_event = next(event for event in events if event["event_type"] == "intent_classification")
+            self.assertEqual(intent_event["metadata"]["intent"]["kind"], "project_analysis")
+            dispatch = next(event for event in events if event["event_type"] == "tool_dispatch")
+            self.assertEqual(dispatch["workflow"], "project_analysis")
+            self.assertEqual(dispatch["step"], "codebase_onboarding")
+            self.assertEqual(dispatch["metadata"]["calls"][0]["name"], decision.calls[0].name)
+        finally:
+            if old_runtime is None:
+                os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+            else:
+                os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+            if old_ws is None:
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+            else:
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = old_ws
+            if old_every is None:
+                os.environ.pop("GATEWAY_AGENT_PLANNER_SUMMARY_EVERY", None)
+            else:
+                os.environ["GATEWAY_AGENT_PLANNER_SUMMARY_EVERY"] = old_every
+            if old_llm is None:
+                os.environ.pop("GATEWAY_AGENT_PLANNER_LLM_SUMMARY", None)
+            else:
+                os.environ["GATEWAY_AGENT_PLANNER_LLM_SUMMARY"] = old_llm
+            planner._STORE = None
+
+    def test_agent_planner_records_completed_steps_from_planner_tool_ids(self):
+        from src.gateway_agent_planner import PlannerToolEvidence, _update_state_with_evidence
+
+        state = _update_state_with_evidence({}, [
+            PlannerToolEvidence(
+                "planner_project_structure_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "mcp__codebase_memory_mcp__get_architecture",
+                "architecture evidence",
+            )
+        ])
+
+        self.assertIn("project_structure", state.get("completed_steps") or [])
+
+    def test_agent_planner_session_key_stays_stable_across_tool_result_turns(self):
+        from src.gateway_agent_planner import planner_session_key
+
+        td = self._setup_workspace()
+        old_ws = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+        try:
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = td
+            first_turn = {
+                "model": "weak",
+                "messages": [{"role": "user", "content": "运行测试并修复"}],
+            }
+            tool_result_turn = {
+                "model": "weak",
+                "messages": [
+                    {"role": "user", "content": "运行测试并修复"},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "bash_1", "name": "Bash", "input": {"command": "python3 -m pytest -q"}},
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "bash_1", "content": "exit_code=1\nFAILED tests/test_app.py"},
+                    ]},
+                ],
+            }
+
+            self.assertEqual(
+                planner_session_key("/v1/messages", first_turn),
+                planner_session_key("/v1/messages", tool_result_turn),
+            )
+        finally:
+            if old_ws is None:
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+            else:
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = old_ws
+
+    def test_agent_planner_session_key_ignores_recalled_memory_anchor_noise(self):
+        from src.gateway_agent_planner import planner_session_key
+
+        td = self._setup_workspace()
+        old_ws = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+        try:
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = td
+            base = {
+                "model": "weak",
+                "messages": [{"role": "user", "content": "分析这套项目"}],
+            }
+            with_memory_a = {
+                "model": "weak",
+                "messages": [{"role": "user", "content": [
+                    {
+                        "type": "text",
+                        "text": "[Gateway recalled memory]\n[Conversation Memories]\n- 上次读取 OLD_A.md\n\n",
+                    },
+                    {"type": "text", "text": "分析这套项目"},
+                ]}],
+            }
+            with_memory_b = {
+                "model": "weak",
+                "messages": [{"role": "user", "content": [
+                    {
+                        "type": "text",
+                        "text": "[Gateway recalled memory]\n[Conversation Memories]\n- 上次读取 OLD_B.md\n\n",
+                    },
+                    {"type": "text", "text": "分析这套项目"},
+                ]}],
+            }
+
+            self.assertEqual(
+                planner_session_key("/v1/messages", base),
+                planner_session_key("/v1/messages", with_memory_a),
+            )
+            self.assertEqual(
+                planner_session_key("/v1/messages", with_memory_a),
+                planner_session_key("/v1/messages", with_memory_b),
+            )
+        finally:
+            if old_ws is None:
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+            else:
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = old_ws
+
+    def test_agent_planner_responses_session_key_ignores_recalled_memory_anchor_noise(self):
+        from src.gateway_agent_planner import planner_session_key
+
+        td = self._setup_workspace()
+        old_ws = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+        try:
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = td
+            base = {"model": "weak", "input": "分析这套项目"}
+            with_memory = {
+                "model": "weak",
+                "input": "[Gateway recalled memory]\n[Conversation Memories]\n- 上次读取 OLD.md\n\n分析这套项目",
+            }
+
+            self.assertEqual(
+                planner_session_key("/v1/responses", base),
+                planner_session_key("/v1/responses", with_memory),
+            )
+        finally:
+            if old_ws is None:
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+            else:
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = old_ws
+
+    def test_agent_planner_session_key_is_tenant_scoped_for_remote_service(self):
+        from src.gateway_agent_planner import planner_session_key
+        from src.gateway_tool_runtime import _workspace_scope
+
+        td = pathlib.Path(self._setup_workspace())
+        body_a = {
+            "model": "weak",
+            "metadata": {"session_id": "shared-session", "user_id": json.dumps({"user_id": "user-a"})},
+            "messages": [{"role": "user", "content": "分析这套项目"}],
+        }
+        body_b = {
+            "model": "weak",
+            "metadata": {"session_id": "shared-session", "user_id": json.dumps({"user_id": "user-b"})},
+            "messages": [{"role": "user", "content": "分析这套项目"}],
+        }
+        with _workspace_scope(td):
+            key_a = planner_session_key("/v1/messages", body_a)
+            key_b = planner_session_key("/v1/messages", body_b)
+        self.assertNotEqual(key_a, key_b)
+        self.assertIn("tenant:user-a", key_a)
+        self.assertIn("tenant:user-b", key_b)
+
+    def test_agent_planner_session_key_without_scope_does_not_use_gateway_env_root_for_remote_identity(self):
+        from src.gateway_agent_planner import planner_session_key
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            service_root = pathlib.Path(td) / "gateway-service-root"
+            service_root.mkdir()
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = str(service_root)
+            try:
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = str(service_root)
+                gateway.save_config(cfg)
+
+                body = {
+                    "model": "weak",
+                    "metadata": {
+                        "session_id": "remote-planner-session",
+                        "user_id": json.dumps({"user_id": "remote-planner-user"}),
+                    },
+                    "messages": [{"role": "user", "content": "分析这套项目"}],
+                }
+                key_a = planner_session_key("/v1/messages", body)
+                key_b = planner_session_key("/v1/messages", body)
+
+                self.assertEqual(key_a, key_b)
+                self.assertIn("tenant:remote-planner-user", key_a)
+                self.assertIn("anonymous_spaces", key_a)
+                self.assertNotIn(str(service_root.resolve()), key_a)
+            finally:
+                gateway.CONFIG_PATH = old_config
+                if old_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_root
+
+    def test_agent_planner_session_key_accepts_metadata_tenant_alias(self):
+        from src.gateway_agent_planner import planner_session_key
+        from src.gateway_tool_runtime import _workspace_scope
+
+        td = pathlib.Path(self._setup_workspace())
+        body = {
+            "model": "weak",
+            "metadata": {"tenant": "tenant-alias-user", "session_id": "shared-session"},
+            "messages": [{"role": "user", "content": "分析这套项目"}],
+        }
+        with _workspace_scope(td):
+            key = planner_session_key("/v1/messages", body)
+        self.assertIn("tenant:tenant-alias-user", key)
+        self.assertIn("session_id:shared-session", key)
+
+    def test_agent_planner_uses_history_only_for_followup_not_plain_thanks(self):
+        from src.gateway_agent_planner import classify_planner_intent
+
+        body = {
+            "model": "weak",
+            "messages": [
+                {"role": "user", "content": "分析这套项目"},
+                {"role": "assistant", "content": "我先读取项目结构。"},
+                {"role": "user", "content": "谢谢"},
+            ],
+            "tools": [{"name": "Bash", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}}],
+        }
+
+        intent = classify_planner_intent("/v1/messages", body)
+        self.assertEqual(intent["kind"], "plain_chat")
+        self.assertEqual(intent["workflow"], "chat_only_synthesis")
+
+    def test_agent_planner_plain_thanks_after_project_history_does_not_dispatch_project_tool(self):
+        from src.gateway_agent_planner import plan_downstream_tool_request
+
+        body = {
+            "model": "weak",
+            "messages": [
+                {"role": "user", "content": "分析这套项目"},
+                {"role": "assistant", "content": "我先读取项目结构。"},
+                {"role": "user", "content": "谢谢"},
+            ],
+            "tools": [{"name": "Bash", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}}],
+        }
+
+        decision = plan_downstream_tool_request("/v1/messages", body)
+        self.assertIsNone(decision)
+
+    def test_agent_planner_uses_history_for_explicit_project_followup(self):
+        from src.gateway_agent_planner import classify_planner_intent
+
+        body = {
+            "model": "weak",
+            "messages": [
+                {"role": "user", "content": "分析这套项目"},
+                {"role": "assistant", "content": "我先读取项目结构。"},
+                {"role": "user", "content": "继续"},
+            ],
+            "tools": [{"name": "Bash", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}}],
+        }
+
+        intent = classify_planner_intent("/v1/messages", body)
+        self.assertEqual(intent["kind"], "project_analysis")
+        self.assertEqual(intent["workflow"], "project_analysis")
+        self.assertIn("conversation_followup", intent.get("signals") or [])
+
+    def test_agent_planner_history_validation_does_not_pollute_plain_followup(self):
+        from src.gateway_agent_planner import classify_planner_intent
+
+        body = {
+            "model": "weak",
+            "messages": [
+                {"role": "user", "content": "运行测试"},
+                {"role": "assistant", "content": "测试已运行。"},
+                {"role": "user", "content": "ok"},
+            ],
+            "tools": [{"name": "Bash", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}}],
+        }
+
+        intent = classify_planner_intent("/v1/messages", body)
+        self.assertEqual(intent["kind"], "plain_chat")
+        self.assertEqual(intent["workflow"], "chat_only_synthesis")
+
+    def test_agent_planner_bounds_huge_plain_chat_before_intent_regexes(self):
+        from src.gateway_agent_planner import classify_planner_intent
+
+        huge = "hello, just remember this note. " + ("CURRENT-HUGE-FILLER-" * 2000)
+        intent = classify_planner_intent(
+            "/v1/responses",
+            {"model": "weak", "input": huge, "metadata": {"session_id": "huge", "user_id": json.dumps({"user_id": "huge-user"})}},
+        )
+        self.assertEqual(intent["kind"], "plain_chat")
+        self.assertEqual(intent["workflow"], "chat_only_synthesis")
+
+    def test_agent_planner_ignores_recalled_memory_for_current_intent(self):
+        from src.gateway_agent_planner import plan_downstream_tool_request
+
+        td = self._setup_workspace()
+        old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+        old_ws = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+        planner = None
+        try:
+            import src.gateway_agent_planner as planner
+            planner._STORE = None
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = td
+            body = {
+                "model": "weak",
+                "metadata": {"session_id": "memory-intent", "user_id": json.dumps({"user_id": "memory-user"})},
+                "messages": [{"role": "user", "content": [
+                    {
+                        "type": "text",
+                        "text": "[Gateway recalled memory]\n[Conversation Memories]\n- 上次用户要求读取 OLD.md 并分析项目\n\n",
+                    },
+                    {"type": "text", "text": "hi"},
+                ]}],
+                "tools": [{
+                    "name": "Read",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                        "required": ["file_path"],
+                    },
+                }],
+                "max_tokens": 4096,
+            }
+
+            self.assertIsNone(plan_downstream_tool_request("/v1/messages", body))
+            persisted = planner._store().list_recent(10, tenant_contains="memory-user")
+            self.assertTrue(persisted)
+            self.assertEqual(persisted[0]["intent"]["kind"], "plain_chat")
+            serialized_intent = json.dumps(persisted[0]["intent"], ensure_ascii=False)
+            self.assertNotIn("OLD.md", serialized_intent)
+        finally:
+            if old_runtime is None:
+                os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+            else:
+                os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+            if old_ws is None:
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+            else:
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = old_ws
+            if planner is not None:
+                planner._STORE = None
+
+    def test_agent_planner_prefers_current_request_over_recalled_memory_paths(self):
+        from src.gateway_agent_planner import plan_downstream_tool_request
+
+        td = self._setup_workspace()
+        old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+        old_ws = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+        planner = None
+        try:
+            import src.gateway_agent_planner as planner
+            planner._STORE = None
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = td
+            body = {
+                "model": "weak",
+                "metadata": {"session_id": "memory-path", "user_id": json.dumps({"user_id": "memory-user"})},
+                "messages": [{"role": "user", "content": [
+                    {
+                        "type": "text",
+                        "text": "[Gateway recalled memory]\n[Conversation Memories]\n- 上次读取 OLD.md\n\n",
+                    },
+                    {"type": "text", "text": "请读取 README.md"},
+                ]}],
+                "tools": [{
+                    "name": "Read",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                        "required": ["file_path"],
+                    },
+                }],
+                "max_tokens": 4096,
+            }
+
+            decision = plan_downstream_tool_request("/v1/messages", body)
+            self.assertIsNotNone(decision)
+            self.assertEqual(decision.calls[0].name, "Read")
+            serialized_args = json.dumps(decision.calls[0].arguments, ensure_ascii=False)
+            self.assertIn("README.md", serialized_args)
+            self.assertNotIn("OLD.md", serialized_args)
+        finally:
+            if old_runtime is None:
+                os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+            else:
+                os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+            if old_ws is None:
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+            else:
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = old_ws
+            if planner is not None:
+                planner._STORE = None
+
+    def test_agent_planner_parallel_users_keep_intent_and_workspace_isolated(self):
+        from src.gateway_tool_runtime import run_tool_orchestration
+
+        td = self._setup_workspace()
+        old_config = gateway.CONFIG_PATH
+        old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
+        old_ws = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+        planner = None
+        try:
+            import src.gateway_agent_planner as planner
+            planner._STORE = None
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_RUNTIME_DIR"] = str(pathlib.Path(td) / "runtime")
+            os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+            cfg = gateway._default_config()
+            cfg["gateway"]["tool_mode"] = "orchestrate"
+            cfg["upstream"]["tools_enabled"] = "adapter"
+            cfg["upstream"]["capabilities"]["supports_tools"] = False
+            cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+            gateway.save_config(cfg)
+
+            workspace_a = pathlib.Path(td) / "client-a"
+            workspace_b = pathlib.Path(td) / "client-b"
+            workspace_a.mkdir()
+            workspace_b.mkdir()
+            workspace_a_key = str(workspace_a.resolve())
+            workspace_b_key = str(workspace_b.resolve())
+            (workspace_a / "README.md").write_text("A\n", encoding="utf-8")
+            (workspace_b / "README.md").write_text("B\n", encoding="utf-8")
+            barrier = threading.Barrier(2)
+            results: dict[str, Json] = {}
+            errors: list[str] = []
+
+            def worker(name: str, root: pathlib.Path) -> None:
+                try:
+                    barrier.wait(timeout=5)
+                    client = FakeClient([])
+                    body = {
+                        "model": "weak",
+                        "workspace_root": str(root),
+                        "metadata": {"session_id": "parallel-session", "user_id": json.dumps({"user_id": name})},
+                        "messages": [{"role": "user", "content": "请读取 README.md"}],
+                        "tools": [{
+                            "name": "Read",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {"file_path": {"type": "string"}},
+                                "required": ["file_path"],
+                            },
+                        }],
+                        "max_tokens": 128,
+                    }
+                    results[name] = run_tool_orchestration("/v1/messages", body, client)
+                    self.assertEqual(client.requests, [])
+                except Exception as exc:  # pragma: no cover - assertion surface for worker threads
+                    errors.append(f"{name}: {exc}")
+
+            t1 = threading.Thread(target=worker, args=("parallel-user-a", workspace_a))
+            t2 = threading.Thread(target=worker, args=("parallel-user-b", workspace_b))
+            t1.start()
+            t2.start()
+            t1.join(timeout=10)
+            t2.join(timeout=10)
+            self.assertEqual(errors, [])
+            self.assertEqual(set(results), {"parallel-user-a", "parallel-user-b"})
+
+            serialized_a = json.dumps(results["parallel-user-a"], ensure_ascii=False)
+            serialized_b = json.dumps(results["parallel-user-b"], ensure_ascii=False)
+            self.assertIn(str(workspace_a / "README.md"), serialized_a)
+            self.assertIn(str(workspace_b / "README.md"), serialized_b)
+            self.assertNotIn(str(workspace_b / "README.md"), serialized_a)
+            self.assertNotIn(str(workspace_a / "README.md"), serialized_b)
+            response_intent_a = (((results["parallel-user-a"].get("gateway_context") or {}).get("agent_planner") or {}).get("intent") or {})
+            response_intent_b = (((results["parallel-user-b"].get("gateway_context") or {}).get("agent_planner") or {}).get("intent") or {})
+            self.assertEqual(response_intent_a.get("kind"), "read_file")
+            self.assertEqual(response_intent_a.get("workflow"), "generic_tool")
+            self.assertEqual(response_intent_b.get("kind"), "read_file")
+            self.assertEqual(response_intent_b.get("workflow"), "generic_tool")
+
+            sessions_a = planner._store().list_recent(10, tenant_contains="parallel-user-a", workspace_contains=workspace_a_key)
+            sessions_b = planner._store().list_recent(10, tenant_contains="parallel-user-b", workspace_contains=workspace_b_key)
+            self.assertEqual(len(sessions_a), 1)
+            self.assertEqual(len(sessions_b), 1)
+            self.assertEqual(sessions_a[0]["intent"]["kind"], "read_file")
+            self.assertEqual(sessions_b[0]["intent"]["kind"], "read_file")
+            self.assertEqual(sessions_a[0]["workspace_key"], workspace_a_key)
+            self.assertEqual(sessions_b[0]["workspace_key"], workspace_b_key)
+        finally:
+            gateway.CONFIG_PATH = old_config
+            if old_runtime is None:
+                os.environ.pop("GATEWAY_RUNTIME_DIR", None)
+            else:
+                os.environ["GATEWAY_RUNTIME_DIR"] = old_runtime
+            if old_ws is None:
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+            else:
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = old_ws
+            if planner is not None:
+                planner._STORE = None
+
+    def test_agent_planner_evidence_survives_upstream_context_compaction(self):
+        from src.gateway_config import save_config
+        from src.gateway_tool_runtime import run_tool_orchestration
+
+        td = self._setup_workspace()
+        old_config = gateway.CONFIG_PATH
+        old_cwd = os.getcwd()
+        old_ws = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+        try:
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            cfg = gateway._default_config()
+            cfg["gateway"]["workspace_root"] = td
+            cfg["gateway"]["tool_mode"] = "orchestrate"
+            cfg["upstream"]["tools_enabled"] = "adapter"
+            cfg["upstream"]["protocol"] = "openai_chat"
+            cfg["upstream"]["capabilities"]["supports_tools"] = False
+            cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+            cfg.setdefault("context", {})
+            cfg["context"]["enabled"] = True
+            cfg["context"]["fanout_enabled"] = False
+            cfg["context"]["max_input_tokens"] = 80
+            cfg["context"]["summary_max_chars"] = 500
+            save_config(cfg)
+            os.chdir(td)
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = td
+
+            weak_resp = {"id": "c1", "choices": [{"message": {"role": "assistant", "content": "final compact synthesis"},
+                                                   "finish_reason": "stop"}],
+                         "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+            client = FakeClient([weak_resp])
+            result = run_tool_orchestration("/v1/messages", {
+                "model": "weak",
+                "messages": [
+                    {"role": "system", "content": "large harness\n" + ("SYSTEM-CONTEXT " * 1000)},
+                    {"role": "user", "content": "分析这套项目\n" + ("user context " * 1000)},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "bash_1", "name": "Bash", "input": {"command": "find ."}},
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "bash_1", "content": "--- files ---\nREADME.md\nsrc/huge.py\n"},
+                    ]},
+                ],
+                "tools": [{
+                    "name": "Bash",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                }],
+                "max_tokens": 4096,
+            }, client)
+
+            self.assertEqual(result.get("content", [{}])[0].get("text"), "final compact synthesis")
+            self.assertEqual(len(client.requests), 1)
+            upstream_body = client.requests[0][1]
+            full_prompt = json.dumps(upstream_body, ensure_ascii=False)
+            self.assertIn("Gateway Agent Planner evidence", full_prompt)
+            self.assertIn("src/huge.py", full_prompt)
+            self.assertNotIn("gateway_context", upstream_body)
+            self.assertNotIn("gateway_agent_planner", upstream_body)
+            self.assertTrue((result.get("gateway_context") or {}).get("compacted"))
+        finally:
+            gateway.CONFIG_PATH = old_config
+            os.chdir(old_cwd)
+            if old_ws is None:
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+            else:
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = old_ws
+
+    def test_agent_planner_code_search_infers_mcp_project_argument(self):
+        old_project = os.environ.get("GATEWAY_CODEBASE_MEMORY_PROJECT")
+        try:
+            os.environ["GATEWAY_CODEBASE_MEMORY_PROJECT"] = "Users-sanbo-Desktop-ai_tool_functioncall"
+            result = self._run("/v1/messages", {
+                "model": "weak",
+                "messages": [{"role": "user", "content": "搜索代码 gateway_tool_runtime"}],
+                "tools": [{
+                    "name": "mcp__codebase_memory_mcp__search_graph",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"project": {"type": "string"}, "query": {"type": "string"}},
+                        "required": ["project", "query"],
+                        "additionalProperties": False,
+                    },
+                }],
+                "max_tokens": 4096,
+            })
+        finally:
+            if old_project is None:
+                os.environ.pop("GATEWAY_CODEBASE_MEMORY_PROJECT", None)
+            else:
+                os.environ["GATEWAY_CODEBASE_MEMORY_PROJECT"] = old_project
+
+        tool_use = [b for b in (result.get("content") or []) if b.get("type") == "tool_use"]
+        self.assertEqual(tool_use[0].get("name"), "mcp__codebase_memory_mcp__search_graph")
+        self.assertEqual(tool_use[0].get("input", {}).get("project"), "Users-sanbo-Desktop-ai_tool_functioncall")
+        self.assertIn("gateway_tool_runtime", tool_use[0].get("input", {}).get("query", ""))
+        self.assertEqual((result.get("gateway_context") or {}).get("agent_planner", {}).get("workflow"), "code_search")
+
+    def test_agent_planner_code_search_without_scope_does_not_infer_gateway_service_project(self):
+        from src.gateway_agent_planner import plan_downstream_tool_request
+
+        with tempfile.TemporaryDirectory() as td:
+            old_config = gateway.CONFIG_PATH
+            old_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+            old_gateway_project = os.environ.get("GATEWAY_CODEBASE_MEMORY_PROJECT")
+            old_project = os.environ.get("CODEBASE_MEMORY_PROJECT")
+            service_root = pathlib.Path(td) / "gateway-service-root"
+            service_root.mkdir()
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = str(service_root)
+            os.environ.pop("GATEWAY_CODEBASE_MEMORY_PROJECT", None)
+            os.environ.pop("CODEBASE_MEMORY_PROJECT", None)
+            try:
+                cfg = gateway._default_config()
+                cfg["gateway"]["workspace_root"] = str(service_root)
+                gateway.save_config(cfg)
+
+                body = {
+                    "model": "weak",
+                    "metadata": {
+                        "session_id": f"remote-code-search-{uuid.uuid4().hex}",
+                        "user_id": json.dumps({"user_id": "remote-code-search-user"}),
+                    },
+                    "messages": [{"role": "user", "content": "搜索代码 gateway_tool_runtime"}],
+                    "tools": [{
+                        "name": "mcp__codebase_memory_mcp__search_graph",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"project": {"type": "string"}, "query": {"type": "string"}},
+                            "required": ["project", "query"],
+                            "additionalProperties": False,
+                        },
+                    }],
+                }
+                decision = plan_downstream_tool_request("/v1/messages", body)
+                self.assertIsNotNone(decision)
+                project = decision.calls[0].arguments.get("project")
+                self.assertEqual(project, "default")
+                self.assertNotIn("gateway-service-root", json.dumps(decision.calls[0].arguments))
+                self.assertNotIn(str(service_root.resolve()), json.dumps(decision.calls[0].arguments))
+            finally:
+                gateway.CONFIG_PATH = old_config
+                if old_root is None:
+                    os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+                else:
+                    os.environ["GATEWAY_WORKSPACE_ROOT"] = old_root
+                if old_gateway_project is None:
+                    os.environ.pop("GATEWAY_CODEBASE_MEMORY_PROJECT", None)
+                else:
+                    os.environ["GATEWAY_CODEBASE_MEMORY_PROJECT"] = old_gateway_project
+                if old_project is None:
+                    os.environ.pop("CODEBASE_MEMORY_PROJECT", None)
+                else:
+                    os.environ["CODEBASE_MEMORY_PROJECT"] = old_project
+
+    def test_agent_planner_run_tests_uses_declared_shell_tool(self):
+        result = self._run("/v1/responses", {
+            "model": "weak",
+            "input": "运行测试",
+            "tools": [{
+                "type": "function",
+                "name": "exec_command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"cmd": {"type": "string"}},
+                    "required": ["cmd"],
+                    "additionalProperties": False,
+                },
+            }],
+        })
+
+        calls = [o for o in (result.get("output") or []) if o.get("type") == "function_call"]
+        self.assertEqual(calls[0].get("name"), "exec_command")
+        args = json.loads(calls[0].get("arguments") or "{}")
+        self.assertIn("pytest", args.get("cmd", ""))
+        self.assertEqual((result.get("gateway_context") or {}).get("agent_planner", {}).get("workflow"), "test_build")
+
+    def test_agent_planner_explicit_edit_uses_declared_edit_tool(self):
+        result = self._run("/v1/messages", {
+            "model": "weak",
+            "messages": [{"role": "user", "content": "把 README.md 中的 `TestProject` 改成 `BetterProject`"}],
+            "tools": [{
+                "name": "Edit",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "old_string": {"type": "string"},
+                        "new_string": {"type": "string"},
+                    },
+                    "required": ["file_path", "old_string", "new_string"],
+                    "additionalProperties": False,
+                },
+            }],
+            "max_tokens": 4096,
+        })
+
+        tool_use = [b for b in (result.get("content") or []) if b.get("type") == "tool_use"]
+        self.assertEqual(tool_use[0].get("name"), "Edit")
+        self.assertTrue(tool_use[0].get("input", {}).get("file_path", "").endswith("/README.md"))
+        self.assertEqual(tool_use[0].get("input", {}).get("old_string"), "TestProject")
+        self.assertEqual(tool_use[0].get("input", {}).get("new_string"), "BetterProject")
+        self.assertEqual((result.get("gateway_context") or {}).get("agent_planner", {}).get("workflow"), "edit")
+
+    def test_agent_planner_reads_failure_file_after_test_result(self):
+        result = self._run("/v1/messages", {
+            "model": "weak",
+            "messages": [
+                {"role": "user", "content": "运行测试"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "bash_test", "name": "Bash", "input": {"command": "python3 -m pytest -q"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "bash_test", "content": "FAILED tests/test_app.py::test_x\nTraceback\n  File \"src/app.py\", line 12, in run\nAssertionError\nexit_code=1"},
+                ]},
+            ],
+            "tools": [{
+                "name": "Read",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                    "additionalProperties": False,
+                },
+            }],
+            "max_tokens": 4096,
+        })
+
+        tool_use = [b for b in (result.get("content") or []) if b.get("type") == "tool_use"]
+        self.assertEqual(tool_use[0].get("name"), "Read")
+        self.assertTrue(tool_use[0].get("input", {}).get("file_path", "").endswith("/src/app.py"))
+        self.assertEqual((result.get("gateway_context") or {}).get("agent_planner", {}).get("workflow"), "fix_loop")
+
+    def test_fix_loop_reads_source_followup_import_after_diagnostic_read(self):
+        result = self._run("/v1/messages", {
+            "model": "weak",
+            "messages": [
+                {"role": "user", "content": "运行测试并修复"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "bash_test", "name": "Bash", "input": {"command": "python3 -m pytest -q"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "bash_test", "content": "FAILED tests/test_app.py::test_x\nTraceback\n  File \"src/app.py\", line 12, in run\nAssertionError\nexit_code=1"},
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "planner_diagnostic_read_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "name": "Read", "input": {"file_path": "src/app.py"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "planner_diagnostic_read_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "content": "from src.helper import check\n\ndef run():\n    return check()"},
+                ]},
+            ],
+            "tools": [{
+                "name": "Read",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                    "additionalProperties": False,
+                },
+            }],
+            "max_tokens": 4096,
+        })
+
+        tool_use = [b for b in (result.get("content") or []) if b.get("type") == "tool_use"]
+        self.assertEqual(tool_use[0].get("name"), "Read")
+        self.assertTrue(tool_use[0].get("input", {}).get("file_path", "").endswith("/src/helper.py"))
+        planner_ctx = (result.get("gateway_context") or {}).get("agent_planner", {})
+        self.assertEqual(planner_ctx.get("workflow"), "fix_loop")
+        self.assertEqual(planner_ctx.get("step"), "source_followup_read")
+
+    def test_fix_loop_upstream_patch_json_is_not_granted_tool_authority(self):
+        from src.gateway_config import save_config
+        from src.gateway_tool_runtime import run_tool_orchestration
+
+        td = self._setup_workspace()
+        old_config = gateway.CONFIG_PATH
+        old_cwd = os.getcwd()
+        old_ws = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+        try:
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            cfg = gateway._default_config()
+            cfg["gateway"]["workspace_root"] = td
+            cfg["gateway"]["tool_mode"] = "orchestrate"
+            cfg["upstream"]["tools_enabled"] = "adapter"
+            cfg["upstream"]["protocol"] = "openai_chat"
+            cfg["upstream"]["capabilities"]["supports_tools"] = False
+            cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+            save_config(cfg)
+            os.chdir(td)
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = td
+
+            patch_text = """```json
+{"name":"Edit","arguments":{"file_path":"src/app.py","old_string":"return False","new_string":"return True"}}
+```"""
+            client = FakeClient([{"id": "c1", "choices": [{"message": {"role": "assistant", "content": patch_text}, "finish_reason": "stop"}]}])
+            result = run_tool_orchestration("/v1/messages", {
+                "model": "weak",
+                "messages": [
+                    {"role": "user", "content": "运行测试并修复"},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "bash_test", "name": "Bash", "input": {"command": "python3 -m pytest -q"}},
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "bash_test", "content": "FAILED tests/test_app.py::test_x\n  File \"src/app.py\", line 12\nexit_code=1"},
+                    ]},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "read_1", "name": "Read", "input": {"file_path": "src/app.py"}},
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "read_1", "content": "def ok():\n    return False\n"},
+                    ]},
+                ],
+                "tools": [{
+                    "name": "Edit",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string"},
+                            "old_string": {"type": "string"},
+                            "new_string": {"type": "string"},
+                        },
+                        "required": ["file_path", "old_string", "new_string"],
+                        "additionalProperties": False,
+                    },
+                }],
+                "max_tokens": 4096,
+            }, client)
+
+            self.assertEqual(len(client.requests), 1)
+            upstream_messages = client.requests[0][1].get("messages") or []
+            self.assertIn("Gateway Agent Planner evidence", upstream_messages[0].get("content", ""))
+            self.assertNotIn("tools", client.requests[0][1])
+            tool_use = [b for b in (result.get("content") or []) if b.get("type") == "tool_use"]
+            self.assertEqual(tool_use, [])
+            text = "\n".join(str(b.get("text") or "") for b in (result.get("content") or []) if b.get("type") == "text")
+            self.assertIn('"name":"Edit"', text)
+            self.assertTrue((result.get("gateway_context") or {}).get("chat_only_synthesis"))
+        finally:
+            gateway.CONFIG_PATH = old_config
+            os.chdir(old_cwd)
+            if old_ws is None:
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+            else:
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = old_ws
+
+    def test_qa_loop_reruns_tests_after_edit_result(self):
+        result = self._run("/v1/responses", {
+            "model": "weak",
+            "input": [
+                {"role": "user", "content": "运行测试并修复"},
+                {"role": "assistant", "tool_calls": [
+                    {"id": "bash_test", "type": "function", "function": {"name": "exec_command", "arguments": "{\"cmd\":\"python3 -m pytest -q\"}"}},
+                    {"id": "edit_1", "type": "function", "function": {"name": "Edit", "arguments": "{\"file_path\":\"src/app.py\",\"old_string\":\"return False\",\"new_string\":\"return True\"}"}},
+                ]},
+                {"type": "function_call_output", "call_id": "edit_1", "output": "edited src/app.py; replacements=1"},
+            ],
+            "tools": [{
+                "type": "function",
+                "name": "exec_command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"cmd": {"type": "string"}},
+                    "required": ["cmd"],
+                    "additionalProperties": False,
+                },
+            }],
+        })
+
+        calls = [o for o in (result.get("output") or []) if o.get("type") == "function_call"]
+        self.assertEqual(calls[0].get("name"), "exec_command")
+        args = json.loads(calls[0].get("arguments") or "{}")
+        self.assertIn("pytest", args.get("cmd", ""))
+        self.assertEqual((result.get("gateway_context") or {}).get("agent_planner", {}).get("workflow"), "qa_loop")
+
+    def test_qa_loop_passes_to_final_synthesis_after_validation_success(self):
+        from src.gateway_config import save_config
+        from src.gateway_tool_runtime import run_tool_orchestration
+
+        td = self._setup_workspace()
+        old_config = gateway.CONFIG_PATH
+        old_cwd = os.getcwd()
+        old_ws = os.environ.get("GATEWAY_WORKSPACE_ROOT")
+        try:
+            gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
+            cfg = gateway._default_config()
+            cfg["gateway"]["workspace_root"] = td
+            cfg["gateway"]["tool_mode"] = "orchestrate"
+            cfg["upstream"]["tools_enabled"] = "adapter"
+            cfg["upstream"]["protocol"] = "openai_chat"
+            cfg["upstream"]["capabilities"]["supports_tools"] = False
+            cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+            save_config(cfg)
+            os.chdir(td)
+            os.environ["GATEWAY_WORKSPACE_ROOT"] = td
+
+            client = FakeClient([{"id": "c1", "choices": [{"message": {"role": "assistant", "content": "修复完成，测试已通过。"}, "finish_reason": "stop"}]}])
+            result = run_tool_orchestration("/v1/messages", {
+                "model": "weak",
+                "messages": [
+                    {"role": "user", "content": "运行测试并修复"},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "edit_1", "name": "Edit", "input": {"file_path": "src/app.py", "old_string": "return False", "new_string": "return True"}},
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "edit_1", "content": "edited src/app.py; replacements=1"},
+                    ]},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "bash_validate", "name": "Bash", "input": {"command": "python3 -m pytest -q"}},
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "bash_validate", "content": "1 passed in 0.01s\nexit_code=0"},
+                    ]},
+                ],
+                "tools": [{
+                    "name": "Bash",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                }],
+                "max_tokens": 4096,
+            }, client)
+
+            self.assertEqual(result.get("stop_reason"), "end_turn")
+            self.assertEqual(result.get("content", [{}])[0].get("text"), "修复完成，测试已通过。")
+            self.assertEqual(len(client.requests), 1)
+            system_text = (client.requests[0][1].get("messages") or [{}])[0].get("content", "")
+            self.assertIn("Gateway Agent Planner evidence", system_text)
+            self.assertIn("exit_code=0", system_text)
+        finally:
+            gateway.CONFIG_PATH = old_config
+            os.chdir(old_cwd)
+            if old_ws is None:
+                os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
+            else:
+                os.environ["GATEWAY_WORKSPACE_ROOT"] = old_ws
 
     def test_responses_surfaces_function_call_items(self):
         result = self._run("/v1/responses", {
@@ -6111,6 +13330,87 @@ class ToolCallDefaultTests(unittest.TestCase):
         user_content = str(result["messages"][1].get("content", ""))
         self.assertIn("[IMPORTANT: Tool Call Gateway adapter is active", user_content,
                       "User message must contain adapter reminder")
+
+    def test_text_tool_adapter_injects_for_chinese_project_analysis_intent(self):
+        from src.gateway_streaming import _merge_builtin_tools
+
+        body = {
+            "model": "test-model",
+            "gateway_context": {"client_can_handle_implicit_tools": True},
+            "messages": [
+                {"role": "user", "content": "分析这套项目"},
+            ],
+            "max_tokens": 100,
+        }
+
+        result = _merge_builtin_tools("/v1/chat/completions", body)
+
+        self.assertNotIn("tools", result)
+        system_content = str(result["messages"][0].get("content", ""))
+        self.assertIn("Tool Call Gateway adapter", system_content)
+        user_content = str(result["messages"][-1].get("content", ""))
+        self.assertIn("[IMPORTANT: Tool Call Gateway adapter is active", user_content)
+
+    def test_text_tool_adapter_keeps_plain_chat_plain_without_tool_intent(self):
+        from src.gateway_streaming import _merge_builtin_tools
+
+        cases = [
+            "Tell me a story about my cat.",
+            "My cat is sick.",
+            "The head office is closed.",
+            "Help me find a way to stay focused.",
+            "如何分析一个项目的商业价值？",
+            "分析这套项目",
+        ]
+        for content in cases:
+            body = {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": content}],
+                "max_tokens": 100,
+            }
+
+            result = _merge_builtin_tools("/v1/chat/completions", body)
+
+            self.assertEqual(result["messages"], body["messages"])
+            self.assertNotIn("tools", result)
+            self.assertNotIn("tool_choice", result)
+
+    def test_text_tool_adapter_keeps_workspace_metadata_plain_without_capability(self):
+        from src.gateway_streaming import _merge_builtin_tools
+
+        cases = [
+            {"project_dir": "relative/project"},
+            {"project_dir": self._td.name},
+            {"cwd": "/"},
+        ]
+        for metadata in cases:
+            body = {
+                "model": "test-model",
+                "metadata": metadata,
+                "messages": [{"role": "user", "content": "分析这套项目"}],
+                "max_tokens": 100,
+            }
+
+            result = _merge_builtin_tools("/v1/chat/completions", body)
+
+            self.assertEqual(result["messages"], body["messages"])
+            self.assertNotIn("tools", result)
+            self.assertNotIn("tool_choice", result)
+
+    def test_text_tool_adapter_keeps_message_embedded_cwd_plain(self):
+        from src.gateway_streaming import _merge_builtin_tools
+
+        body = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "CWD: /tmp\n分析这套项目"}],
+            "max_tokens": 100,
+        }
+
+        result = _merge_builtin_tools("/v1/chat/completions", body)
+
+        self.assertEqual(result["messages"], body["messages"])
+        self.assertNotIn("tools", result)
+        self.assertNotIn("tool_choice", result)
 
     def test_text_tool_adapter_roundtrip_extracts_user_side_text_tool_calls(self):
         """End-to-end: request with tools → text adapter → upstream text with

@@ -13,6 +13,13 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any
 
+from .gateway_protocol import (
+    _is_responses_tool_call_type,
+    _legacy_function_call_id,
+    _responses_tool_call_arguments_string,
+    _responses_tool_call_name,
+)
+
 _logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -192,6 +199,14 @@ def _detect_streaming_tool_calls_from_sse(
                     "name": func.get("name", ""),
                     "arguments": func.get("arguments", ""),
                 })
+            legacy = delta.get("function_call")
+            if isinstance(legacy, dict):
+                name = legacy.get("name", "")
+                calls.append({
+                    "call_id": _legacy_function_call_id(name) if name else "",
+                    "name": name,
+                    "arguments": legacy.get("arguments", ""),
+                })
     # Anthropic /messages
     elif "/messages" in path:
         if event == "content_block_start":
@@ -227,11 +242,12 @@ def _detect_streaming_tool_calls_from_sse(
         resp_type = payload.get("type", "")
         item = payload.get("item") or payload.get("output") or {}
         if resp_type in ("response.output_item.done", "response.function_call_arguments.done"):
-            if isinstance(item, dict) and item.get("type") == "function_call":
+            if isinstance(item, dict) and _is_responses_tool_call_type(item.get("type")):
+                arguments = _responses_tool_call_arguments_string(item)
                 calls.append({
-                    "call_id": item.get("call_id", ""),
-                    "name": item.get("name", ""),
-                    "arguments": item.get("arguments", ""),
+                    "call_id": item.get("call_id") or item.get("id") or "",
+                    "name": _responses_tool_call_name(item),
+                    "arguments": arguments,
                 })
         elif resp_type == "response.function_call_arguments.delta":
             delta_val = payload.get("delta", "")
@@ -244,11 +260,12 @@ def _detect_streaming_tool_calls_from_sse(
                     "_output_index": payload.get("output_index", 0),
                 })
         elif resp_type == "response.output_item.added":
-            if isinstance(item, dict) and item.get("type") == "function_call":
+            if isinstance(item, dict) and _is_responses_tool_call_type(item.get("type")):
+                arguments = _responses_tool_call_arguments_string(item)
                 calls.append({
-                    "call_id": item.get("call_id", ""),
-                    "name": item.get("name", ""),
-                    "arguments": item.get("arguments", ""),
+                    "call_id": item.get("call_id") or item.get("id") or "",
+                    "name": _responses_tool_call_name(item),
+                    "arguments": arguments,
                     "_initial": True,
                 })
     # Unknown event name — try OpenAI format as fallback if path suggests it
@@ -263,6 +280,14 @@ def _detect_streaming_tool_calls_from_sse(
                     "call_id": tc.get("id", ""),
                     "name": func.get("name", ""),
                     "arguments": func.get("arguments", ""),
+                })
+            legacy = delta.get("function_call")
+            if isinstance(legacy, dict):
+                name = legacy.get("name", "")
+                calls.append({
+                    "call_id": _legacy_function_call_id(name) if name else "",
+                    "name": name,
+                    "arguments": legacy.get("arguments", ""),
                 })
     return calls
 
@@ -294,7 +319,7 @@ def _forced_tool_name(path: str, body: dict) -> str:
 
 
 def run_streaming_orchestration(
-    handler: Any, path: str, body: dict
+    handler: Any, path: str, body: dict, client_id: str | None = None
 ) -> None:
     """Streaming orchestration with tool call support."""
     from .gateway_config import _configured_max_tool_rounds, _gateway_config, _upstream_protocol
@@ -306,9 +331,15 @@ def run_streaming_orchestration(
     )
     from .gateway_proxy import NativeProxyClient
     from .gateway_protocol import _convert_request_to_upstream, _convert_response_to_downstream
+    from .gateway_agent_planner import (
+        apply_synthesis_refusal_fallback as _agent_apply_synthesis_refusal_fallback,
+        prepare_upstream_body as _agent_prepare_upstream_body,
+    )
     from .gateway_tool_runtime import (
         _append_text_tool_results,
         _append_tool_results,
+        _adapt_text_calls_for_declared_downstream_tools,
+        _attach_request_gateway_context,
         _calls_require_downstream_execution,
         _convert_text_calls_to_downstream_response,
         _convert_response_to_path,
@@ -319,6 +350,7 @@ def run_streaming_orchestration(
         _execute_tool_call,
         _extract_text_tool_calls,
         _extract_tool_calls,
+        _request_scope_body,
         _request_workspace_root,
         _weak_upstream_text_tools_active,
         _workspace_scope,
@@ -335,7 +367,8 @@ def run_streaming_orchestration(
             _stream_upstream_passthrough(handler, path, body)
             return
 
-        with _workspace_scope(_request_workspace_root(body)):
+        scope_body = _request_scope_body(body, client_id)
+        with _workspace_scope(_request_workspace_root(scope_body), scope_body):
             _run_streaming_orchestration_scoped(
                 handler,
                 path,
@@ -346,6 +379,7 @@ def run_streaming_orchestration(
                 max_rounds=_configured_max_tool_rounds(gateway_cfg),
                 upstream=NativeProxyClient(),
                 context_cfg=_context_config(),
+                client_id=client_id,
             )
     except Exception as exc:
         try:
@@ -366,6 +400,7 @@ def _run_streaming_orchestration_scoped(
     max_rounds: int,
     upstream: Any,
     context_cfg: dict,
+    client_id: str | None = None,
 ) -> None:
     """Run streaming orchestration after workspace root has been resolved."""
     from .gateway_context import (
@@ -373,11 +408,19 @@ def _run_streaming_orchestration_scoped(
         _maybe_compact_request_for_upstream,
         _remember_conversation_turn,
     )
+    from .gateway_agent_planner import (
+        apply_synthesis_refusal_fallback as _agent_apply_synthesis_refusal_fallback,
+        prepare_upstream_body as _agent_prepare_upstream_body,
+    )
     from .gateway_protocol import _convert_request_to_upstream, _convert_response_to_downstream
     from .gateway_tool_runtime import (
         _append_text_tool_results,
         _append_tool_results,
+        _adapt_text_calls_for_declared_downstream_tools,
+        _attach_request_gateway_context,
         _calls_require_downstream_execution,
+        _chat_only_synthesis_active,
+        _chat_only_synthesis_body,
         _convert_text_calls_to_downstream_response,
         _convert_response_to_path,
         _detect_intent_tool_calls,
@@ -388,6 +431,10 @@ def _run_streaming_orchestration_scoped(
         _execute_tool_call,
         _extract_text_tool_calls,
         _extract_tool_calls,
+        _preexecute_gateway_owned_planner_tool,
+        _record_chat_only_synthesis_boundary_event,
+        _record_ignored_upstream_tool_attempt,
+        _should_use_chat_only_synthesis_boundary,
         _weak_upstream_text_tools_active,
     )
 
@@ -404,8 +451,26 @@ def _run_streaming_orchestration_scoped(
             _stream_final_response(handler, path, direct_response)
             _remember_conversation_turn(path, body, direct_response)
             return
+        memory_body = _preexecute_gateway_owned_planner_tool(path, memory_body, client_id=client_id)
 
-    request_body = _merge_builtin_tools(path, _maybe_compact_request_for_upstream(path, memory_body, context_cfg))
+    # Keep planner memory independent from weak-upstream context windows:
+    # persist full evidence first, compact the transport payload second, then
+    # re-inject the planner's compact summary after compaction.
+    _agent_prepare_upstream_body(path, memory_body)
+    compacted_body = _maybe_compact_request_for_upstream(path, memory_body, context_cfg)
+    request_body = _agent_prepare_upstream_body(path, compacted_body)
+    if _weak_upstream_text_tools_active(mode) and _should_use_chat_only_synthesis_boundary(request_body):
+        pre_synthesis_body = request_body
+        request_body = _chat_only_synthesis_body(request_body)
+        _record_chat_only_synthesis_boundary_event(
+            path,
+            pre_synthesis_body,
+            request_body,
+            source="streaming",
+            scope_body=body,
+        )
+    else:
+        request_body = _merge_builtin_tools(path, request_body)
 
     # --- Intelligence Enhancement (streaming path) ---
     try:
@@ -432,6 +497,11 @@ def _run_streaming_orchestration_scoped(
     except Exception as _exc:
         _logger.debug("Intelligence enhancement skipped: %s", _exc)
 
+    # Keep the internal planner/runtime envelope for local synthesis guards and
+    # response observability, but never forward that envelope to the upstream
+    # model.  _convert_request_to_upstream strips gateway_context and other
+    # Gateway-only routing fields from the actual upstream payload.
+    response_context_body = request_body
     upstream_path, request_body = _convert_request_to_upstream(path, request_body, upstream_protocol)
     # The gateway is responsible for emitting downstream SSE in orchestrate
     # mode. Keep the upstream request non-streaming unless passthrough is used.
@@ -457,16 +527,32 @@ def _run_streaming_orchestration_scoped(
 
         upstream_response = _convert_response_to_path(upstream_path, response)
         downstream_response = _convert_response_to_downstream(path, response, upstream_protocol)
+        if _chat_only_synthesis_active(response_context_body):
+            _record_ignored_upstream_tool_attempt(
+                path,
+                response_context_body,
+                downstream_response,
+                source="streaming",
+                scope_body=body,
+            )
+            downstream_response = _agent_apply_synthesis_refusal_fallback(path, response_context_body, downstream_response)
+            downstream_response = _attach_request_gateway_context(downstream_response, response_context_body)
+            _stream_final_response(handler, path, downstream_response)
+            _remember_conversation_turn(path, body, downstream_response)
+            return
         calls = _extract_tool_calls(path, downstream_response)
         text_fallback = False
         if not calls:
             calls = _extract_text_tool_calls(path, downstream_response)
             text_fallback = bool(calls)
+            if text_fallback:
+                calls = _adapt_text_calls_for_declared_downstream_tools(memory_body, calls)
         if not calls and _round == 0:
             calls = _detect_intent_tool_calls(path, downstream_response, body)
             text_fallback = bool(calls)
 
         if not calls:
+            downstream_response = _attach_request_gateway_context(downstream_response, response_context_body)
             _stream_final_response(handler, path, downstream_response)
             _remember_conversation_turn(path, body, downstream_response)
             return
@@ -488,7 +574,7 @@ def _run_streaming_orchestration_scoped(
                 "call_id": call.call_id,
                 "name": call.name,
             }, event="tool_start")
-            result = _execute_tool_call(call, provider="streaming")
+            result = _execute_tool_call(call, provider="streaming", client_id=client_id)
             results.append(result)
             _write_sse(handler, {
                 "type": "tool_result",
@@ -573,6 +659,66 @@ def _maybe_compact_for_text_tool_adapter(path: str, body: dict) -> dict:
         return body
 
 
+def _truthy(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _client_can_handle_implicit_tools(body: dict) -> bool:
+    gateway_context = body.get("gateway_context")
+    if isinstance(gateway_context, dict):
+        return _truthy(gateway_context.get("client_can_handle_implicit_tools"))
+    return False
+
+
+def _user_message_needs_tools(body: dict) -> bool:
+    """Detect if user message indicates need for tools (file reading, code analysis, etc.)."""
+    import re
+
+    messages = body.get("messages", [])
+    if not messages:
+        return False
+
+    # Get last user message
+    last_user_msg = None
+    for msg in reversed(messages):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                last_user_msg = content
+            elif isinstance(content, list):
+                # Extract text from content blocks
+                last_user_msg = " ".join(
+                    block.get("text", "") for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
+            break
+
+    if not last_user_msg:
+        return False
+
+    text = last_user_msg.lower()
+    tool_intent_patterns = [
+        r'(分析|检查|查看|审查|梳理|整理)(这套|这个|当前|本地|本)?(项目|工程|代码|代码库|仓库|目录|文件夹|结构)',
+        r'(读取|打开|列出|搜索|查找).*(代码|文件|目录|文件夹|仓库|代码库|函数|类)',
+        r'(运行|执行|测试).*(命令|脚本|测试|代码)',
+        r'\b(analyze|analyse|check|inspect|review|examine|investigate)\b.*\b(project|code|file|directory|repo|codebase)\b',
+        r'\b(read|open|view|show|display|cat)\b.*\b(file|code)\b',
+        r'\b(list|show|display)\b.*\b(files|directory|folder|contents)\b',
+        r'\b(find|search|locate|grep)\b.*\b(file|code|function|class)\b',
+        r'\b(run|execute|test)\b.*\b(command|script|test)\b',
+        r'\b(what|how|where)\b.*\b(files|structure|organized|works)\b',
+        r'^\s*(tree|ls|pwd|grep)\b',
+        r'^\s*(cat|head|tail)\s+(\.|/|~|\S*[./]\S*)',
+        r'^\s*find\s+(\.|/|~|\S*[./]\S*)',
+    ]
+
+    return any(re.search(pattern, text) for pattern in tool_intent_patterns)
+
+
 def _merge_builtin_tools(path: str, body: dict) -> dict:
     """Merge builtin tools into request body. Respects tools_enabled config."""
     from .gateway_builtin_tools import BUILTIN_TOOLS
@@ -606,14 +752,18 @@ def _merge_builtin_tools(path: str, body: dict) -> dict:
     )
 
     if _should_use_text_tool_adapter(tools_enabled, native_capable) and not caller_requested_tools:
-        # Plain chat requests should stay plain.  The gateway only downgrades
-        # tool schemas into text adapter instructions when the downstream
-        # actually requested tools/tool_choice; otherwise every weak-upstream
-        # request gets polluted with a large tool manual and simple messages no
-        # longer reach upstream intact.
-        body.pop("tools", None)
-        body.pop("tool_choice", None)
-        return body
+        # Check if user message indicates tool usage intent (e.g., "analyze project", "read file")
+        # If so, inject tools even if downstream didn't explicitly request them
+        if not (_client_can_handle_implicit_tools(body) and _user_message_needs_tools(body)):
+            # Plain chat requests should stay plain.  The gateway only downgrades
+            # tool schemas into text adapter instructions when the downstream
+            # actually requested tools/tool_choice; otherwise every weak-upstream
+            # request gets polluted with a large tool manual and simple messages no
+            # longer reach upstream intact.
+            body.pop("tools", None)
+            body.pop("tool_choice", None)
+            return body
+        _logger.debug("Tool-capable client message detected as needing tools; injecting adapter")
 
     # Add builtin tools
     for tool in BUILTIN_TOOLS.values():
@@ -762,8 +912,32 @@ def _iter_normalized_anthropic_sse_blocks(resp: Any):
             yield normalized
 
 
+def _stream_gateway_context(response: dict) -> dict | None:
+    """Return stream-safe Gateway runtime metadata, if present.
+
+    Non-streaming responses already expose ``gateway_context`` for observability.
+    Streaming clients should get the same information without adding custom SSE
+    event types that strict OpenAI/Anthropic clients may reject.  We therefore
+    attach the metadata to existing terminal/final chunks where unknown fields
+    are normally ignored by SDKs but remain visible to diagnostics.
+    """
+    ctx = response.get("gateway_context")
+    if not isinstance(ctx, dict) or not ctx:
+        return None
+    return dict(ctx)
+
+
+def _attach_stream_gateway_context(payload: dict, gateway_context: dict | None) -> dict:
+    if not gateway_context:
+        return payload
+    updated = dict(payload)
+    updated["gateway_context"] = gateway_context
+    return updated
+
+
 def _stream_final_response(handler: Any, path: str, response: dict) -> None:
     """Stream the final response to client."""
+    gateway_context = _stream_gateway_context(response)
     if "/chat/completions" in path:
         choices = response.get("choices", [])
         for choice in choices:
@@ -778,11 +952,11 @@ def _stream_final_response(handler: Any, path: str, response: dict) -> None:
                         "finish_reason": None,
                     }],
                 })
-                _write_sse(handler, {
+                _write_sse(handler, _attach_stream_gateway_context({
                     "id": response.get("id", ""),
                     "object": "chat.completion.chunk",
                     "choices": [{"index": choice.get("index", 0), "delta": {}, "finish_reason": "tool_calls"}],
-                })
+                }, gateway_context))
                 continue
             if message.get("content"):
                 _write_sse(handler, {
@@ -795,11 +969,11 @@ def _stream_final_response(handler: Any, path: str, response: dict) -> None:
                     }],
                 })
         if not any(((choice.get("message") or {}).get("tool_calls")) for choice in choices):
-            _write_sse(handler, {
+            _write_sse(handler, _attach_stream_gateway_context({
                 "id": response.get("id", ""),
                 "object": "chat.completion.chunk",
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            })
+            }, gateway_context))
     elif "/messages" in path:
         msg_id = response.get("id", f"msg_{uuid.uuid4().hex}")
         model = response.get("model", "")
@@ -872,16 +1046,22 @@ def _stream_final_response(handler: Any, path: str, response: dict) -> None:
                     "index": idx,
                 })
         stop_reason = response.get("stop_reason", "end_turn")
-        _write_sse(handler, {
+        _write_sse(handler, _attach_stream_gateway_context({
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},
             "usage": {"output_tokens": usage.get("output_tokens", 0)},
-        })
+        }, gateway_context))
         _write_sse(handler, {"type": "message_stop"})
     elif "/responses" in path:
         response_id = response.get("id") or f"resp_gateway_{uuid.uuid4().hex}"
         model = response.get("model", "")
-        usage = response.get("usage") or {}
+        usage = dict(response.get("usage") or {})
+        if "total_tokens" not in usage:
+            input_tokens = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+            output_tokens = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
+            usage["input_tokens"] = input_tokens
+            usage["output_tokens"] = output_tokens
+            usage["total_tokens"] = input_tokens + output_tokens
         response_base = {
             "id": response_id,
             "object": "response",
@@ -1007,6 +1187,8 @@ def _stream_final_response(handler: Any, path: str, response: dict) -> None:
             "status": response.get("status") or "completed",
             "output": completed_output,
         })
+        if gateway_context:
+            completed_response["gateway_context"] = gateway_context
         _write_sse(handler, {
             "type": "response.completed",
             "response": completed_response,

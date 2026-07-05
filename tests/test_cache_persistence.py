@@ -69,6 +69,32 @@ class TestCachePersistence(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result["answer"], "Another programming language")
 
+    def test_semantic_cache_scope_persists_and_isolates(self):
+        """Semantic cache scope survives reload and blocks cross-tenant hits."""
+        cache1 = SemanticCache(
+            embedding_provider=LocalEmbeddingProvider(),
+            max_entries=100,
+            similarity_threshold=0.0,
+            ttl_seconds=3600,
+            persistent=True,
+        )
+        cache1.put("same prompt", {"answer": "tenant-a"}, scope_key="tenant-a/session/workspace")
+        del cache1
+
+        cache2 = SemanticCache(
+            embedding_provider=LocalEmbeddingProvider(),
+            max_entries=100,
+            similarity_threshold=0.0,
+            ttl_seconds=3600,
+            persistent=True,
+        )
+
+        result = cache2.get("same prompt", scope_key="tenant-a/session/workspace")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["answer"], "tenant-a")
+        self.assertIsNone(cache2.get("same prompt", scope_key="tenant-b/session/workspace"))
+        self.assertIsNone(cache2.get("similar prompt", scope_key="tenant-b/session/workspace"))
+
     def test_tool_cache_persistence_lifecycle(self):
         """Test tool cache saves to and loads from database."""
         # Create first cache instance with persistence

@@ -64,7 +64,7 @@ class TestPersistence(unittest.TestCase):
         response = {"answer": "Python is a programming language"}
         ttl = 3600
 
-        result = save_semantic_cache_entry(cache_key, query, embedding, response, ttl)
+        result = save_semantic_cache_entry(cache_key, query, embedding, response, ttl, scope_key="tenant-a")
         self.assertTrue(result)
 
         # Load entries
@@ -77,6 +77,7 @@ class TestPersistence(unittest.TestCase):
         self.assertEqual(entry["embedding"], embedding)
         self.assertEqual(entry["response"], response)
         self.assertEqual(entry["ttl_seconds"], ttl)
+        self.assertEqual(entry["scope_key"], "tenant-a")
 
     def test_semantic_cache_touch(self):
         """Test updating access stats for semantic cache."""

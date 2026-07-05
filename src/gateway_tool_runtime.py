@@ -13,6 +13,7 @@ import os
 _logger = logging.getLogger(__name__)
 import pathlib
 import re
+import shlex
 import subprocess
 import threading
 import uuid
@@ -46,17 +47,40 @@ from .gateway_context import (
     _remember_conversation_turn,
     _run_context_fanout,
 )
-from .gateway_errors import GatewayError, ToolExecutionError, UpstreamHTTPError
-from .gateway_http_actions import _call_http_action, _http_action_by_name
+from .gateway_agent_planner import (
+    apply_synthesis_refusal_fallback as _agent_apply_synthesis_refusal_fallback,
+    plan_downstream_tool_request as _agent_plan_downstream_tool_request,
+    planner_intent_catalog as _agent_planner_intent_catalog,
+    planner_session_key as _agent_planner_session_key,
+    planner_state_snapshot as _agent_planner_state_snapshot,
+    planner_workflow_catalog as _agent_planner_workflow_catalog,
+    prepare_upstream_body as _agent_prepare_upstream_body,
+    record_runtime_event as _agent_record_runtime_event,
+    _session_key_index_parts as _agent_session_key_index_parts,
+)
+from .gateway_errors import BadRequestError, GatewayError, ToolExecutionError, UpstreamHTTPError
+from .gateway_http_actions import _call_http_action, _enabled_http_actions, _http_action_by_name
 from .gateway_logging import _record_tool_failure, _record_tool_stat
-from .gateway_mcp import _mcp_call_tool, _mcp_parse_public_name, _mcp_server_by_name
+from .gateway_mcp import (
+    _enabled_mcp_servers,
+    _mcp_call_tool,
+    _mcp_list_server_tools,
+    _mcp_parse_public_name,
+    _mcp_public_name,
+    _mcp_server_by_name,
+)
 from .gateway_protocol import (
     _convert_request_to_upstream,
     _convert_response_to_downstream,
+    _encode_tool_result_content,
     _forced_tool_name_from_choice,
     _from_openai_chat_response,
+    _is_responses_tool_call_type,
     _last_user_text,
+    _legacy_function_call_id,
     _replace_last_user_text,
+    _responses_tool_call_arguments_value,
+    _responses_tool_call_name,
     _without_tools,
 )
 from .gateway_proxy import NativeProxyClient
@@ -173,7 +197,7 @@ def _response_has_tool_calls(path: str, response: Json) -> bool:
         return False
     if path == "/v1/responses":
         for item in response.get("output") or []:
-            if isinstance(item, dict) and item.get("type") == "function_call":
+            if isinstance(item, dict) and _is_responses_tool_call_type(item.get("type")):
                 return True
         return False
     return False
@@ -307,6 +331,8 @@ def _extract_client_project_dir(body: Json) -> pathlib.Path | None:
             "workspace_root",
             "project_dir",
             "projectDir",
+            "workspace",
+            "workspace_dir",
             "cwd",
             "working_directory",
             "primary_working_directory",
@@ -324,6 +350,8 @@ def _extract_client_project_dir(body: Json) -> pathlib.Path | None:
     for key in (
         "project_dir",
         "projectDir",
+        "workspace",
+        "workspace_dir",
         "cwd",
         "working_directory",
         "primary_working_directory",
@@ -455,18 +483,26 @@ def _create_anonymous_workspace(body: Json) -> pathlib.Path:
     This prevents cross-session contamination and protects the Gateway server.
 
     The workspace is identified by:
-    1. session_id from metadata
-    2. Request hash (model + first message)
-    3. Random UUID as fallback
+    1. tenant/user + session_id from metadata
+    2. random UUID fallback when the client did not provide identity
+
+    Do not derive anonymous spaces from request text: on a remote service two
+    users can send identical prompts, and they must never share a workspace.
     """
     import hashlib
-    import tempfile
 
-    # Try to extract session_id from metadata
+    def stable_part(value: Any) -> str:
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
+        text = str(text or "").strip()
+        return hashlib.sha256(text.encode("utf-8", "ignore")).hexdigest()[:24] if text else ""
+
+    # Try to extract session_id and tenant/user from metadata
     session_id = None
+    tenant_id = None
     metadata = body.get("metadata")
     if isinstance(metadata, dict):
         session_id = metadata.get("session_id") or metadata.get("conversation_id")
+        tenant_id = metadata.get("tenant") or metadata.get("tenant_id") or metadata.get("account_id") or metadata.get("organization_id") or metadata.get("user")
         if not session_id:
             try:
                 user_meta = json.loads(metadata.get("user_id") or "{}")
@@ -474,28 +510,40 @@ def _create_anonymous_workspace(body: Json) -> pathlib.Path:
                 user_meta = {}
             if isinstance(user_meta, dict):
                 session_id = user_meta.get("session_id") or user_meta.get("conversation_id")
+                tenant_id = (
+                    tenant_id
+                    or user_meta.get("tenant")
+                    or user_meta.get("tenant_id")
+                    or user_meta.get("account_id")
+                    or user_meta.get("organization_id")
+                    or user_meta.get("user_id")
+                    or user_meta.get("user")
+                    or user_meta.get("email")
+                )
+        elif metadata.get("user_id"):
+            tenant_id = tenant_id or metadata.get("user_id")
 
-    # If no session_id, generate from request content
+    # If no session_id, use a per-request random isolated space.  This is safer
+    # for a remote multi-tenant service than hashing request content.
     if not session_id:
-        # Hash: model + first user message (stable across same conversation)
-        model = body.get("model", "")
-        messages = body.get("messages", [])
-        first_msg = ""
-        for msg in messages:
-            if isinstance(msg, dict) and msg.get("role") == "user":
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    first_msg = content[:100]  # First 100 chars
-                break
+        session_id = f"request-{uuid.uuid4().hex}"
 
-        hash_input = f"{model}:{first_msg}".encode("utf-8")
-        session_id = hashlib.sha256(hash_input).hexdigest()[:16]
+    tenant_id = tenant_id or body.get("client_id")
+    tenant_part = stable_part(tenant_id) or "anonymous"
+    session_part = stable_part(session_id)
+    workspace_hint_part = stable_part(_logical_client_workspace_identifier(body))
+    workspace_id = f"{tenant_part}-{session_part}"
+    if workspace_hint_part:
+        # A cloud client may send a logical workspace id (for example
+        # ``workspace=project-a``) instead of a filesystem path.  Keep it as an
+        # opaque namespace component; never resolve it against the Gateway cwd.
+        workspace_id = f"{workspace_id}-{workspace_hint_part}"
 
     # Create isolated workspace under .gateway_runtime/anonymous_spaces/
     base_dir = pathlib.Path.home() / ".gateway_runtime" / "anonymous_spaces"
     base_dir.mkdir(parents=True, exist_ok=True)
 
-    workspace_dir = base_dir / session_id
+    workspace_dir = base_dir / workspace_id
     workspace_dir.mkdir(exist_ok=True)
 
     return workspace_dir.resolve()
@@ -527,8 +575,8 @@ def _request_workspace_root(body: Json) -> pathlib.Path:
 
     Returns a safe workspace path - never fails.
     """
-    custom_root = body.get("workspace_root") or body.get("gateway_workspace")
-    if custom_root:
+    custom_root = body.get("workspace_root") or body.get("gateway_workspace") or body.get("workspace")
+    if _is_absolute_client_workspace_value(custom_root):
         path = pathlib.Path(custom_root).expanduser().resolve()
         _log_workspace_resolution("explicit_body", path)
         return path
@@ -537,6 +585,14 @@ def _request_workspace_root(body: Json) -> pathlib.Path:
     if detected is not None:
         _log_workspace_resolution("session_metadata", detected)
         return detected
+    if _has_non_absolute_client_workspace_hint(body):
+        anonymous_space = _create_anonymous_workspace(body)
+        _log_workspace_resolution("anonymous_space_relative_workspace", anonymous_space)
+        return anonymous_space
+    if _body_has_remote_identity(body):
+        anonymous_space = _create_anonymous_workspace(body)
+        _log_workspace_resolution("anonymous_space_remote_identity", anonymous_space)
+        return anonymous_space
     # Only allow explicit env var for testing - not cwd
     env_root = os.environ.get("GATEWAY_WORKSPACE_ROOT")
     if env_root:
@@ -557,8 +613,468 @@ def _request_workspace_root(body: Json) -> pathlib.Path:
     return anonymous_space
 
 
+def _scoped_client_id(client_id: str) -> str:
+    import hashlib
+
+    text = str(client_id or "").strip()
+    return f"client:{hashlib.sha256(text.encode('utf-8', 'ignore')).hexdigest()[:24]}"
+
+
+def _request_scope_body(body: Json, client_id: str | None = None) -> Json:
+    """Return a private body copy used only for Gateway runtime scoping.
+
+    Authenticated cloud requests identify a downstream client through the
+    validated API-key name passed as ``client_id``.  That identifier must be
+    considered before workspace resolution so requests without explicit
+    workspace metadata use an isolated anonymous remote scope instead of the
+    Gateway service env/config root.  Keep this copy internal; do not send the
+    synthetic, pseudonymous ``client_id`` field upstream.
+    """
+    if not str(client_id or "").strip() or not isinstance(body, dict):
+        return body
+    scoped = dict(body)
+    scoped["client_id"] = _scoped_client_id(client_id)
+    return scoped
+
+
+def _is_absolute_client_workspace_value(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    if not text:
+        return False
+    return pathlib.Path(text).expanduser().is_absolute() or text.startswith("~")
+
+
+_CLIENT_WORKSPACE_HINT_KEYS = (
+    "workspace_root",
+    "gateway_workspace",
+    "workspace",
+    "project_dir",
+    "projectDir",
+    "workspace_dir",
+    "cwd",
+    "working_directory",
+    "primary_working_directory",
+    "worktree",
+)
+
+
+def _direct_client_workspace_hint_values(body: Json) -> list[str]:
+    values: list[str] = []
+    for key in _CLIENT_WORKSPACE_HINT_KEYS:
+        value = body.get(key)
+        if isinstance(value, str) and value.strip():
+            values.append(value)
+    metadata = body.get("metadata")
+    if isinstance(metadata, dict):
+        for key in _CLIENT_WORKSPACE_HINT_KEYS:
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                values.append(value)
+        user_meta = metadata.get("user_id")
+        if isinstance(user_meta, str):
+            try:
+                parsed = json.loads(user_meta)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict):
+                for key in _CLIENT_WORKSPACE_HINT_KEYS:
+                    value = parsed.get(key)
+                    if isinstance(value, str) and value.strip():
+                        values.append(value)
+    return values
+
+
+def _has_non_absolute_client_workspace_hint(body: Json) -> bool:
+    return any(not _is_absolute_client_workspace_value(value) for value in _direct_client_workspace_hint_values(body))
+
+
+def _logical_client_workspace_identifier(body: Json) -> str:
+    for value in _direct_client_workspace_hint_values(body):
+        if value.strip() and not _is_absolute_client_workspace_value(value):
+            return value.strip()
+    return ""
+
+
+def _body_has_remote_identity(body: Json) -> bool:
+    """Return true when a request identifies a remote tenant/session.
+
+    In cloud mode, tenant/session metadata without a client workspace is still a
+    real remote scope.  It must not fall back to the Gateway service
+    GATEWAY_WORKSPACE_ROOT/config root, or unrelated clients can share runtime
+    state under the service workspace.
+    """
+    metadata = body.get("metadata")
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except Exception:
+            metadata = {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+    user_meta = metadata.get("user_id")
+    if isinstance(user_meta, str):
+        try:
+            parsed_user = json.loads(user_meta)
+        except Exception:
+            parsed_user = {}
+    elif isinstance(user_meta, dict):
+        parsed_user = user_meta
+    else:
+        parsed_user = {}
+    for container in (metadata, parsed_user, body):
+        if not isinstance(container, dict):
+            continue
+        for key in (
+            "tenant",
+            "tenant_id",
+            "account_id",
+            "organization_id",
+            "user",
+            "user_id",
+            "email",
+            "session_id",
+            "conversation_id",
+            "thread_id",
+            "client_id",
+        ):
+            value = container.get(key)
+            if isinstance(value, str) and value.strip():
+                return True
+    return False
+
+
+def _text_has_absolute_workspace_hint(text: str) -> bool:
+    return bool(re.search(
+        r"(?:"
+        r"<cwd>\s*[/~]|"
+        r"Worktree:\s*[/~]|"
+        r"Primary working directory:\s*[/~]|"
+        r"(?:workspace[_-]?root|gateway[_-]?workspace|projectDir|project[_-]?dir|workspace[_-]?dir|cwd|working_directory)"
+        r"[\"']?\s*[:=]\s*[\"']?[/~]"
+        r")",
+        str(text or ""),
+        flags=re.I,
+    ))
+
+
+def _body_has_client_workspace_hint(body: Json) -> bool:
+    """Return true when the request itself names the downstream workspace.
+
+    Environment/config roots are Gateway service configuration.  They are useful
+    for tests/admin-local proxy mode, but a cloud Gateway must not turn them
+    into absolute file targets for downstream Codex/Claude Code tools.
+    """
+    for key in (
+        "workspace_root",
+        "gateway_workspace",
+        "workspace",
+        "project_dir",
+        "projectDir",
+        "workspace_dir",
+        "cwd",
+        "working_directory",
+        "primary_working_directory",
+        "worktree",
+    ):
+        if _is_absolute_client_workspace_value(body.get(key)):
+            return True
+    metadata = body.get("metadata")
+    if isinstance(metadata, dict):
+        for key in (
+            "gateway_workspace",
+            "workspace_root",
+            "project_dir",
+            "projectDir",
+            "workspace",
+            "workspace_dir",
+            "cwd",
+            "working_directory",
+            "primary_working_directory",
+            "worktree",
+        ):
+            if _is_absolute_client_workspace_value(metadata.get(key)):
+                return True
+        user_meta = metadata.get("user_id")
+        if isinstance(user_meta, str) and _text_has_absolute_workspace_hint(user_meta):
+            return True
+    elif isinstance(metadata, str) and _text_has_absolute_workspace_hint(metadata):
+        return True
+    return _extract_client_project_dir(body) is not None
+
+
+def _downstream_declared_path_anchor(body: Json) -> pathlib.Path | None:
+    if _gateway_executes_user_side_tools_locally() or _body_has_client_workspace_hint(body):
+        try:
+            return _workspace_root()
+        except Exception:
+            return None
+    return None
+
+
+def _stable_scope_part(value: Any) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    if len(text) <= 96 and re.fullmatch(r"[A-Za-z0-9_.:@+-]+", text):
+        return text
+    return uuid.uuid5(uuid.NAMESPACE_URL, text).hex[:24]
+
+def _request_runtime_scope_key(body: Json, root: pathlib.Path) -> str:
+    """Build a multi-tenant namespace for process-global runtime state.
+
+    The Gateway is a remote service.  Caller-visible ids such as
+    ``session_id=dev`` or ``agent_id=worker`` are not globally unique, so
+    server-side state must be namespaced by tenant/user + conversation +
+    resolved client workspace.  Anonymous requests without a session get a
+    per-request namespace, which is safer than sharing by prompt or cwd.
+    """
+    metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    user_meta_raw = metadata.get("user_id") if isinstance(metadata, dict) else None
+    try:
+        user_meta = json.loads(user_meta_raw) if isinstance(user_meta_raw, str) else (user_meta_raw if isinstance(user_meta_raw, dict) else {})
+    except Exception:
+        user_meta = {}
+    tenant = (
+        metadata.get("tenant")
+        or metadata.get("tenant_id")
+        or metadata.get("account_id")
+        or metadata.get("organization_id")
+        or user_meta.get("tenant")
+        or user_meta.get("tenant_id")
+        or user_meta.get("account_id")
+        or user_meta.get("organization_id")
+        or user_meta.get("user_id")
+        or user_meta.get("user")
+        or user_meta.get("email")
+        or metadata.get("user")
+        or body.get("user")
+        or body.get("client_id")
+        or "anonymous"
+    )
+    session = (
+        metadata.get("session_id")
+        or metadata.get("conversation_id")
+        or user_meta.get("session_id")
+        or user_meta.get("conversation_id")
+        or body.get("session_id")
+        or body.get("conversation_id")
+        or ""
+    )
+    if not session:
+        session = f"request-{uuid.uuid4().hex}"
+    workspace = uuid.uuid5(uuid.NAMESPACE_URL, str(pathlib.Path(root).resolve())).hex[:24]
+    return f"tenant:{_stable_scope_part(tenant)}:session:{_stable_scope_part(session)}:workspace:{workspace}"
+
+
+def _agent_runtime_scope_from_request(path: str, body: Json) -> Json:
+    """Return planner/runtime event scope for a remote request.
+
+    Runtime events are service-side observability, but their keys must still be
+    tenant + session + *client workspace* scoped.  This helper deliberately uses
+    the same planner session-key builder as the Agent Planner so fallback
+    dispatch events and Gateway-owned service-tool events line up with planner
+    sessions in the admin APIs.
+    """
+    try:
+        session_key = _agent_planner_session_key(path, body)
+        parts = _agent_session_key_index_parts(session_key)
+        return {
+            "session_key": session_key,
+            "tenant_key": str(parts.get("tenant_key") or ""),
+            "workspace_key": str(parts.get("workspace_key") or ""),
+        }
+    except Exception:
+        return {"session_key": "", "tenant_key": "", "workspace_key": ""}
+
+
+def _record_agent_runtime_request_event(
+    path: str,
+    body: Json,
+    *,
+    event_type: str,
+    workflow: str,
+    step: str,
+    summary: str,
+    metadata: Json | None = None,
+) -> None:
+    try:
+        scope = _agent_runtime_scope_from_request(path, body)
+        _agent_record_runtime_event(
+            session_key=str(scope.get("session_key") or ""),
+            tenant_key=str(scope.get("tenant_key") or ""),
+            workspace_key=str(scope.get("workspace_key") or ""),
+            event_type=event_type,
+            workflow=workflow,
+            step=step,
+            summary=summary,
+            metadata=metadata or {},
+        )
+    except Exception:
+        pass
+
+
+def _tool_call_event_payload(call: ToolCall) -> Json:
+    return {
+        "id": call.call_id,
+        "name": call.name,
+        "arguments": call.arguments,
+        "metadata": call.raw,
+    }
+
+
+def _bounded_tool_call_event_payload(call: ToolCall, *, max_chars: int = 1200) -> Json:
+    """Return a bounded event payload for untrusted upstream tool attempts.
+
+    Chat-only synthesis responses come from a weak upstream that has no tool
+    authority. If it emits JSON/XML/function-call-looking text, the gateway
+    records the attempt for debugging, but the runtime event must stay small and
+    must not turn that content into an executable instruction.
+    """
+    payload = _tool_call_event_payload(call)
+    try:
+        rendered = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        rendered = str(payload)
+    if len(rendered) <= max_chars:
+        return payload
+    return {
+        "id": call.call_id,
+        "name": call.name,
+        "arguments_preview": json.dumps(call.arguments, ensure_ascii=False)[:max_chars],
+        "metadata_preview": json.dumps(call.raw, ensure_ascii=False)[:max_chars],
+        "truncated": True,
+    }
+
+
+def _record_ignored_upstream_tool_attempt(
+    path: str,
+    body: Json,
+    response: Json,
+    *,
+    source: str,
+    scope_body: Json | None = None,
+) -> None:
+    """Record, but never execute, tool attempts emitted during chat-only synthesis."""
+    if not _chat_only_synthesis_active(body):
+        return
+    native_calls = _extract_tool_calls(path, response)
+    text_calls: list[ToolCall] = []
+    if not native_calls:
+        text_calls = _extract_text_tool_calls(path, response)
+    calls = native_calls + text_calls
+    if not calls:
+        return
+    response_text = _response_text(path, response) or ""
+    _record_agent_runtime_request_event(
+        path,
+        scope_body or body,
+        event_type="upstream_tool_attempt_ignored",
+        workflow="chat_only_synthesis",
+        step="ignore_upstream_tool_attempt",
+        summary=f"ignored {len(calls)} upstream tool attempt(s) during chat-only synthesis",
+        metadata={
+            "source": source,
+            "call_count": len(calls),
+            "native_call_count": len(native_calls),
+            "text_call_count": len(text_calls),
+            "calls": [_bounded_tool_call_event_payload(call) for call in calls],
+            "response_chars": len(response_text),
+            "response_preview": response_text[:500],
+            "tool_authority_granted": False,
+        },
+    )
+
+
+def _chat_only_synthesis_body(body: Json) -> Json:
+    """Remove tool surfaces before sending final synthesis to chat-only upstreams.
+
+    In Agent Planner mode the upstream model is only a language synthesizer.
+    Tool selection/execution already happened in the outer runtime (or was
+    surfaced to the downstream client), so passing native tool schemas or text
+    adapter manuals to a chat-only upstream reintroduces the old gateway/shim
+    behavior and can make the weak model say "I'll call a tool" again.
+    """
+    cleaned = copy.deepcopy(body)
+    cleaned.pop("tools", None)
+    cleaned.pop("tool_choice", None)
+    ctx = cleaned.setdefault("gateway_context", {})
+    if isinstance(ctx, dict):
+        ctx["chat_only_synthesis"] = True
+        ctx["upstream_tools_stripped"] = True
+    return cleaned
+
+
+def _record_chat_only_synthesis_boundary_event(
+    path: str,
+    pre_body: Json,
+    synthesis_body: Json,
+    *,
+    source: str,
+    scope_body: Json | None = None,
+) -> None:
+    """Record that Agent Planner, not the upstream model, owns tool authority."""
+    if not _chat_only_synthesis_active(synthesis_body):
+        return
+    ctx = synthesis_body.get("gateway_context") if isinstance(synthesis_body.get("gateway_context"), dict) else {}
+    _record_agent_runtime_request_event(
+        path,
+        scope_body or pre_body,
+        event_type="chat_only_synthesis_boundary",
+        workflow="chat_only_synthesis",
+        step="strip_upstream_tools",
+        summary="Agent Planner stripped tool surfaces before chat-only upstream synthesis",
+        metadata={
+            "source": source,
+            "had_tools": bool(pre_body.get("tools")),
+            "had_tool_choice": pre_body.get("tool_choice") not in (None, "", "none"),
+            "strategy": str(ctx.get("strategy") or ""),
+            "upstream_tools_stripped": bool(ctx.get("upstream_tools_stripped")),
+            "agent_planner_strict_every_turn": bool(ctx.get("agent_planner_strict_every_turn")),
+            "planner_has_evidence": bool(ctx.get("planner_has_evidence")),
+            "tool_authority_granted": False,
+        },
+    )
+
+
+def _should_use_chat_only_synthesis_boundary(body: Json) -> bool:
+    """Return true only for final turns already owned by the outer planner.
+
+    Adapter/text fallback mode is also used by legacy orchestration tests and
+    by upstreams that may still emit executable native/text tool calls.  The
+    hard chat-only boundary must therefore be applied only after the Gateway
+    Agent Planner (or a Gateway-owned service tool preexecute) has already
+    produced the evidence that the upstream should synthesize from.
+    """
+    ctx = body.get("gateway_context") if isinstance(body, dict) else None
+    if not isinstance(ctx, dict):
+        return False
+    if ctx.get("agent_planner_strict_every_turn"):
+        return True
+    if ctx.get("strategy") == "agent_planner_final_synthesis" and ctx.get("planner_has_evidence"):
+        return True
+    agent_ctx = ctx.get("agent_planner") if isinstance(ctx.get("agent_planner"), dict) else {}
+    try:
+        evidence_count = int(agent_ctx.get("evidence_count") or 0)
+    except (TypeError, ValueError):
+        evidence_count = 0
+    if evidence_count > 0:
+        return True
+    # Gateway-owned service tools are pre-executed by the service before final
+    # synthesis and must not give the upstream another chance to schedule tools.
+    if str(agent_ctx.get("workflow") or "") == "gateway_owned_tool":
+        return True
+    return False
+
+
+def _chat_only_synthesis_active(body: Json) -> bool:
+    ctx = body.get("gateway_context") if isinstance(body, dict) else None
+    return bool(isinstance(ctx, dict) and ctx.get("chat_only_synthesis"))
+
+
 @contextmanager
-def _workspace_scope(root: pathlib.Path):
+def _workspace_scope(root: pathlib.Path, body: Json | None = None):
     """Context manager that temporarily changes the workspace root.
 
     SECURITY: root is always a valid path (client-provided or anonymous space).
@@ -571,9 +1087,22 @@ def _workspace_scope(root: pathlib.Path):
     _logger.debug("_workspace_scope: setting workspace to %s", resolved_root)
 
     token = _bt._WORKSPACE_ROOT_OVERRIDE.set(resolved_root)
+    scope_token = None
+    client_token = None
+    if body is not None:
+        scope_key = _request_runtime_scope_key(body, resolved_root)
+        scope_token = _bt._RUNTIME_SCOPE_OVERRIDE.set(scope_key)
+        client_id = body.get("client_id") if isinstance(body, dict) else None
+        if isinstance(client_id, str) and client_id.strip():
+            client_token = _bt._CLIENT_ID_SCOPE_OVERRIDE.set(client_id.strip())
+        _logger.debug("_workspace_scope: setting runtime scope to %s", scope_key)
     try:
         yield resolved_root
     finally:
+        if client_token is not None:
+            _bt._CLIENT_ID_SCOPE_OVERRIDE.reset(client_token)
+        if scope_token is not None:
+            _bt._RUNTIME_SCOPE_OVERRIDE.reset(scope_token)
         _bt._WORKSPACE_ROOT_OVERRIDE.reset(token)
         _logger.debug("_workspace_scope: reset workspace")
 
@@ -715,24 +1244,15 @@ def _direct_tool_calls_from_body(body: Json) -> list[ToolCall]:
 
 def _response_tool_call_from_item(item: Json) -> ToolCall | None:
     item_type = item.get("type")
-    if item_type not in {"function_call", "tool_call", "custom_tool_call"}:
+    if not _is_responses_tool_call_type(item_type):
         return None
-    name = item.get("name")
+    name = _responses_tool_call_name(item)
     if not name:
         return None
-    raw_args = item.get("arguments")
-    allow_text = item_type == "custom_tool_call"
-    custom_string_input = False
-    if raw_args is None and item_type == "custom_tool_call":
-        raw_args = item.get("input")
-        custom_string_input = raw_args is not None and not isinstance(raw_args, dict)
-    if raw_args is None:
-        raw_args = item.get("input") if isinstance(item.get("input"), dict) else item.get("action")
-    arguments = {"input": raw_args} if custom_string_input else _parse_json_arguments(raw_args, allow_text=allow_text)
     return ToolCall(
         call_id=str(item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex}"),
         name=str(name),
-        arguments=arguments,
+        arguments=_responses_tool_call_arguments_value(item),
         raw=item,
     )
 
@@ -1072,6 +1592,16 @@ def _extract_tool_calls(path: str, response: Json) -> list[ToolCall]:
                         raw=call,
                     )
                 )
+            legacy_call = message.get("function_call")
+            if isinstance(legacy_call, dict) and legacy_call.get("name"):
+                calls.append(
+                    ToolCall(
+                        call_id=_legacy_function_call_id(legacy_call.get("name")),
+                        name=str(legacy_call["name"]),
+                        arguments=_parse_json_arguments(legacy_call.get("arguments")),
+                        raw=legacy_call,
+                    )
+                )
         return calls
 
     if path == "/v1/responses":
@@ -1266,19 +1796,20 @@ def _detect_intent_tool_calls(path: str, response: Json, body: Json) -> list[Too
     # Pattern 0: Bare shell commands (highest priority)
     # Match standalone commands like "ls -la", "tree", "pwd", "find .", etc.
     # Strip trailing punctuation like . , ! ?
-    clean_text = text.strip().rstrip('.,!?;:')
+    clean_text = text.strip().rstrip(',!?;:')
     bare_cmd_pattern = r"^(ls|tree|pwd|find|grep|cat|head|tail|wc|du|df)(\s+.*)?$"
     bare_match = re.match(bare_cmd_pattern, clean_text, re.IGNORECASE)
     _logger.debug("Bare command pattern match on '%s': %s", clean_text, bare_match)
     if bare_match:
         cmd = clean_text
         _logger.debug("Detected bare command: '%s'", cmd)
-        calls.append(ToolCall(
-            call_id=f"intent_{uuid.uuid4().hex}",
-            name="Bash",
-            arguments={"command": cmd, "description": f"Execute command: {cmd}"},
-            raw={"gateway_intent_detection": True, "bare_command": True, "text": text[:500]},
-        ))
+        call = _shell_tool_call_for_downstream(
+            body,
+            cmd,
+            {"gateway_intent_detection": True, "bare_command": True, "text": text[:500]},
+        )
+        if call is not None:
+            calls.append(call)
         _logger.debug("Returning %d intent-detected tool calls", len(calls))
         return calls
 
@@ -1299,12 +1830,22 @@ def _detect_intent_tool_calls(path: str, response: Json, body: Json) -> list[Too
             if file_path and not file_path.startswith(("http://", "https://", "ftp://")):
                 # Avoid duplicates
                 if not any(c.arguments.get("path") == file_path for c in calls):
-                    calls.append(ToolCall(
-                        call_id=f"intent_{uuid.uuid4().hex}",
-                        name="Read",
-                        arguments={"path": file_path},
-                        raw={"gateway_intent_detection": True, "text": text[:500]},
-                    ))
+                    call = _declared_or_fallback_tool_call(
+                        body,
+                        f"intent_{uuid.uuid4().hex}",
+                        ("Read", "read", "open", "view_file"),
+                        "Read",
+                        {"path": file_path},
+                        {"gateway_intent_detection": True, "text": text[:500]},
+                    )
+                    if call is None:
+                        call = _shell_tool_call_for_downstream(
+                            body,
+                            _read_shell_command(file_path),
+                            {"gateway_intent_detection": True, "fallback_shell_tool": True, "text": text[:500]},
+                        )
+                    if call is not None:
+                        calls.append(call)
                     break  # Only one Read per response
         if calls:
             break
@@ -1312,18 +1853,28 @@ def _detect_intent_tool_calls(path: str, response: Json, body: Json) -> list[Too
     # Pattern 2: Model says it will list/check directory
     if not calls:
         dir_patterns = [
-            r"(?:list|check|examine|look at|explore)\s+(?:the\s+)?(?:directory|folder|contents)\s+(?:of\s+)?(?:`([^`]+)`|(\S+))",
-            r"(?:ls|dir)\s+(?:`([^`]+)`|(\S+))",
+            r"\b(?:list|check|examine|look at|explore)\s+(?:the\s+)?(?:directory|folder|contents)\s+(?:of\s+)?(?:`([^`]+)`|(\S+))",
+            r"\b(?:ls|dir)\b\s+(?:`([^`]+)`|(\S+))",
         ]
         for pattern in dir_patterns:
             for match in re.finditer(pattern, text, re.IGNORECASE):
                 dir_path = match.group(1) or match.group(2) or match.group(3) or "."
-                calls.append(ToolCall(
-                    call_id=f"intent_{uuid.uuid4().hex}",
-                    name="LS",
-                    arguments={"path": dir_path},
-                    raw={"gateway_intent_detection": True, "text": text[:500]},
-                ))
+                call = _declared_or_fallback_tool_call(
+                    body,
+                    f"intent_{uuid.uuid4().hex}",
+                    ("LS", "ls", "list", "list_files", "list_directory"),
+                    "LS",
+                    {"path": dir_path},
+                    {"gateway_intent_detection": True, "text": text[:500]},
+                )
+                if call is None:
+                    call = _shell_tool_call_for_downstream(
+                        body,
+                        f"ls -la {shlex.quote(dir_path)}",
+                        {"gateway_intent_detection": True, "fallback_shell_tool": True, "text": text[:500]},
+                    )
+                if call is not None:
+                    calls.append(call)
                 break
             if calls:
                 break
@@ -1338,12 +1889,13 @@ def _detect_intent_tool_calls(path: str, response: Json, body: Json) -> list[Too
             for match in re.finditer(pattern, text, re.IGNORECASE):
                 cmd = match.group(1)
                 if cmd:
-                    calls.append(ToolCall(
-                        call_id=f"intent_{uuid.uuid4().hex}",
-                        name="Bash",
-                        arguments={"command": cmd},
-                        raw={"gateway_intent_detection": True, "text": text[:500]},
-                    ))
+                    call = _shell_tool_call_for_downstream(
+                        body,
+                        cmd,
+                        {"gateway_intent_detection": True, "text": text[:500]},
+                    )
+                    if call is not None:
+                        calls.append(call)
                     break
             if calls:
                 break
@@ -1357,15 +1909,50 @@ def _detect_intent_tool_calls(path: str, response: Json, body: Json) -> list[Too
             for match in re.finditer(pattern, text, re.IGNORECASE):
                 glob_pattern = match.group(1) or match.group(2)
                 if glob_pattern:
-                    calls.append(ToolCall(
-                        call_id=f"intent_{uuid.uuid4().hex}",
-                        name="Glob",
-                        arguments={"pattern": glob_pattern},
-                        raw={"gateway_intent_detection": True, "text": text[:500]},
-                    ))
+                    glob_name = _declared_tool_name_for_candidates(body, ("Glob", "glob", "file_search", "find_files"))
+                    if glob_name is not None or not body.get("tools"):
+                        glob_name = glob_name or "Glob"
+                        calls.append(ToolCall(
+                            call_id=f"intent_{uuid.uuid4().hex}",
+                            name=glob_name,
+                            arguments=_adapt_arguments_for_declared_tool(body, glob_name, {"pattern": glob_pattern}),
+                            raw={"gateway_intent_detection": True, "text": text[:500]},
+                        ))
+                    else:
+                        call = _shell_tool_call_for_downstream(
+                            body,
+                            f"find . -name {shlex.quote(glob_pattern)} | head -200",
+                            {"gateway_intent_detection": True, "fallback_shell_tool": True, "text": text[:500]},
+                        )
+                        if call is not None:
+                            calls.append(call)
                     break
             if calls:
                 break
+
+    # Pattern 5: After a downstream tool result (for example Skill loaded),
+    # weak upstreams often answer with prose such as "Let me gather the project
+    # structure" instead of a protocol tool call.  If the conversation still
+    # contains the original project-inspection request, surface a real
+    # downstream shell inspection call rather than ending with a placeholder.
+    if not calls:
+        response_lower = text.lower()
+        wants_gather = any(token in response_lower for token in (
+            "gather the project", "project structure", "key files", "analyze this project",
+            "inspect the project", "读取项目", "项目结构", "关键文件", "分析项目",
+        ))
+        try:
+            conversation_text = json.dumps(body.get("messages") or body.get("input") or body, ensure_ascii=False)
+        except Exception:
+            conversation_text = str(body)
+        if wants_gather and _text_requests_project_inspection(conversation_text):
+            call = _shell_tool_call_for_downstream(
+                body,
+                _project_inspection_shell_command("."),
+                {"gateway_intent_detection": True, "intent": "project_inspection_followup", "fallback_shell_tool": True, "text": text[:500]},
+            )
+            if call is not None:
+                calls.append(call)
 
     return calls
 
@@ -1381,15 +1968,25 @@ def _append_tool_results(path: str, body: Json, response: Json, results: list[To
     updated = dict(body)
     if path == "/v1/chat/completions":
         messages = list(updated.get("messages") or [])
-        messages.append(_assistant_message_from_chat_response(response))
+        assistant_message = _assistant_message_from_chat_response(response)
+        messages.append(assistant_message)
+        legacy_function_call = (
+            isinstance(assistant_message, dict)
+            and isinstance(assistant_message.get("function_call"), dict)
+            and not assistant_message.get("tool_calls")
+        )
         for result in results:
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": result.call_id,
-                    "content": result.content,
-                }
-            )
+            result_content = _encode_tool_result_content(result.content, not result.success)
+            if legacy_function_call:
+                messages.append({"role": "function", "name": result.name, "content": result_content})
+            else:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": result.call_id,
+                        "content": result_content,
+                    }
+                )
         updated["messages"] = messages
         return updated
 
@@ -1418,7 +2015,7 @@ def _append_tool_results(path: str, body: Json, response: Json, results: list[To
             output_item = {
                 "type": output_type,
                 "call_id": result.call_id,
-                "output": result.content,
+                "output": _encode_tool_result_content(result.content, not result.success),
             }
             if output_type == "custom_tool_call_output":
                 output_item["name"] = result.name
@@ -1530,8 +2127,794 @@ def _should_build_local_planner_context(path: str, body: Json) -> bool:
     has_path = bool(_extract_mentioned_paths(text))
     if read_intent and has_path:
         return True
-    analyze_intent = any(token in lowered for token in ("分析代码", "分析项目", "analyze code", "analyze project", "code review", "代码审查", "代码分析", "项目分析", "梳理代码", "梳理架构"))
-    return analyze_intent and has_path
+    analyze_intent = _text_requests_project_inspection(text)
+    return analyze_intent
+
+
+def _text_requests_project_inspection(text: str) -> bool:
+    """Return True for prompts that require looking at the local code/workspace.
+
+    This intentionally covers broad Chinese requests such as "分析这套项目" even
+    when no explicit path is mentioned.  A chat-only upstream cannot see the
+    user's filesystem by itself; surfacing a real downstream tool call is safer
+    and more faithful than asking the upstream to guess from no evidence.
+    """
+    lowered = text.lower()
+    project_tokens = (
+        "这套项目", "这个项目", "当前项目", "本地项目", "项目结构",
+        "工程", "代码", "代码库", "仓库", "目录结构", "这套代码", "这套工程",
+        "this project", "current project", "local project", "codebase", "repo", "repository", "workspace",
+    )
+    inspect_tokens = (
+        "分析", "审查", "检查", "梳理", "看看", "看一下", "了解", "理解", "解释", "总结",
+        "analyze", "analyse", "review", "inspect", "investigate", "explain", "summarize",
+    )
+    explicit_phrases = (
+        "分析代码", "分析这套项目", "分析这个项目", "分析当前项目", "分析本地项目",
+        "项目结构", "代码分析", "代码审查", "梳理代码", "梳理架构",
+        "analyze code", "analyze project", "analyze the project", "analyze this project",
+        "review code", "code review", "inspect codebase", "explain this repo",
+    )
+    return (
+        any(phrase in lowered for phrase in explicit_phrases)
+        or (any(token in lowered for token in inspect_tokens) and any(token in lowered for token in project_tokens))
+    )
+
+
+def _text_requests_web_search(text: str) -> bool:
+    lowered = text.lower()
+    return any(token in lowered for token in (
+        "web search", "search web", "search online", "look up", "google", "browse",
+        "搜索网页", "联网搜索", "上网查", "网上查", "查一下", "检索",
+    ))
+
+
+def _text_says_tool_work_is_needed(text: str) -> bool:
+    lowered = text.lower()
+    return any(token in lowered for token in (
+        "i will read", "i'll read", "let me read", "i need to read",
+        "i will check", "i'll check", "let me check", "i need to check",
+        "i will inspect", "let me inspect", "i need to inspect",
+        "i will explore", "let me explore", "i need to explore",
+        "我来读取", "我会读取", "需要读取", "先读取", "我来查看", "我会查看",
+        "需要查看", "先查看", "我来检查", "需要检查", "我来分析文件",
+    ))
+
+
+def _extract_web_search_query(text: str) -> str:
+    cleaned = re.sub(
+        r"(?i)\b(?:please\s+)?(?:web\s+search|search\s+web|search\s+online|look\s+up|google|browse)\b[:：]?",
+        "",
+        text,
+    )
+    cleaned = re.sub(r"(?:请)?(?:搜索网页|联网搜索|上网查|网上查|查一下|检索)[:：]?", "", cleaned)
+    cleaned = cleaned.strip().strip("`'\"“” \n\t")
+    return cleaned[:500] or text.strip()[:500]
+
+
+def _declared_tool_name_map_from_body(body: Json) -> dict[str, str]:
+    """Map normalized/lowercase tool names to the exact caller-declared name."""
+    names: dict[str, str] = {}
+    for tool in body.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        candidates: list[Any] = [tool.get("name")]
+        function = tool.get("function")
+        if isinstance(function, dict):
+            candidates.append(function.get("name"))
+        for candidate in candidates:
+            if not isinstance(candidate, str) or not candidate.strip():
+                continue
+            exact = candidate.strip()
+            for key in {exact, exact.lower(), _normalize_tool_name(exact), _normalize_tool_name(exact).lower()}:
+                if key:
+                    names.setdefault(key, exact)
+    return names
+
+
+def _preferred_declared_tool_name(body: Json, candidates: tuple[str, ...], fallback: str) -> str:
+    declared = _declared_tool_name_map_from_body(body)
+    for candidate in candidates:
+        for key in (candidate, candidate.lower(), _normalize_tool_name(candidate), _normalize_tool_name(candidate).lower()):
+            if key in declared:
+                return declared[key]
+    return fallback
+
+
+def _declared_tool_name_for_candidates(body: Json, candidates: tuple[str, ...]) -> str | None:
+    declared = _declared_tool_name_map_from_body(body)
+    for candidate in candidates:
+        for key in (candidate, candidate.lower(), _normalize_tool_name(candidate), _normalize_tool_name(candidate).lower()):
+            if key in declared:
+                return declared[key]
+    return None
+
+
+def _declared_gateway_builtin_name(body: Json, name: str) -> str | None:
+    """Return the exact caller-declared name when it targets a Gateway builtin."""
+    candidates: list[str] = []
+
+    def add(candidate: str) -> None:
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    normalized = _normalize_tool_name(name)
+    add(name)
+    add(normalized)
+    tool = BUILTIN_TOOLS.get(normalized) or BUILTIN_TOOLS.get(name)
+    if tool is not None:
+        add(tool.name)
+        for registry_name, registry_tool in BUILTIN_TOOLS.items():
+            if registry_tool is tool:
+                add(registry_name)
+    return _declared_tool_name_for_candidates(body, tuple(candidates))
+
+
+def _declared_tool_shadows_gateway_builtin(body: Json, name: str) -> bool:
+    """True when a caller-declared function name must override our builtin.
+
+    In cloud Gateway mode, a request's private tool schema belongs to the
+    downstream client even if its name collides with a pure/network Gateway
+    helper such as ``calculator`` or ``WebSearch``.  Gateway-owned extension
+    points (HTTP Actions/MCP public names) and explicit ``gateway__`` aliases
+    remain service-owned.
+    """
+    declared_name = _declared_gateway_builtin_name(body, name)
+    if not declared_name:
+        return False
+    if declared_name.lower().startswith("gateway__"):
+        return False
+    if _http_action_by_name(declared_name) or _mcp_parse_public_name(declared_name):
+        return False
+    tool = BUILTIN_TOOLS.get(_normalize_tool_name(name)) or BUILTIN_TOOLS.get(declared_name)
+    return tool is not None and tool.risk not in USER_SIDE_TOOL_RISKS
+
+
+def _declared_tool_specs_from_body(body: Json) -> list[tuple[str, str, Json]]:
+    """Return exact caller-declared tool name, description, and input schema."""
+    specs: list[tuple[str, str, Json]] = []
+    for tool in body.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        if isinstance(tool.get("function"), dict):
+            fn = tool["function"]
+            name = str(fn.get("name") or "").strip()
+            description = str(fn.get("description") or tool.get("description") or "")
+            schema = fn.get("parameters") if isinstance(fn.get("parameters"), dict) else {}
+        else:
+            name = str(tool.get("name") or "").strip()
+            description = str(tool.get("description") or "")
+            if isinstance(tool.get("input_schema"), dict):
+                schema = tool["input_schema"]
+            elif isinstance(tool.get("parameters"), dict):
+                # OpenAI Responses tools are top-level
+                # {"type":"function","name":"...","parameters":{...}} rather
+                # than chat-completions {"function":{...}}.
+                schema = tool["parameters"]
+            else:
+                schema = {}
+        if name:
+            specs.append((name, description, schema))
+    return specs
+
+
+def _declared_tool_schema_from_body(body: Json, tool_name: str) -> Json:
+    normalized = _normalize_tool_name(tool_name)
+    for name, _description, schema in _declared_tool_specs_from_body(body):
+        if name == tool_name or name.lower() == tool_name.lower() or _normalize_tool_name(name) == normalized:
+            return schema
+    return {}
+
+
+def _schema_properties(schema: Json) -> dict[str, Any]:
+    properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    return properties
+
+
+def _schema_prefers_property(schema: Json, candidates: tuple[str, ...], fallback: str) -> str:
+    properties = _schema_properties(schema)
+    for candidate in candidates:
+        if candidate in properties:
+            return candidate
+    required = schema.get("required") if isinstance(schema.get("required"), list) else []
+    for candidate in candidates:
+        if candidate in required:
+            return candidate
+    return fallback
+
+
+def _adapt_arguments_for_declared_tool(body: Json, tool_name: str, arguments: Json) -> Json:
+    """Adapt gateway semantic args to the exact downstream client schema.
+
+    Codex Responses exposes ``exec_command(cmd=...)`` while Claude Code exposes
+    ``Bash(command=...)`` and ``Read(file_path=...)``.  Returning gateway-native
+    aliases such as ``Read(path=...)`` makes the real client reject the call
+    before any local tool can run, so every synthesized downstream call must be
+    reshaped against the caller-declared schema when one exists.
+    """
+    schema = _declared_tool_schema_from_body(body, tool_name)
+    if not schema:
+        return arguments
+    adapted = dict(arguments)
+    properties = _schema_properties(schema)
+    normalized = _normalize_tool_name(tool_name).lower()
+
+    if "command" in adapted:
+        prop = _schema_prefers_property(schema, ("command", "cmd"), "command")
+        if prop != "command":
+            adapted[prop] = adapted.pop("command")
+    if "path" in adapted:
+        prop = _schema_prefers_property(schema, ("path", "file_path", "cwd", "directory"), "path")
+        if prop != "path":
+            adapted[prop] = adapted.pop("path")
+        if prop == "file_path" and isinstance(adapted.get(prop), str):
+            raw_path = adapted[prop]
+            if raw_path and not pathlib.Path(raw_path).expanduser().is_absolute():
+                root = _downstream_declared_path_anchor(body)
+                if root is not None:
+                    try:
+                        adapted[prop] = str((root / raw_path).resolve(strict=False))
+                    except Exception:
+                        adapted[prop] = raw_path
+    if "file_path" in adapted and isinstance(adapted.get("file_path"), str):
+        raw_path = adapted["file_path"]
+        if raw_path and not pathlib.Path(raw_path).expanduser().is_absolute():
+            root = _downstream_declared_path_anchor(body)
+            if root is not None:
+                try:
+                    adapted["file_path"] = str((root / raw_path).resolve(strict=False))
+                except Exception:
+                    adapted["file_path"] = raw_path
+    if "name" in adapted and (normalized == "skill" or tool_name.lower() == "skill"):
+        prop = _schema_prefers_property(schema, ("name", "skill"), "name")
+        if prop != "name":
+            adapted[prop] = adapted.pop("name")
+
+    # Keep only schema-declared properties when the downstream schema is strict.
+    if properties and schema.get("additionalProperties") is False:
+        adapted = {key: value for key, value in adapted.items() if key in properties}
+    return adapted
+
+
+def _declared_or_fallback_tool_call(
+    body: Json,
+    call_id: str,
+    candidates: tuple[str, ...],
+    fallback: str,
+    arguments: Json,
+    raw: Json | None = None,
+) -> ToolCall | None:
+    declared_name = _declared_tool_name_for_candidates(body, candidates)
+    if body.get("tools") and declared_name is None:
+        return None
+    name = declared_name or fallback
+    return ToolCall(call_id, name, _adapt_arguments_for_declared_tool(body, name, arguments), raw or {"gateway_downstream_tool_request": True})
+
+
+def _adapt_text_calls_for_declared_downstream_tools(body: Json, calls: list[ToolCall]) -> list[ToolCall]:
+    """Reshape parsed text-tool calls to the exact caller-declared schema.
+
+    Chat-only upstreams may emit fallback JSON such as
+    ``{"name":"Edit","arguments":{"file_path":"..."}}``.  The text parser
+    normalizes those against gateway builtin schemas, but the downstream client
+    might have declared a different exact shape (Claude Code Read(file_path),
+    Codex exec_command(cmd), etc.).  Before surfacing a text fallback as a
+    native downstream tool request, re-bind the call to the declared tool name
+    and argument schema.
+    """
+    if not calls:
+        return calls
+    adapted: list[ToolCall] = []
+    for call in calls:
+        candidates = (call.name, call.name.lower(), _normalize_tool_name(call.name), _normalize_tool_name(call.name).lower())
+        declared = _declared_tool_name_for_candidates(body, candidates)
+        name = declared or call.name
+        adapted.append(ToolCall(
+            call.call_id,
+            name,
+            _adapt_arguments_for_declared_tool(body, name, call.arguments),
+            dict(call.raw or {}),
+        ))
+    return adapted
+
+
+def _body_mentions_available_skill(body: Json, skill_name: str) -> bool:
+    """Return True when the request context lists a skill as available."""
+    try:
+        haystack = json.dumps(body.get("messages") or body.get("input") or body, ensure_ascii=False)
+    except Exception:
+        haystack = str(body)
+    return skill_name in haystack
+
+
+def _shell_tool_call_for_downstream(body: Json, command: str, raw: Json | None = None) -> ToolCall | None:
+    return _declared_or_fallback_tool_call(
+        body,
+        f"client_required_{uuid.uuid4().hex}",
+        ("Bash", "bash", "shell", "exec_command"),
+        "Bash",
+        {"command": command},
+        raw or {"gateway_downstream_tool_request": True, "fallback_shell_tool": True},
+    )
+
+
+def _read_shell_command(path: str) -> str:
+    return f"python3 - <<'PY'\nfrom pathlib import Path\np = Path({path!r}).expanduser()\nprint(p.read_text(encoding='utf-8', errors='replace')[:20000], end='')\nPY"
+
+
+def _project_inspection_shell_command(target: str = ".") -> str:
+    quoted = shlex.quote(target)
+    return (
+        f"pwd; printf '\\n--- files ---\\n'; "
+        f"find {quoted} -maxdepth 3 -type f "
+        f"\\( -name '*.py' -o -name '*.md' -o -name '*.json' -o -name '*.toml' -o -name '*.yaml' -o -name '*.yml' \\) "
+        f"| sed 's#^./##' | sort | head -200"
+    )
+
+
+_ARG_MISSING = object()
+
+
+def _json_objects_from_text(text: str) -> list[Json]:
+    candidates: list[Json] = []
+    for match in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.I | re.S):
+        try:
+            value = json.loads(match.group(1))
+        except Exception:
+            continue
+        if isinstance(value, dict):
+            candidates.append(value)
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        try:
+            value, _end = decoder.raw_decode(text[match.start():])
+        except Exception:
+            continue
+        if isinstance(value, dict):
+            candidates.append(value)
+    return candidates
+
+
+def _declared_argument_object_from_text(user_text: str, properties: Json) -> Json:
+    property_names = set(properties.keys())
+    for obj in _json_objects_from_text(user_text):
+        args = obj.get("arguments") if isinstance(obj.get("arguments"), dict) else obj
+        if not isinstance(args, dict):
+            continue
+        if property_names and not (set(args.keys()) & property_names):
+            continue
+        return args
+    return {}
+
+
+def _schema_type(spec: Any) -> str:
+    if not isinstance(spec, dict):
+        return ""
+    typ = spec.get("type")
+    if isinstance(typ, list):
+        for item in typ:
+            if item != "null":
+                return str(item)
+        return ""
+    return str(typ or "")
+
+
+def _enum_value_from_text(text: str, spec: Any) -> Any:
+    if not isinstance(spec, dict) or not isinstance(spec.get("enum"), list):
+        return _ARG_MISSING
+    lowered = text.lower()
+    for item in spec["enum"]:
+        item_text = str(item)
+        if lowered == item_text.lower() or re.search(rf"(?<![A-Za-z0-9_]){re.escape(item_text.lower())}(?![A-Za-z0-9_])", lowered):
+            return item
+    return _ARG_MISSING
+
+
+def _coerce_declared_argument_value(value: Any, spec: Any) -> Any:
+    if not isinstance(spec, dict):
+        return value
+    enum_value = _enum_value_from_text(str(value), spec)
+    if enum_value is not _ARG_MISSING:
+        return enum_value
+    typ = _schema_type(spec)
+    if typ == "integer":
+        if isinstance(value, bool):
+            return _ARG_MISSING
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        match = re.search(r"-?\d+", str(value))
+        return int(match.group(0)) if match else _ARG_MISSING
+    if typ == "number":
+        if isinstance(value, bool):
+            return _ARG_MISSING
+        if isinstance(value, (int, float)):
+            return value
+        match = re.search(r"-?(?:\d+\.\d+|\d+)", str(value))
+        return float(match.group(0)) if match else _ARG_MISSING
+    if typ == "boolean":
+        if isinstance(value, bool):
+            return value
+        lowered = str(value).strip().lower()
+        if lowered in {"1", "true", "yes", "y", "on", "是", "开启", "启用"}:
+            return True
+        if lowered in {"0", "false", "no", "n", "off", "否", "关闭", "禁用"}:
+            return False
+        return _ARG_MISSING
+    if typ == "array":
+        item_spec = spec.get("items") if isinstance(spec.get("items"), dict) else {}
+        raw_items = value if isinstance(value, list) else [part.strip() for part in re.split(r"[,，\n]+", str(value)) if part.strip()]
+        coerced = []
+        for item in raw_items:
+            item_value = _coerce_declared_argument_value(item, item_spec)
+            if item_value is _ARG_MISSING:
+                return _ARG_MISSING
+            coerced.append(item_value)
+        return coerced
+    if typ == "object":
+        if isinstance(value, dict):
+            nested_props = spec.get("properties") if isinstance(spec.get("properties"), dict) else {}
+            if not nested_props:
+                return value
+            out: Json = {}
+            for key, nested_spec in nested_props.items():
+                if key in value:
+                    nested_value = _coerce_declared_argument_value(value[key], nested_spec)
+                    if nested_value is not _ARG_MISSING:
+                        out[str(key)] = nested_value
+            if spec.get("additionalProperties") is not False:
+                for key, nested_value in value.items():
+                    out.setdefault(str(key), nested_value)
+            return out
+        return _ARG_MISSING
+    if typ == "string":
+        return str(value)
+    return value
+
+
+def _labelled_value_from_text(prop: str, user_text: str) -> str:
+    match = re.search(rf"(?:{re.escape(prop)}|{re.escape(prop.replace('_', ' '))})\s*[:=]\s*([^\n;]+)", user_text, flags=re.I)
+    return match.group(1).strip(" ,，。.!?") if match else ""
+
+
+def _infer_declared_tool_arguments(name: str, schema: Json, user_text: str) -> Json | None:
+    properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    required = schema.get("required") if isinstance(schema.get("required"), list) else []
+    args: Json = {}
+    explicit_args = _declared_argument_object_from_text(user_text, properties)
+    if explicit_args and not properties:
+        return explicit_args
+    for prop, spec in properties.items():
+        if prop in explicit_args:
+            value = _coerce_declared_argument_value(explicit_args[prop], spec)
+            if value is _ARG_MISSING:
+                return None
+            args[str(prop)] = value
+
+    url_match = re.search(r"https?://[^\s`'\"<>]+", user_text)
+    path_candidates = _extract_mentioned_paths(user_text)
+    arithmetic_match = re.search(r"[-+*/().\d\s]{3,}", user_text)
+    number_match = re.search(r"-?(?:\d+\.\d+|\d+)", user_text)
+    location_match = re.search(
+        r"(?:\bin\s+|\bfor\s+|天气[：:]?|weather\s+(?:in|for)\s+)([A-Za-z\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff ,.-]{1,80})",
+        user_text,
+        flags=re.I,
+    )
+    query = _extract_web_search_query(user_text) if _text_requests_web_search(user_text) else user_text.strip()
+
+    def value_for(prop: str, spec: Any) -> Any:
+        lower = prop.lower()
+        enum_value = _enum_value_from_text(user_text, spec)
+        if enum_value is not _ARG_MISSING:
+            return enum_value
+        labelled = _labelled_value_from_text(prop, user_text)
+        if labelled:
+            return _coerce_declared_argument_value(labelled, spec)
+        if lower in {"query", "q", "search", "search_query", "keywords"}:
+            return query
+        if lower in {"location", "city", "place", "where"}:
+            return (location_match.group(1).strip(" ?。.!") if location_match else user_text.strip())
+        if lower in {"expression", "expr", "formula"}:
+            return arithmetic_match.group(0).strip() if arithmetic_match else user_text.strip()
+        if lower in {"url", "uri", "link"}:
+            return url_match.group(0).rstrip(".,)") if url_match else user_text.strip()
+        if lower in {"path", "file", "file_path", "filename"}:
+            return path_candidates[-1] if path_candidates else user_text.strip()
+        if lower in {"prompt", "input", "text", "message", "question"}:
+            return user_text.strip()
+        if isinstance(spec, dict):
+            typ = _schema_type(spec)
+            if typ in {"integer", "number"} and number_match:
+                return _coerce_declared_argument_value(number_match.group(0), spec)
+            if typ == "array":
+                labelled_items = _labelled_value_from_text(prop, user_text)
+                return _coerce_declared_argument_value(labelled_items, spec) if labelled_items else _ARG_MISSING
+            if typ == "string":
+                return user_text.strip()
+            if typ == "boolean":
+                lowered = user_text.lower()
+                if any(token in lowered for token in (f"{lower} true", f"{lower}=true", f"{lower}: true", f"{lower} yes", f"{lower}=1")):
+                    return True
+                if any(token in lowered for token in (f"{lower} false", f"{lower}=false", f"{lower}: false", f"{lower} no", f"{lower}=0")):
+                    return False
+                return False
+        return _ARG_MISSING
+
+    for prop, spec in properties.items():
+        if prop in args:
+            continue
+        if prop in required or prop.lower() in {"query", "q", "location", "city", "expression", "url", "path", "input", "text"}:
+            value = value_for(str(prop), spec)
+            if value is not _ARG_MISSING and value != "":
+                args[str(prop)] = value
+    for prop in required:
+        if prop not in args:
+            if isinstance(properties.get(prop), dict) and properties[prop].get("type") == "string":
+                args[prop] = user_text.strip()
+            else:
+                return None
+    return args
+
+
+def _declared_function_tool_call_from_user_text(body: Json, user_text: str) -> ToolCall | None:
+    """Deterministically select a caller-declared custom function when obvious.
+
+    This is the stable outer-service path for chat-only upstreams: when a client
+    supplies a single-purpose custom function such as ``get_weather`` and the
+    user asks for weather, the gateway can return a real protocol-level tool
+    call to the client instead of hoping the weak upstream invents one.
+    """
+    specs = []
+    for name, description, schema in _declared_tool_specs_from_body(body):
+        # Builtin/user-machine tools have dedicated safer planners above.
+        shadows_gateway_builtin = _declared_tool_shadows_gateway_builtin(body, name)
+        if _normalize_tool_name(name) in BUILTIN_TOOLS and not shadows_gateway_builtin:
+            continue
+        if _http_action_by_name(name) or _mcp_parse_public_name(name):
+            continue
+        specs.append((name, description, schema, shadows_gateway_builtin))
+    if not specs:
+        return None
+    lowered = user_text.lower()
+    best: tuple[int, str, str, Json] | None = None
+    for name, description, schema, shadows_gateway_builtin in specs:
+        normalized_name = name.lower().replace("_", " ").replace("-", " ")
+        name_tokens = [tok for tok in re.split(r"[^a-z0-9\u4e00-\u9fff]+", normalized_name) if len(tok) >= 2]
+        desc_tokens = [tok for tok in re.split(r"[^a-z0-9\u4e00-\u9fff]+", description.lower()) if len(tok) >= 4]
+        score = 0
+        if name.lower() in lowered or normalized_name in lowered:
+            score += 4
+        if shadows_gateway_builtin:
+            tool = BUILTIN_TOOLS.get(_normalize_tool_name(name))
+            canonical_name = tool.name if tool is not None else name
+            if canonical_name == "calculator" and re.search(r"\d\s*[-+*/%]\s*\d", user_text):
+                score += 5
+            elif canonical_name == "get_current_time" and (
+                any(token in lowered for token in ("current time", "what time", "time now", "now time"))
+                or any(token in user_text for token in ("现在几点", "当前时间", "现在时间", "几点了"))
+            ):
+                score += 5
+            elif canonical_name in {"WebSearch", "web_search_call"} and _text_requests_web_search(user_text):
+                score += 5
+        score += sum(1 for tok in name_tokens if tok in lowered)
+        score += min(2, sum(1 for tok in desc_tokens if tok in lowered))
+        if len(specs) == 1 and score > 0:
+            score += 1
+        if score and (best is None or score > best[0]):
+            best = (score, name, description, schema)
+    if best is None or best[0] < 2:
+        return None
+    _, name, _description, schema = best
+    args = _infer_declared_tool_arguments(name, schema, user_text)
+    if args is None:
+        return None
+    return ToolCall(
+        f"client_required_{uuid.uuid4().hex}",
+        name,
+        args,
+        {"gateway_downstream_tool_request": True, "declared_function_planner": True},
+    )
+
+
+def _gateway_owned_tool_calls_from_user_text(body: Json, user_text: str) -> list[ToolCall]:
+    """Plan obvious Gateway-owned tool calls before involving chat-only upstreams.
+
+    HTTP Actions and configured MCP connectors are service-owned capabilities:
+    the weak upstream should not have to invent XML/JSON tool syntax for them.
+    When the request clearly matches configured Gateway-owned actions, the outer
+    planner can execute them and pass the results to the upstream only for final
+    language synthesis.
+    """
+    specs: list[tuple[str, str, Json]] = []
+    seen_names: set[str] = set()
+
+    def add_spec(name: str, description: str, schema: Json) -> None:
+        if not name or name in seen_names:
+            return
+        specs.append((name, description, schema if isinstance(schema, dict) else {}))
+        seen_names.add(name)
+
+    lowered = user_text.lower()
+    arithmetic_requested = bool(
+        re.search(r"\d\s*[-+*/%]\s*\d", user_text)
+        and any(token in lowered for token in ("calculate", "calc", "math", "arithmetic", "compute", "what is", "多少", "计算", "算一下", "等于"))
+    )
+    time_requested = bool(
+        any(token in lowered for token in ("current time", "what time", "time now", "now time"))
+        or any(token in user_text for token in ("现在几点", "当前时间", "现在时间", "几点了"))
+    )
+    web_search_requested = _text_requests_web_search(user_text)
+
+    # Built-in Gateway-owned capabilities are part of the service-side planner
+    # registry too.  Keep this list intentionally narrow and capability-driven:
+    # user-machine tools (filesystem/shell/GUI/local agents) must still be
+    # surfaced to the downstream client, but pure/network service tools can run
+    # before a chat-only upstream is asked to synthesize.
+    for builtin_name, enabled in (
+        ("calculator", arithmetic_requested),
+        ("current_time", time_requested),
+        ("WebSearch", web_search_requested),
+    ):
+        if not enabled:
+            continue
+        if _declared_tool_shadows_gateway_builtin(body, builtin_name):
+            continue
+        tool = BUILTIN_TOOLS.get(builtin_name)
+        if tool is None or tool.risk in USER_SIDE_TOOL_RISKS:
+            continue
+        add_spec(tool.name, tool.description, tool.parameters)
+
+    for name, description, schema in _declared_tool_specs_from_body(body):
+        action = _http_action_by_name(name)
+        if not action and not _mcp_parse_public_name(name):
+            continue
+        if action and (not schema.get("properties")) and isinstance(action.get("input_schema"), dict):
+            schema = action["input_schema"]
+        add_spec(name, description or str((action or {}).get("description") or ""), schema)
+    # Configured HTTP Actions are Gateway-owned capabilities even when the
+    # downstream client did not explicitly include a tools array.  This is the
+    # agent-planner path: service-side capabilities are discovered from Gateway
+    # config and executed before asking a chat-only upstream to synthesize.
+    for action in _enabled_http_actions():
+        name = str(action.get("name") or "").strip()
+        if not name or name in seen_names:
+            continue
+        schema = action.get("input_schema") if isinstance(action.get("input_schema"), dict) else {}
+        add_spec(name, str(action.get("description") or ""), schema)
+    for server in _enabled_mcp_servers():
+        server_name = str(server.get("name") or "").strip()
+        if not server_name:
+            continue
+        try:
+            for tool in _mcp_list_server_tools(server):
+                tool_name = str(tool.get("name") or "").strip()
+                if not tool_name:
+                    continue
+                public_name = _mcp_public_name(server_name, tool_name)
+                if public_name in seen_names:
+                    continue
+                schema = tool.get("inputSchema") if isinstance(tool.get("inputSchema"), dict) else {}
+                add_spec(public_name, str(tool.get("description") or f"MCP tool from {server_name}"), schema)
+        except Exception:
+            # MCP discovery is best-effort for planner preexecution.  The
+            # normal explicit MCP tool path still reports detailed failures.
+            continue
+    if not specs:
+        return []
+    scored: list[tuple[int, int, str, Json]] = []
+    for index, (name, description, schema) in enumerate(specs):
+        normalized_name = name.lower().replace("_", " ").replace("-", " ")
+        name_tokens = [tok for tok in re.split(r"[^a-z0-9\u4e00-\u9fff]+", normalized_name) if len(tok) >= 2]
+        desc_tokens = [tok for tok in re.split(r"[^a-z0-9\u4e00-\u9fff]+", description.lower()) if len(tok) >= 4]
+        score = 0
+        if name.lower() in lowered or normalized_name in lowered:
+            score += 4
+        if name.lower() in {"calculator", "calc", "gateway__calculator"} and arithmetic_requested:
+            score += 5
+        if name.lower() in {"current_time", "get_current_time", "gateway__get_current_time"} and time_requested:
+            score += 5
+        if name.lower() in {"websearch", "web_search", "web_search_preview"} and web_search_requested:
+            score += 5
+        score += sum(1 for tok in name_tokens if tok in lowered)
+        score += min(2, sum(1 for tok in desc_tokens if tok in lowered))
+        if len(specs) == 1 and score > 0:
+            score += 1
+        if score >= 2:
+            scored.append((score, index, name, schema))
+    if not scored:
+        return []
+    calls: list[ToolCall] = []
+    for _score, _index, name, schema in sorted(scored, key=lambda item: (-item[0], item[1])):
+        args = _infer_declared_tool_arguments(name, schema, user_text)
+        if args is None:
+            continue
+        calls.append(
+            ToolCall(
+                f"gateway_planner_{uuid.uuid4().hex}",
+                name,
+                args,
+                {"gateway_agent_planner": True, "gateway_owned_preexecute": True},
+            )
+        )
+    return calls
+
+
+def _gateway_owned_tool_call_from_user_text(body: Json, user_text: str) -> ToolCall | None:
+    calls = _gateway_owned_tool_calls_from_user_text(body, user_text)
+    return calls[0] if calls else None
+
+
+def _preexecute_gateway_owned_planner_tool(path: str, body: Json, client_id: str | None = None) -> Json:
+    """Execute obvious Gateway-owned planner tools and append their evidence.
+
+    This moves HTTP/MCP service tools into the outer planner path: chat-only
+    upstreams receive the tool result as context and only synthesize the final
+    answer.  User-machine tools remain downstream-owned and are not executed
+    here.
+    """
+    if _has_tool_result_in_messages(path, body):
+        return body
+    user_text = _last_user_text(path, body)
+    if not user_text:
+        return body
+    calls = [
+        call
+        for call in _gateway_owned_tool_calls_from_user_text(body, user_text)
+        if not _tool_call_requires_downstream_execution(call, body)
+    ]
+    if not calls:
+        return body
+    results: list[ToolResult] = []
+    for call in calls:
+        _record_agent_runtime_request_event(
+            path,
+            body,
+            event_type="gateway_tool_execute",
+            workflow="gateway_owned_tool",
+            step="preexecute_gateway_owned_tool",
+            summary=f"execute Gateway-owned tool {call.name}",
+            metadata={"call": _tool_call_event_payload(call), "client_id_present": bool(client_id)},
+        )
+        result = _execute_tool_call(call, client_id=client_id, provider="gateway_agent_planner")
+        results.append(result)
+        _record_agent_runtime_request_event(
+            path,
+            body,
+            event_type="gateway_tool_result",
+            workflow="gateway_owned_tool",
+            step="preexecute_gateway_owned_tool",
+            summary=f"Gateway-owned tool {call.name} {'succeeded' if result.success else 'failed'}",
+            metadata={
+                "call_id": call.call_id,
+                "tool": call.name,
+                "success": result.success,
+                "failure_type": result.failure_type,
+                "content_chars": len(result.content or ""),
+            },
+        )
+    synthetic = _build_tool_round_response(
+        path,
+        calls,
+        [],
+        {"model": str(body.get("model") or _config_env("UPSTREAM_MODEL", "")), "usage": {"input_tokens": 0, "output_tokens": 0}},
+    )
+    updated = _append_tool_results(path, body, synthetic, results)
+    # The selected Gateway-owned tool has already run.  Do not pass native tool
+    # schemas or text-adapter manuals to the chat-only upstream for this final
+    # synthesis turn.
+    updated.pop("tools", None)
+    updated.pop("tool_choice", None)
+    ctx = updated.setdefault("gateway_context", {})
+    if isinstance(ctx, dict):
+        ctx["agent_planner"] = {
+            "workflow": "gateway_owned_tool",
+            "step": "preexecute_gateway_owned_tool",
+            "tool": calls[0].name,
+            "tools": [call.name for call in calls],
+            "success": all(result.success for result in results),
+        }
+    return updated
 
 
 def _extract_value_after_marker_request(text: str) -> str:
@@ -1691,7 +3074,46 @@ def _direct_local_bash_response(path: str, body: Json) -> Json | None:
 
 def _direct_downstream_tool_request_response(path: str, body: Json) -> Json | None:
     """Surface obvious user-machine tool requests without touching Gateway FS/shell."""
-    if _gateway_executes_user_side_tools_locally() or _has_tool_result_in_messages(path, body):
+    if _gateway_executes_user_side_tools_locally():
+        return None
+    planner_decision = _agent_plan_downstream_tool_request(path, body)
+    if planner_decision is not None and planner_decision.calls:
+        response = _build_tool_round_response(
+            path,
+            planner_decision.calls,
+            [],
+            {"model": str(body.get("model") or _config_env("UPSTREAM_MODEL", "")), "usage": {"input_tokens": 0, "output_tokens": 0}},
+        )
+        ctx = response.setdefault("gateway_context", {})
+        if isinstance(ctx, dict):
+            state_snapshot = _agent_planner_state_snapshot(planner_decision.state)
+            ctx["agent_planner"] = {
+                "workflow": planner_decision.workflow,
+                "step": planner_decision.step,
+                "reason": planner_decision.reason,
+                "session_key": planner_decision.state.get("session_key"),
+                "intent": state_snapshot.get("intent") if isinstance(state_snapshot.get("intent"), dict) else {},
+                "evidence_count": planner_decision.state.get("evidence_count", 0),
+                "state": state_snapshot,
+            }
+        _record_agent_runtime_request_event(
+            path,
+            body,
+            event_type="tool_dispatch",
+            workflow="direct_downstream_tool_request",
+            step="surface_user_side_tools",
+            summary=f"surface {len(planner_decision.calls)} downstream user-machine tool request(s)",
+            metadata={
+                "calls": [_tool_call_event_payload(call) for call in planner_decision.calls],
+                "source": "agent_planner",
+                "owner": "downstream_client",
+                "dispatch": "downstream_client",
+                "planner_workflow": planner_decision.workflow,
+                "planner_step": planner_decision.step,
+            },
+        )
+        return response
+    if _has_tool_result_in_messages(path, body):
         return None
     user_text = _last_user_text(path, body)
     if not user_text:
@@ -1700,33 +3122,185 @@ def _direct_downstream_tool_request_response(path: str, body: Json) -> Json | No
     skill_action, skill_name = _extract_explicit_skill_request(user_text)
     if skill_action:
         arguments = {"name": skill_name} if skill_action == "read" else {}
-        calls.append(ToolCall(f"client_required_{uuid.uuid4().hex}", "Skill", arguments, {"gateway_downstream_tool_request": True}))
+        call = _declared_or_fallback_tool_call(
+            body,
+            f"client_required_{uuid.uuid4().hex}",
+            ("Skill", "skill"),
+            "Skill",
+            arguments,
+            {"gateway_downstream_tool_request": True},
+        )
+        if call is not None:
+            calls.append(call)
     command = "" if calls else _extract_explicit_shell_command_request(user_text)
     if command:
-        calls.append(ToolCall(f"client_required_{uuid.uuid4().hex}", "Bash", {"command": command}, {"gateway_downstream_tool_request": True}))
+        call = _shell_tool_call_for_downstream(body, command)
+        if call is not None:
+            calls.append(call)
     else:
         lowered = user_text.lower()
         paths = _extract_mentioned_paths(user_text)
         read_intent = any(token in lowered for token in ("read", "show", "cat", "open", "查看", "读取", "读", "打开"))
         list_intent = any(token in lowered for token in ("current directory", "list files", "list directory", "当前目录", "列出文件", "目录下", "ls "))
-        if read_intent and paths:
+        web_intent = _text_requests_web_search(user_text)
+        project_intent = _text_requests_project_inspection(user_text)
+        if (
+            project_intent
+            and not paths
+            and _declared_tool_name_for_candidates(body, ("Skill", "skill")) is not None
+            and _body_mentions_available_skill(body, "codebase-onboarding")
+        ):
+            call = _declared_or_fallback_tool_call(
+                body,
+                f"client_required_{uuid.uuid4().hex}",
+                ("Skill", "skill"),
+                "Skill",
+                {"name": "codebase-onboarding"},
+                {"gateway_downstream_tool_request": True, "intent": "project_onboarding_skill"},
+            )
+            if call is not None:
+                calls.append(call)
+        elif read_intent and paths:
             # Prefer the path closest to the explicit read request. Claude Code
             # prompts often include stale Worktree/System-reminder paths before
             # the actual user request; asking the client to read all extracted
             # paths could leak or touch the wrong project.
-            calls.append(ToolCall(f"client_required_{uuid.uuid4().hex}", "Read", {"path": paths[-1]}, {"gateway_downstream_tool_request": True}))
+            call = _declared_or_fallback_tool_call(
+                body,
+                f"client_required_{uuid.uuid4().hex}",
+                ("Read", "read", "open", "view_file"),
+                "Read",
+                {"path": paths[-1]},
+                {"gateway_downstream_tool_request": True},
+            )
+            if call is None:
+                call = _shell_tool_call_for_downstream(body, _read_shell_command(paths[-1]))
+            if call is not None:
+                calls.append(call)
         elif list_intent:
             target = paths[-1] if paths else "."
-            calls.append(ToolCall(f"client_required_{uuid.uuid4().hex}", "LS", {"path": target}, {"gateway_downstream_tool_request": True}))
+            call = _declared_or_fallback_tool_call(
+                body,
+                f"client_required_{uuid.uuid4().hex}",
+                ("LS", "ls", "list", "list_files", "list_directory"),
+                "LS",
+                {"path": target},
+                {"gateway_downstream_tool_request": True},
+            )
+            if call is None:
+                call = _shell_tool_call_for_downstream(body, f"ls -la {shlex.quote(target)}")
+            if call is not None:
+                calls.append(call)
+        elif web_intent:
+            search_name = _declared_tool_name_for_candidates(
+                body,
+                ("web_search", "WebSearch", "web_search_preview", "search", "google", "browser_search"),
+            )
+            if search_name is not None or not body.get("tools"):
+                search_name = search_name or "WebSearch"
+                calls.append(ToolCall(
+                    f"client_required_{uuid.uuid4().hex}",
+                    search_name,
+                    _adapt_arguments_for_declared_tool(body, search_name, {"query": _extract_web_search_query(user_text)}),
+                    {"gateway_downstream_tool_request": True},
+                ))
+        else:
+            declared = _declared_tool_name_map_from_body(body)
+            has_declared_workspace_tools = any(
+                key in declared
+                for key in ("LS", "ls", "Glob", "glob", "Read", "read", "Bash", "bash", "exec_command")
+            )
+            project_can_surface = (not body.get("tools")) or has_declared_workspace_tools
+        if not calls and project_intent and not paths and len(user_text) < 2000 and project_can_surface:
+            # A chat-only upstream cannot inspect local files.  Surface a small,
+            # safe, protocol-level first tool fanout to the downstream client
+            # (Codex/Claude Code) so it can provide real local evidence.
+            target = paths[-1] if paths else "."
+            ls_call = _declared_or_fallback_tool_call(
+                body,
+                f"client_required_{uuid.uuid4().hex}",
+                ("LS", "ls", "list", "list_files", "list_directory"),
+                "LS",
+                {"path": target},
+                {"gateway_downstream_tool_request": True, "intent": "project_inspection"},
+            )
+            glob_name = _declared_tool_name_for_candidates(body, ("Glob", "glob", "file_search", "find_files"))
+            if ls_call is not None:
+                calls.append(ls_call)
+            if glob_name is not None or not body.get("tools"):
+                glob_name = glob_name or "Glob"
+                calls.append(ToolCall(
+                    f"client_required_{uuid.uuid4().hex}",
+                    glob_name,
+                    _adapt_arguments_for_declared_tool(body, glob_name, {"pattern": "**/*.py", "path": target}),
+                    {"gateway_downstream_tool_request": True, "intent": "project_inspection"},
+                ))
+                calls.append(ToolCall(
+                    f"client_required_{uuid.uuid4().hex}",
+                    glob_name,
+                    _adapt_arguments_for_declared_tool(body, glob_name, {"pattern": "**/*.md", "path": target}),
+                    {"gateway_downstream_tool_request": True, "intent": "project_inspection"},
+                ))
+            if not calls:
+                call = _shell_tool_call_for_downstream(
+                    body,
+                    _project_inspection_shell_command(target),
+                    {"gateway_downstream_tool_request": True, "intent": "project_inspection", "fallback_shell_tool": True},
+                )
+                if call is not None:
+                    calls.append(call)
+        elif not calls:
+            declared_call = _declared_function_tool_call_from_user_text(body, user_text)
+            if declared_call is not None:
+                calls.append(declared_call)
     if not calls:
         return None
-    normalized_calls = [_normalize_tool_call(call) for call in calls]
-    return _build_tool_round_response(
+    _record_agent_runtime_request_event(
         path,
-        normalized_calls,
+        body,
+        event_type="tool_dispatch",
+        workflow="direct_downstream_tool_request",
+        step="surface_user_side_tools",
+        summary=f"surface {len(calls)} downstream user-machine tool request(s)",
+        metadata={
+            "calls": [_tool_call_event_payload(call) for call in calls],
+            "source": "fallback_intent",
+            "owner": "downstream_client",
+            "dispatch": "downstream_client",
+        },
+    )
+    response = _build_tool_round_response(
+        path,
+        calls,
         [],
         {"model": str(body.get("model") or _config_env("UPSTREAM_MODEL", "")), "usage": {"input_tokens": 0, "output_tokens": 0}},
     )
+    ctx = response.setdefault("gateway_context", {})
+    if isinstance(ctx, dict):
+        declared_function = any(
+            isinstance(call.raw, dict) and call.raw.get("declared_function_planner")
+            for call in calls
+        )
+        workflow = "project_analysis" if _text_requests_project_inspection(user_text) else "direct_downstream_tool_request"
+        step = "custom_function" if declared_function else ("project_structure" if workflow == "project_analysis" else "surface_user_side_tools")
+        ctx.setdefault("agent_planner", {
+            "workflow": workflow,
+            "step": step,
+            "reason": "fallback downstream fanout from planner-classified user intent",
+            "session_key": _agent_planner_session_key(path, body),
+            "intent": {
+                "kind": "project_analysis" if workflow == "project_analysis" else "tool_request",
+                "workflow": workflow,
+                "source": "current_user_text",
+            },
+            "evidence_count": 0,
+            "state": {
+                "workflow": workflow,
+                "current_step": step,
+                "session_key": _agent_planner_session_key(path, body),
+            },
+        })
+    return response
 
 
 def _weak_upstream_text_tools_active(gateway_mode: str) -> bool:
@@ -1747,23 +3321,163 @@ def _weak_upstream_text_tools_active(gateway_mode: str) -> bool:
 USER_SIDE_TOOL_RISKS = {"read_local", "write_local", "execute_code", "gui", "ai_agent"}
 
 
+def planner_capability_catalog(*, include_mcp_tools: bool = False) -> Json:
+    """Return a bounded Agent Planner capability registry snapshot.
+
+    This is an observability surface, not an execution path.  It makes the
+    runtime's ownership model explicit for remote operators: service-owned
+    capabilities may run inside the Gateway, while user-machine capabilities
+    must be surfaced to the downstream client workspace.
+    """
+
+    def _schema_summary(schema: Json) -> Json:
+        props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+        required = schema.get("required") if isinstance(schema.get("required"), list) else []
+        return {
+            "properties": sorted(str(name) for name in props.keys())[:50],
+            "required": [str(name) for name in required][:50],
+        }
+
+    def _tool_entry(name: str, description: str, schema: Json, *, owner: str, source: str, risk: str = "") -> Json:
+        return {
+            "name": name,
+            "owner": owner,
+            "source": source,
+            "risk": risk,
+            "description": (description or "")[:300],
+            "schema": _schema_summary(schema if isinstance(schema, dict) else {}),
+        }
+
+    service_side: list[Json] = []
+    downstream_owned: list[Json] = []
+    seen_service: set[str] = set()
+    seen_downstream: set[str] = set()
+
+    for tool in BUILTIN_TOOLS.values():
+        if tool.risk in USER_SIDE_TOOL_RISKS:
+            if tool.name not in seen_downstream:
+                downstream_owned.append(
+                    _tool_entry(
+                        tool.name,
+                        tool.description,
+                        tool.parameters,
+                        owner="downstream_client",
+                        source="builtin",
+                        risk=tool.risk,
+                    )
+                )
+                seen_downstream.add(tool.name)
+        else:
+            if tool.name not in seen_service:
+                service_side.append(
+                    _tool_entry(
+                        tool.name,
+                        tool.description,
+                        tool.parameters,
+                        owner="gateway_service",
+                        source="builtin",
+                        risk=tool.risk,
+                    )
+                )
+                seen_service.add(tool.name)
+
+    http_actions: list[Json] = []
+    for action in _enabled_http_actions():
+        name = str(action.get("name") or "").strip()
+        if not name:
+            continue
+        schema = action.get("input_schema") if isinstance(action.get("input_schema"), dict) else {}
+        entry = _tool_entry(
+            name,
+            str(action.get("description") or ""),
+            schema,
+            owner="gateway_service",
+            source="http_action",
+            risk="network",
+        )
+        entry["method"] = str(action.get("method") or "GET").upper()
+        http_actions.append(entry)
+        if name not in seen_service:
+            service_side.append(entry)
+            seen_service.add(name)
+
+    mcp_servers: list[Json] = []
+    for server in _enabled_mcp_servers():
+        server_name = str(server.get("name") or "").strip()
+        if not server_name:
+            continue
+        server_entry: Json = {"name": server_name, "owner": "gateway_service", "source": "mcp_server"}
+        if include_mcp_tools:
+            tools: list[Json] = []
+            try:
+                for tool in _mcp_list_server_tools(server):
+                    tool_name = str(tool.get("name") or "").strip()
+                    if not tool_name:
+                        continue
+                    public_name = _mcp_public_name(server_name, tool_name)
+                    schema = tool.get("inputSchema") if isinstance(tool.get("inputSchema"), dict) else {}
+                    entry = _tool_entry(
+                        public_name,
+                        str(tool.get("description") or f"MCP tool from {server_name}"),
+                        schema,
+                        owner="gateway_service",
+                        source="mcp_tool",
+                        risk="connector",
+                    )
+                    entry["server"] = server_name
+                    entry["tool"] = tool_name
+                    tools.append(entry)
+                    if public_name not in seen_service:
+                        service_side.append(entry)
+                        seen_service.add(public_name)
+                server_entry["tools"] = tools
+                server_entry["tool_count"] = len(tools)
+            except Exception as exc:
+                server_entry["error"] = str(exc)[:300]
+                server_entry["tool_count"] = 0
+        mcp_servers.append(server_entry)
+
+    workflows = _agent_planner_workflow_catalog()
+    intents = _agent_planner_intent_catalog()
+    return {
+        "mode": "remote_agent_planner",
+        "chat_only_upstream_role": "synthesis_only",
+        "ownership_model": {
+            "gateway_service": "service-owned pure/network/connectors may run before upstream synthesis",
+            "downstream_client": "filesystem, shell, GUI, local agent, and caller-private tools run in the client workspace",
+            "chat_only_upstream": "language synthesis only; no tool authority",
+        },
+        "workflows": workflows,
+        "intents": intents,
+        "service_side": service_side,
+        "downstream_owned": downstream_owned,
+        "http_actions": http_actions,
+        "mcp_servers": mcp_servers,
+        "counts": {
+            "workflows": len(workflows),
+            "intents": len(intents),
+            "service_side": len(service_side),
+            "downstream_owned": len(downstream_owned),
+            "http_actions": len(http_actions),
+            "mcp_servers": len(mcp_servers),
+        },
+    }
+
+
 def _gateway_executes_user_side_tools_locally() -> bool:
-    """Return True only for explicit legacy/local-proxy execution mode.
+    """Return True only for explicit local-proxy execution mode.
 
     The production default for Codex/Claude Code clients is that tools touching
     the user's filesystem, shell, GUI, or local agent runtime execute on the
     downstream client.  Gateway-side execution is kept only as an explicit
-    compatibility/local-proxy opt-in.
+    local-proxy opt-in; delegation preferences must not grant the cloud service
+    authority over the user's workspace.
     """
     gateway = _gateway_config()
     env_value = os.environ.get("GATEWAY_EXECUTE_USER_SIDE_TOOLS")
     if env_value is not None:
         return env_value.strip().lower() in {"1", "true", "yes", "on"}
     if gateway.get("execute_user_side_tools_in_gateway") is True:
-        return True
-    # Backward-compatible escape hatch for old tests/deployments that
-    # intentionally opted out of downstream delegation.
-    if gateway.get("delegate_tools_to_downstream") is False:
         return True
     return False
 
@@ -1796,8 +3510,9 @@ def _tool_call_requires_downstream_execution(call: ToolCall, body: Json | None =
         return False
     normalized = _normalize_tool_call(call)
     tool = BUILTIN_TOOLS.get(normalized.name)
+    canonical_name = tool.name if tool is not None else normalized.name
 
-    if normalized.name == "multi_tool_use.parallel":
+    if canonical_name == "multi_tool_use.parallel":
         tool_uses = normalized.arguments.get("tool_uses")
         if isinstance(tool_uses, list):
             for item in tool_uses:
@@ -1813,7 +3528,18 @@ def _tool_call_requires_downstream_execution(call: ToolCall, body: Json | None =
                 ):
                     return True
 
+    if body is not None and _declared_tool_shadows_gateway_builtin(body, normalized.name):
+        return True
+
     if tool is not None:
+        if canonical_name == "JsonQuery":
+            # JsonQuery(data=...) is a pure service helper.  JsonQuery(file_path=...)
+            # reads the downstream workspace and must not run on the cloud Gateway
+            # service unless explicit local-proxy execution is enabled.
+            args = normalized.arguments if isinstance(normalized.arguments, dict) else {}
+            reads_workspace_file = args.get("data") is None and bool(args.get("file_path") or args.get("path"))
+            if reads_workspace_file:
+                return True
         return tool.risk in USER_SIDE_TOOL_RISKS
 
     # Gateway-owned extension points.
@@ -2005,13 +3731,29 @@ def _execute_tool_call(call: ToolCall, provider: str | None = None, client_id: s
         max_retries = max(0, max_retries)
     provider = provider or "unknown"
 
-    # Check tool result cache for cacheable read-only tools
+    # Check tool result cache for cacheable read-only tools.  Cache keys must
+    # include both the resolved client workspace and request runtime scope: the
+    # same arguments such as {"file_path": "README.md"} or {"url": ...}
+    # are different operations for different remote tenants/sessions/workspaces.
     _tool_cache = None
+    _tool_cache_arguments = call.arguments
     try:
         from .gateway_cache import get_tool_result_cache
         _tool_cache = get_tool_result_cache()
         if tool and _tool_cache.is_cacheable(call.name):
-            cached = _tool_cache.get(call.name, call.arguments)
+            try:
+                workspace_cache_key = str(_workspace_root())
+            except Exception:
+                workspace_cache_key = "workspace:unavailable"
+            try:
+                from . import gateway_builtin_tools as _bt
+                runtime_cache_key = _bt._runtime_scope_key()
+            except Exception:
+                runtime_cache_key = "runtime:unavailable"
+            _tool_cache_arguments = dict(call.arguments)
+            _tool_cache_arguments["__gateway_workspace_cache_key"] = workspace_cache_key
+            _tool_cache_arguments["__gateway_runtime_cache_key"] = runtime_cache_key
+            cached = _tool_cache.get(call.name, _tool_cache_arguments)
             if cached is not None:
                 return ToolResult(call_id=call.call_id, name=call.name, content=cached, success=True)
     except Exception:
@@ -2072,7 +3814,7 @@ def _execute_tool_call(call: ToolCall, provider: str | None = None, client_id: s
             # Store in tool result cache for cacheable tools
             try:
                 if _tool_cache and _tool_cache.is_cacheable(call.name):
-                    _tool_cache.put(call.name, call.arguments, content)
+                    _tool_cache.put(call.name, _tool_cache_arguments, content)
             except Exception:
                 pass
             return ToolResult(call_id=call.call_id, name=call.name, content=content, success=True)
@@ -2116,6 +3858,7 @@ def _execute_tool_call(call: ToolCall, provider: str | None = None, client_id: s
 
 
 def _direct_tool_result_payload(result: ToolResult) -> Json:
+    protocol_content = _encode_tool_result_content(result.content, not result.success)
     payload: Json = {
         "id": result.call_id,
         "object": "gateway.tool_result",
@@ -2127,12 +3870,12 @@ def _direct_tool_result_payload(result: ToolResult) -> Json:
         "openai_chat": {
             "role": "tool",
             "tool_call_id": result.call_id,
-            "content": result.content,
+            "content": protocol_content,
         },
         "openai_responses": {
             "type": "function_call_output",
             "call_id": result.call_id,
-            "output": result.content,
+            "output": protocol_content,
         },
         "anthropic": {
             "type": "tool_result",
@@ -2144,10 +3887,80 @@ def _direct_tool_result_payload(result: ToolResult) -> Json:
     return payload
 
 
-def execute_direct_tool_call(body: Json) -> Json:
-    with _workspace_scope(_request_workspace_root(body)):
-        calls = _direct_tool_calls_from_body(body)
-        results = [_execute_tool_call(call, provider="direct") for call in calls]
+def execute_direct_tool_call(body: Json, *, path: str = "/tools/call", client_id: str | None = None) -> Json:
+    scope_body = _request_scope_body(body, client_id)
+    with _workspace_scope(_request_workspace_root(scope_body), scope_body):
+        try:
+            calls = _direct_tool_calls_from_body(body)
+        except ToolExecutionError as exc:
+            _record_agent_runtime_request_event(
+                path,
+                scope_body,
+                event_type="direct_tool_error",
+                workflow="direct_tool",
+                step="invalid_input",
+                summary=str(exc)[:500],
+                metadata={
+                    "owner": "gateway_service",
+                    "source": "direct_tool_endpoint",
+                    "success": False,
+                    "failure_type": exc.failure_type,
+                },
+            )
+            raise BadRequestError(str(exc), detail={"failure_type": exc.failure_type}) from exc
+        if _calls_require_downstream_execution(calls, body):
+            tool_names = [call.name for call in calls]
+            failure_type = "direct_user_side_tool_requires_downstream_client"
+            _record_agent_runtime_request_event(
+                path,
+                scope_body,
+                event_type="direct_tool_error",
+                workflow="direct_tool",
+                step="downstream_required",
+                summary=", ".join(tool_names)[:500],
+                metadata={
+                    "owner": "downstream_client",
+                    "source": "direct_tool_endpoint",
+                    "success": False,
+                    "failure_type": failure_type,
+                    "tool_names": tool_names,
+                },
+            )
+            raise BadRequestError(
+                "direct user-side tool execution is disabled in Gateway cloud mode; "
+                "run this tool in the downstream client workspace",
+                detail={"failure_type": failure_type, "tool_names": tool_names},
+            )
+        _record_agent_runtime_request_event(
+            path,
+            scope_body,
+            event_type="direct_tool_execute",
+            workflow="direct_tool",
+            step="execute",
+            summary=", ".join(call.name for call in calls)[:500],
+            metadata={
+                "owner": "gateway_service",
+                "source": "direct_tool_endpoint",
+                "tool_count": len(calls),
+                "tool_names": [call.name for call in calls],
+            },
+        )
+        results = [_execute_tool_call(call, provider="direct", client_id=client_id) for call in calls]
+        _record_agent_runtime_request_event(
+            path,
+            scope_body,
+            event_type="direct_tool_result",
+            workflow="direct_tool",
+            step="result",
+            summary=", ".join(f"{result.name}:{'ok' if result.success else result.failure_type or 'failed'}" for result in results)[:500],
+            metadata={
+                "owner": "gateway_service",
+                "source": "direct_tool_endpoint",
+                "tool_count": len(results),
+                "success": all(result.success for result in results),
+                "tool_names": [result.name for result in results],
+            },
+        )
     payloads = [_direct_tool_result_payload(result) for result in results]
     if len(payloads) == 1:
         return payloads[0]
@@ -2177,8 +3990,80 @@ def _looks_like_context_rejection(text: str) -> bool:
     )
     return any(needle in lowered for needle in needles)
 
-def token_count_response(body: Json) -> Json:
-    return {"input_tokens": _body_token_estimate(body)}
+def token_count_response(body: Json, *, path: str = "/v1/messages/count_tokens", client_id: str | None = None) -> Json:
+    scope_body = _request_scope_body(body, client_id)
+    with _workspace_scope(_request_workspace_root(scope_body), scope_body):
+        _record_agent_runtime_request_event(
+            path,
+            scope_body,
+            event_type="token_count_execute",
+            workflow="token_count",
+            step="estimate",
+            summary="estimate request input tokens",
+            metadata={
+                "owner": "gateway_service",
+                "source": "token_count_endpoint",
+            },
+        )
+        response = {"input_tokens": _body_token_estimate(body)}
+        _record_agent_runtime_request_event(
+            path,
+            scope_body,
+            event_type="token_count_result",
+            workflow="token_count",
+            step="result",
+            summary=f"input_tokens={response['input_tokens']}",
+            metadata={
+                "owner": "gateway_service",
+                "source": "token_count_endpoint",
+                "success": True,
+                "input_tokens": response["input_tokens"],
+            },
+        )
+        return response
+
+
+def record_gateway_public_endpoint(
+    path: str,
+    body: Json,
+    *,
+    resource: str,
+    action: str,
+    response: Json | None = None,
+    success: bool = True,
+    failure_type: str | None = None,
+    client_id: str | None = None,
+) -> None:
+    """Record a Gateway-owned public API boundary in runtime audit scope."""
+    scope_body = _request_scope_body(body, client_id)
+    with _workspace_scope(_request_workspace_root(scope_body), scope_body):
+        response = response if isinstance(response, dict) else {}
+        metadata: Json = {
+            "owner": "gateway_service",
+            "source": f"{resource}_endpoint",
+            "resource": resource,
+            "action": action,
+            "success": bool(success),
+        }
+        if failure_type:
+            metadata["failure_type"] = failure_type
+        object_value = response.get("object")
+        if object_value is not None:
+            metadata["object"] = object_value
+        response_id = response.get("id")
+        if response_id is not None:
+            metadata["id"] = response_id
+        if resource == "models" and isinstance(response.get("data"), list):
+            metadata["model_count"] = len(response.get("data") or [])
+        _record_agent_runtime_request_event(
+            path,
+            scope_body,
+            event_type=f"{resource}_{'result' if success else 'error'}",
+            workflow=f"gateway_{resource}",
+            step=action,
+            summary=f"{resource}:{action}:{'ok' if success else failure_type or 'failed'}",
+            metadata=metadata,
+        )
 
 
 
@@ -2297,13 +4182,34 @@ def _collect_local_planner_tool_rounds(path: str, body: Json) -> tuple[list[Tool
     results: list[ToolResult] = []
 
     def add_user_side_call(name: str, arguments: dict) -> None:
-        call = ToolCall(
+        candidate_map = {
+            "Read": ("Read", "read", "open", "view_file"),
+            "LS": ("LS", "ls", "list", "list_files", "list_directory"),
+            "Glob": ("Glob", "glob", "file_search", "find_files"),
+            "Tree": ("Tree", "tree"),
+            "Bash": ("Bash", "bash", "shell", "exec_command"),
+        }
+        call = _declared_or_fallback_tool_call(
+            body,
             f"client_required_{uuid.uuid4().hex}",
+            candidate_map.get(name, (name, name.lower())),
             name,
-            arguments,
+            dict(arguments),
             {"gateway_downstream_tool_request": True},
         )
-        calls.append(_normalize_tool_call(call))
+        if call is None:
+            if name == "Read":
+                target = str(arguments.get("path") or arguments.get("file_path") or ".")
+                call = _shell_tool_call_for_downstream(body, _read_shell_command(target))
+            elif name in {"LS", "Glob", "Tree"}:
+                target = str(arguments.get("path") or ".")
+                call = _shell_tool_call_for_downstream(
+                    body,
+                    _project_inspection_shell_command(target),
+                    {"gateway_downstream_tool_request": True, "fallback_shell_tool": True},
+                )
+        if call is not None:
+            calls.append(call)
 
     if not _gateway_executes_user_side_tools_locally():
         paths = _extract_mentioned_paths(user_text)
@@ -2313,6 +4219,10 @@ def _collect_local_planner_tool_rounds(path: str, body: Json) -> tuple[list[Tool
         if not paths:
             if any(token in lowered for token in ("current directory", "当前目录", "list files", "列出文件", "目录")):
                 add_user_side_call("LS", {"path": "."})
+            elif _text_requests_project_inspection(user_text):
+                add_user_side_call("LS", {"path": "."})
+                add_user_side_call("Glob", {"path": ".", "pattern": "**/*.py"})
+                add_user_side_call("Glob", {"path": ".", "pattern": "**/*.md"})
             return calls, results
         for raw_path in paths[: max(1, min(int(_gateway_config().get("local_planner_max_files") or 24), 12))]:
             cleaned = raw_path.rstrip("/") or "."
@@ -2483,7 +4393,8 @@ def _forced_gateway_tool_round(path: str, body: Json) -> tuple[ToolCall | None, 
 
 def run_tool_orchestration(path: str, body: Json, client: NativeProxyClient | None = None, client_id: str | None = None) -> Json:
     _logger.debug("run_tool_orchestration called for path: %s", path)
-    workspace_root = _request_workspace_root(body)
+    scope_body = _request_scope_body(body, client_id)
+    workspace_root = _request_workspace_root(scope_body)
     _logger.debug("Workspace root resolved to: %s", workspace_root)
 
     # Check if tools are present in body
@@ -2492,7 +4403,7 @@ def run_tool_orchestration(path: str, body: Json, client: NativeProxyClient | No
     if len(tools_in_body) > 0:
         _logger.debug("First 3 tools: %s", [t.get('name', t.get('function', {}).get('name', 'unknown')) for t in tools_in_body[:3]])
 
-    with _workspace_scope(workspace_root):
+    with _workspace_scope(workspace_root, scope_body):
         return _run_tool_orchestration_scoped(path, body, client, client_id)
 
 
@@ -2530,6 +4441,42 @@ def _convert_response_to_path(target_path: str, response: Json) -> Json:
         if _is_openai_responses_response(response):
             return _from_openai_chat_response(target_path, _from_responses_response_to_openai(response))
     return response
+
+
+def _attach_request_gateway_context(response: Json, request_body: Json) -> Json:
+    """Carry planner/runtime metadata from the synthesized request to response.
+
+    The outer planner can preexecute service-side tools before the chat-only
+    upstream is called.  Without this propagation the final user-facing
+    response looks like a plain upstream answer, hiding which planner workflow
+    ran and making the Agent runtime hard to observe/debug.
+    """
+    source_ctx = request_body.get("gateway_context")
+    if not isinstance(source_ctx, dict) or not source_ctx:
+        return response
+    interesting = {
+        key: copy.deepcopy(value)
+        for key, value in source_ctx.items()
+        if key in {
+            "agent_planner",
+            "local_planner",
+            "planner_evidence_chars",
+            "compacted",
+            "strategy",
+            "chat_only_synthesis",
+            "upstream_tools_stripped",
+            "agent_planner_strict_every_turn",
+            "planner_has_evidence",
+        }
+    }
+    if not interesting:
+        return response
+    updated = dict(response)
+    target_ctx = updated.get("gateway_context") if isinstance(updated.get("gateway_context"), dict) else {}
+    merged = dict(target_ctx)
+    merged.update(interesting)
+    updated["gateway_context"] = merged
+    return updated
 
 
 def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyClient | None = None, client_id: str | None = None) -> Json:
@@ -2583,7 +4530,27 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
     if forced_response is not None:
         _remember_conversation_turn(path, body, forced_response)
         return forced_response
-    request_body = _merge_builtin_tools(path, _apply_local_planner_context(path, _maybe_compact_request_for_upstream(path, memory_body, context_cfg)))
+    if _weak_upstream_text_tools_active(mode):
+        memory_body = _preexecute_gateway_owned_planner_tool(path, memory_body, client_id=client_id)
+    # Agent Planner evidence must survive upstream context limits.  First record
+    # the full, un-compacted tool evidence into planner state; then compact the
+    # request for the weak upstream; finally inject the compact planner summary
+    # back into the post-compaction body.
+    _agent_prepare_upstream_body(path, memory_body)
+    compacted_body = _maybe_compact_request_for_upstream(path, memory_body, context_cfg)
+    request_body = _agent_prepare_upstream_body(path, _apply_local_planner_context(path, compacted_body))
+    if _weak_upstream_text_tools_active(mode) and _should_use_chat_only_synthesis_boundary(request_body):
+        pre_synthesis_body = request_body
+        request_body = _chat_only_synthesis_body(request_body)
+        _record_chat_only_synthesis_boundary_event(
+            path,
+            pre_synthesis_body,
+            request_body,
+            source="non_streaming",
+            scope_body=body,
+        )
+    else:
+        request_body = _merge_builtin_tools(path, request_body)
 
     # --- Intelligence Enhancement ---
     # Analyze the user question and enhance the system prompt with insights.
@@ -2610,6 +4577,10 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
             _logger.debug("Intelligence: %s", get_intelligence_summary(intel_result))
     except Exception as exc:
         _logger.debug("Intelligence enhancement skipped: %s", exc)
+
+    # Keep Gateway planner/runtime metadata for response attachment and local
+    # synthesis guards, but do not forward that internal envelope upstream.
+    response_context_body = request_body
 
     # Convert merged request to upstream format
     upstream_path, request_body = _convert_request_to_upstream(path, request_body, upstream_protocol)
@@ -2640,6 +4611,18 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
             if forced_fanout is not None:
                 _remember_conversation_turn(path, body, forced_fanout)
                 return forced_fanout
+        if _chat_only_synthesis_active(response_context_body):
+            _record_ignored_upstream_tool_attempt(
+                path,
+                response_context_body,
+                downstream_response,
+                source="non_streaming",
+                scope_body=body,
+            )
+            downstream_response = _agent_apply_synthesis_refusal_fallback(path, response_context_body, downstream_response)
+            downstream_response = _attach_request_gateway_context(downstream_response, response_context_body)
+            _remember_conversation_turn(path, body, downstream_response)
+            return downstream_response
         if forced_call is None:
             _verify_native_if_forced(path, request_body, downstream_response)
         calls = _extract_tool_calls(path, downstream_response)
@@ -2647,6 +4630,8 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
         if not calls:
             calls = _extract_text_tool_calls(path, downstream_response)
             text_fallback = bool(calls)
+            if text_fallback:
+                calls = _adapt_text_calls_for_declared_downstream_tools(memory_body, calls)
         # Intent detection fallback for weak models that can't generate tool calls
         if not calls:
             calls = _detect_intent_tool_calls(path, downstream_response, body)
@@ -2660,18 +4645,23 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
                 else:
                     request_body = _append_tool_results(upstream_path, request_body, upstream_response, results)
                 continue
-            # If the weak upstream did not emit tool calls, synthesize the
-            # protocol-level user-side tool request (default) or surface the
+            # If the first weak-upstream reply did not emit tool calls, synthesize
+            # a protocol-level user-side tool request (default) or surface the
             # explicit legacy local-planner results (opt-in local execution).
-            planner_source_body = request_body if _gateway_executes_user_side_tools_locally() else memory_body
-            planner_calls, planner_results = _collect_local_planner_tool_rounds(path, planner_source_body)
-            if planner_calls:
-                synthetic_calls, synthetic_results = _collect_synthetic_upstream_calls(path, downstream_response)
-                all_calls = planner_calls + synthetic_calls
-                all_results = planner_results + synthetic_results
-                response = _build_tool_round_response(path, all_calls, all_results, downstream_response)
-                _remember_conversation_turn(path, body, response)
-                return response
+            # Do not re-run the planner after we already executed adapter/native
+            # tools and the upstream has produced a final text answer; doing so
+            # turns a completed answer back into another tool round.
+            if _round == 0 and _text_says_tool_work_is_needed(response_text):
+                planner_source_body = request_body if _gateway_executes_user_side_tools_locally() else memory_body
+                planner_calls, planner_results = _collect_local_planner_tool_rounds(path, planner_source_body)
+                if planner_calls:
+                    synthetic_calls, synthetic_results = _collect_synthetic_upstream_calls(path, downstream_response)
+                    all_calls = planner_calls + synthetic_calls
+                    all_results = planner_results + synthetic_results
+                    response = _build_tool_round_response(path, all_calls, all_results, downstream_response)
+                    _remember_conversation_turn(path, body, response)
+                    return response
+            downstream_response = _attach_request_gateway_context(downstream_response, response_context_body)
             _remember_conversation_turn(path, body, downstream_response)
             return downstream_response
 
@@ -2692,9 +4682,11 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
         # When delegate_tools_to_downstream=true, all remaining text tool calls
         # are converted to native protocol format and returned to the downstream
         # client (Claude Code / Codex) for execution.
-        # When false, the gateway executes tools locally (legacy behavior).
-        # Auto-detect: delegate when downstream is Claude Code/Codex (path-based)
-        # and upstream doesn't support native tools. Config can override.
+        # delegate_tools_to_downstream only controls whether otherwise
+        # Gateway-executable calls are surfaced to the downstream client. It is
+        # not authorization to execute user-machine tools in the cloud service:
+        # those were already returned above unless explicit local-proxy mode is
+        # enabled with execute_user_side_tools_in_gateway/GATEWAY_EXECUTE_USER_SIDE_TOOLS.
         cfg_delegate = _gateway_config().get("delegate_tools_to_downstream")
         if cfg_delegate is None:
             # Default: gateway-owned tools execute in Gateway; user-machine
@@ -2713,7 +4705,8 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
             _remember_conversation_turn(path, body, native_response)
             return native_response
 
-        # Execute tools locally (either native calls or delegated=false)
+        # Execute Gateway-owned/service-safe tools locally. User-machine tools
+        # reach this point only in explicit local-proxy compatibility mode.
         results = [_execute_tool_call(call, client_id=client_id) for call in calls]
         if text_fallback:
             request_body = _append_text_tool_results(upstream_path, request_body, upstream_response, calls, results)
@@ -2837,7 +4830,9 @@ def _native_tool_signal(path: str, response: Json) -> bool:
             message = choice.get("message") or {}
             if message.get("tool_calls"):
                 return True
-            if choice.get("finish_reason") == "tool_calls":
+            if message.get("function_call"):
+                return True
+            if choice.get("finish_reason") in {"tool_calls", "function_call"}:
                 return True
         return False
     elif path.startswith("/v1/responses"):

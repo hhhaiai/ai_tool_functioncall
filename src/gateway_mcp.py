@@ -15,6 +15,8 @@ import threading
 import time
 from typing import Any, Callable
 
+from .gateway_errors import ToolExecutionError
+
 Json = dict[str, Any]
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
@@ -23,12 +25,6 @@ MCP_SESSIONS: dict[str, "McpSession"] = {}
 MCP_SESSIONS_LOCK = threading.Lock()
 MCP_TOOL_CATALOG_CACHE: dict[str, tuple[float, list[Json]]] = {}
 MCP_SERVER_STATUS: dict[str, Json] = {}
-
-
-class ToolExecutionError(Exception):
-    def __init__(self, message: str, *, failure_type: str = "execution_failed") -> None:
-        super().__init__(message)
-        self.failure_type = failure_type
 
 
 class McpSession:
@@ -148,6 +144,136 @@ def _mcp_command(server: Json) -> list[str]:
     elif isinstance(args, list):
         parts.extend(str(arg) for arg in args)
     return parts
+
+
+_MCP_SERVICE_FILE_ARGUMENT_KEYS = {
+    "cwd",
+    "dbpath",
+    "destination",
+    "dir",
+    "directory",
+    "dst",
+    "file",
+    "filepath",
+    "folder",
+    "inputpath",
+    "outputpath",
+    "path",
+    "repo",
+    "repopath",
+    "repository",
+    "resourceuri",
+    "root",
+    "source",
+    "src",
+    "target",
+    "uri",
+    "workdir",
+    "workingdir",
+}
+
+
+def _mcp_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _mcp_tool_config(server: Json, tool_name: str | None) -> Json:
+    if not tool_name:
+        return {}
+    tools = server.get("tools")
+    if isinstance(tools, dict):
+        item = tools.get(tool_name) or tools.get(_mcp_safe_component(tool_name, default="tool"))
+        if isinstance(item, dict):
+            return item
+    if isinstance(tools, list):
+        for item in tools:
+            if isinstance(item, dict) and item.get("name") == tool_name:
+                return item
+    return {}
+
+
+def _mcp_allows_service_file_arguments(server: Json, tool_name: str | None = None) -> bool:
+    tool_cfg = _mcp_tool_config(server, tool_name)
+    for cfg in (tool_cfg, server):
+        if _mcp_bool(cfg.get("allow_service_file_arguments")):
+            return True
+        if _mcp_bool(cfg.get("allow_service_files")):
+            return True
+        if _mcp_bool(cfg.get("allow_file_arguments")):
+            return True
+    allowed_tools = server.get("service_file_argument_tools") or server.get("allow_service_file_tools")
+    if isinstance(allowed_tools, list) and tool_name in {str(item) for item in allowed_tools}:
+        return True
+    return False
+
+
+def _mcp_argument_key_is_file_target(key: str) -> bool:
+    cleaned = re.sub(r"[^a-z0-9]+", "", key.lower())
+    return cleaned in _MCP_SERVICE_FILE_ARGUMENT_KEYS
+
+
+def _mcp_value_looks_like_service_file_target(value: str) -> bool:
+    text = value.strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if lowered.startswith("file://"):
+        return True
+    if lowered.startswith(("http://", "https://", "mailto:", "urn:")):
+        return False
+    if text in {".", ".."}:
+        return True
+    if text.startswith(("/", "\\", "~/", "~\\", "../", "..\\", "./", ".\\")):
+        return True
+    if re.match(r"^[a-zA-Z]:[\\/]", text):
+        return True
+    if "/" in text or "\\" in text:
+        return True
+    if re.search(r"\.[A-Za-z0-9]{1,12}$", text) and not re.search(r"\s", text):
+        return True
+    return False
+
+
+def _mcp_find_service_file_argument(value: Any, *, key: str | None = None, inherited_file_key: bool = False) -> str | None:
+    is_file_key = inherited_file_key or (key is not None and _mcp_argument_key_is_file_target(key))
+    if isinstance(value, str):
+        if is_file_key and _mcp_value_looks_like_service_file_target(value):
+            return key or "argument"
+        if value.strip().lower().startswith("file://"):
+            return key or "argument"
+        return None
+    if isinstance(value, dict):
+        for child_key, child_value in value.items():
+            hit = _mcp_find_service_file_argument(
+                child_value,
+                key=str(child_key),
+                inherited_file_key=is_file_key,
+            )
+            if hit:
+                return hit
+    elif isinstance(value, list):
+        for item in value:
+            hit = _mcp_find_service_file_argument(item, key=key, inherited_file_key=is_file_key)
+            if hit:
+                return hit
+    return None
+
+
+def _mcp_validate_service_file_arguments(server: Json, arguments: Json, *, tool_name: str | None = None) -> None:
+    if _mcp_allows_service_file_arguments(server, tool_name):
+        return
+    hit = _mcp_find_service_file_argument(arguments)
+    if hit:
+        raise ToolExecutionError(
+            f"MCP argument '{hit}' looks like a Gateway service filesystem target; "
+            "pass user workspace paths to downstream client tools, or set "
+            "allow_service_file_arguments=true on the MCP server/tool for an admin-approved service endpoint",
+            failure_type="invalid_input",
+        )
 
 
 def _mcp_write_message(proc: subprocess.Popen, message: Json) -> None:
@@ -375,6 +501,7 @@ def _mcp_list_server_tools(server: Json) -> list[Json]:
 
 
 def _mcp_call_tool(server: Json, tool_name: str, arguments: Json) -> str:
+    _mcp_validate_service_file_arguments(server, arguments, tool_name=tool_name)
     session = _mcp_get_session(server)
     result = session.request("tools/call", {"name": tool_name, "arguments": arguments})
     return _mcp_content_to_text(result)

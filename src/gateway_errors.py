@@ -18,7 +18,7 @@ class GatewayError(Exception):
 class UpstreamHTTPError(GatewayError):
     status = 502
 
-    def __init__(self, upstream_status: int, detail: str) -> None:
+    def __init__(self, upstream_status: int, detail: Any) -> None:
         super().__init__(f"upstream HTTP {upstream_status}", detail=detail)
         self.upstream_status = upstream_status
 
@@ -41,6 +41,10 @@ class GatewayBusyError(GatewayError):
 
 class RequestBodyTooLargeError(GatewayError):
     status = 413
+
+
+class BadRequestError(GatewayError):
+    status = 400
 
 
 class ConfigError(GatewayError):

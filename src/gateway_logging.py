@@ -108,6 +108,9 @@ def _sqlite_init() -> None:
                     ts TEXT NOT NULL,
                     session_key TEXT NOT NULL,
                     workspace_root TEXT NOT NULL,
+                    tenant_key TEXT NOT NULL DEFAULT '',
+                    workspace_key TEXT NOT NULL DEFAULT '',
+                    memory_session_key TEXT NOT NULL DEFAULT '',
                     kind TEXT NOT NULL,
                     summary TEXT NOT NULL,
                     keywords_json TEXT NOT NULL DEFAULT '[]',
@@ -124,6 +127,11 @@ def _sqlite_init() -> None:
             _sqlite_migrate_add_column(conn, "tool_failures", "execution_ms", "REAL")
             _sqlite_migrate_add_column(conn, "tool_failures", "retry_count", "INTEGER DEFAULT 0")
             _sqlite_migrate_add_column(conn, "tool_failures", "provider", "TEXT")
+            _sqlite_migrate_add_column(conn, "conversation_memories", "tenant_key", "TEXT NOT NULL DEFAULT ''")
+            _sqlite_migrate_add_column(conn, "conversation_memories", "workspace_key", "TEXT NOT NULL DEFAULT ''")
+            _sqlite_migrate_add_column(conn, "conversation_memories", "memory_session_key", "TEXT NOT NULL DEFAULT ''")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_conversation_memories_scope ON conversation_memories(tenant_key, workspace_key, memory_session_key, ts DESC)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_conversation_memories_kind_scope ON conversation_memories(kind, tenant_key, workspace_key, memory_session_key, ts DESC)")
             _sqlite_import_legacy_logs_locked(conn)
             conn.commit()
             SQLITE_READY = True

@@ -155,11 +155,7 @@ class NativeProxyClient:
                     error_detail = json.loads(response_data) if response_data else {}
                 except:
                     error_detail = {"raw": response_data}
-                raise UpstreamHTTPError(
-                    f"upstream returned {status_code}",
-                    upstream_status=status_code,
-                    detail=error_detail
-                )
+                raise UpstreamHTTPError(status_code, error_detail)
 
             if response_data:
                 if response_data.lstrip().startswith("data:"):

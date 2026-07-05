@@ -52,16 +52,20 @@ upstream:
 # Gateway 核心配置
 # ----------------------------------------------------------------------------
 gateway:
-  # 工作目录（工具读写的根目录）
-  workspace_root: ./workspace
+  # 远端服务默认不持久化 workspace_root。
+  # 每个请求应由 client 传入 workspace_root/gateway_workspace 或通过客户端环境元数据解析。
+  # 缺失时 Gateway 会使用隔离 anonymous workspace，而不是服务机 cwd。
+  # workspace_root: /absolute/client/workspace
 
   # 工具模式：orchestrate（本地编排）| passthrough（直通上游）
   tool_mode: orchestrate
+  agent_planner_strict_every_turn: true
 
   # 工具权限
   allow_write_tools: false           # 允许文件写入工具；仅可信本地 coding-agent 场景开启
   allow_shell_tools: false           # 允许 Shell 执行工具；生产默认关闭
   execute_user_side_tools_in_gateway: false  # 默认禁止在 Gateway 服务机执行用户侧文件/shell/GUI/local agent 工具
+  allow_private_network_tools: false # 默认禁止 WebFetch/WebSearch/image_generation provider 访问 Gateway 服务端私网；仅管理员确认服务侧网络工具需要时开启
 
   # 工具执行
   max_tool_rounds: 10                # 最大工具调用轮数
@@ -149,6 +153,10 @@ mcp:
   # - name: filesystem
   #   command: npx
   #   args: ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]
+  #   # Cloud default: downstream-supplied path/file args are blocked from
+  #   # targeting the Gateway service filesystem. Enable only for an
+  #   # admin-approved service-side filesystem connector.
+  #   allow_service_file_arguments: true
   marketplace_enabled: true
 
 # ----------------------------------------------------------------------------
@@ -160,6 +168,9 @@ http_actions:
   # - name: lookup_user
   #   method: POST
   #   url: http://127.0.0.1:9000/lookup
+  #   # Cloud default blocks private/localhost URLs; enable only for
+  #   # admin-approved service-private action endpoints.
+  #   allow_private_network: true
   #   input_schema:
   #     type: object
   #     properties:

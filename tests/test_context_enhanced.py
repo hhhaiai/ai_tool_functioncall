@@ -178,7 +178,15 @@ class TestMemorySessionKey:
             "messages": [{"role": "user", "content": "Hello"}],
         }
         key = _memory_session_key(body)
-        assert key == "my-session-123"
+        assert key == "tenant:anonymous:session:my-session-123"
+
+    def test_session_accepts_metadata_tenant_alias(self):
+        body = {
+            "metadata": {"tenant": "tenant-alias-user", "session_id": "my-session-123"},
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        key = _memory_session_key(body)
+        assert key == "tenant:tenant-alias-user:session:my-session-123"
 
     def test_session_from_conversation_id(self):
         body = {
@@ -186,7 +194,7 @@ class TestMemorySessionKey:
             "messages": [{"role": "user", "content": "Hello"}],
         }
         key = _memory_session_key(body)
-        assert key == "conv-456"
+        assert key == "tenant:anonymous:session:conv-456"
 
     def test_session_from_first_message(self):
         body = {
@@ -195,12 +203,12 @@ class TestMemorySessionKey:
             ]
         }
         key = _memory_session_key(body)
-        assert key.startswith("session_") or len(key) == 16
+        assert key.startswith("tenant:anonymous:session_")
 
     def test_session_random_fallback(self):
         body = {"messages": []}
         key = _memory_session_key(body)
-        assert key.startswith("session_")
+        assert key.startswith("tenant:anonymous:session_")
 
 
 class TestMessageCompaction:
@@ -316,7 +324,7 @@ class TestContextIntegration:
             "metadata": {"session_id": "test-session"},
         }
         session_key = _memory_session_key(body)
-        assert session_key == "test-session"
+        assert session_key == "tenant:anonymous:session:test-session"
         text = _memory_extract_request_text("/v1/chat/completions", body)
         assert "Python" in text or "FastAPI" in text
         keywords = _memory_extract_keywords(text)

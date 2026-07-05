@@ -181,6 +181,20 @@ class TestSemanticCache:
         # Note: Local embedding may not be semantic enough for this to always work
         # This tests the mechanism, not the embedding quality
 
+    def test_scope_key_isolates_exact_and_semantic_matches(self):
+        cache = SemanticCache(
+            similarity_threshold=0.0,
+            ttl_seconds=60,
+        )
+        cache.put("repeatable prompt", {"answer": "tenant-a"}, scope_key="tenant-a/session/workspace")
+
+        same_scope = cache.get("repeatable prompt", scope_key="tenant-a/session/workspace")
+        assert same_scope is not None
+        assert same_scope["answer"] == "tenant-a"
+
+        assert cache.get("repeatable prompt", scope_key="tenant-b/session/workspace") is None
+        assert cache.get("similar prompt", scope_key="tenant-b/session/workspace") is None
+
     def test_cache_miss(self):
         cache = SemanticCache(
             similarity_threshold=0.99,

@@ -147,10 +147,12 @@ class CacheEntry:
         response: dict,
         embedding: list[float],
         ttl_seconds: int = 3600,
+        scope_key: str = "",
     ):
         self.query = query
         self.response = response
         self.embedding = embedding
+        self.scope_key = str(scope_key or "")
         self.created_at = time.time()
         self.last_accessed = self.created_at
         self.access_count = 0
@@ -217,6 +219,7 @@ class SemanticCache:
                     response=entry_data["response"],
                     embedding=entry_data["embedding"],
                     ttl_seconds=entry_data["ttl_seconds"],
+                    scope_key=entry_data.get("scope_key", ""),
                 )
                 entry.created_at = entry_data["created_at"]
                 entry.last_accessed = entry_data["last_accessed"]
@@ -247,6 +250,7 @@ class SemanticCache:
                 embedding=entry.embedding,
                 response=entry.response,
                 ttl_seconds=entry.ttl_seconds,
+                scope_key=entry.scope_key,
             )
         except Exception as exc:
             _logger.error(f"Failed to save semantic cache entry to database: {exc}")
@@ -266,9 +270,21 @@ class SemanticCache:
                 "ttl_seconds": self.ttl_seconds,
             }
 
-    def _make_key(self, query: str) -> str:
+    def _normalize_scope_key(self, scope_key: str | None = None) -> str:
+        return str(scope_key or "").strip()
+
+    def _make_key(self, query: str, scope_key: str | None = None) -> str:
         """Create a cache key from query text."""
-        return hashlib.sha256(query.lower().strip().encode()).hexdigest()[:32]
+        normalized_query = query.lower().strip()
+        normalized_scope = self._normalize_scope_key(scope_key)
+        if not normalized_scope:
+            return hashlib.sha256(normalized_query.encode()).hexdigest()[:32]
+        payload = json.dumps(
+            {"scope": normalized_scope, "query": normalized_query},
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()[:32]
 
     def _evict_expired(self):
         """Remove expired entries."""
@@ -296,7 +312,7 @@ class SemanticCache:
         for key, _ in sorted_entries[:entries_to_remove]:
             del self._entries[key]
 
-    def get(self, query: str) -> Optional[dict]:
+    def get(self, query: str, scope_key: str | None = None) -> Optional[dict]:
         """Get cached response for a query.
 
         Returns None if no sufficiently similar query is cached.
@@ -306,7 +322,8 @@ class SemanticCache:
         if not isinstance(query, str) or not query:
             return None
 
-        key = self._make_key(query)
+        normalized_scope = self._normalize_scope_key(scope_key)
+        key = self._make_key(query, normalized_scope)
 
         # Fast path: exact match under lock (no embedding computation)
         with self._lock:
@@ -334,6 +351,8 @@ class SemanticCache:
             for entry in self._entries.values():
                 if entry.is_expired:
                     continue
+                if entry.scope_key != normalized_scope:
+                    continue
 
                 similarity = cosine_similarity(query_embedding, entry.embedding)
                 if similarity > best_similarity:
@@ -348,7 +367,7 @@ class SemanticCache:
             self._misses += 1
             return None
 
-    def put(self, query: str, response: dict) -> None:
+    def put(self, query: str, response: dict, scope_key: str | None = None) -> None:
         """Cache a response for a query."""
         if not self.enabled:
             return
@@ -356,7 +375,8 @@ class SemanticCache:
             return
 
         # Compute embedding OUTSIDE the lock
-        key = self._make_key(query)
+        normalized_scope = self._normalize_scope_key(scope_key)
+        key = self._make_key(query, normalized_scope)
         embedding = self.embedding_provider.embed(query)
 
         with self._lock:
@@ -367,6 +387,7 @@ class SemanticCache:
                 response=response,
                 embedding=embedding,
                 ttl_seconds=self.ttl_seconds,
+                scope_key=normalized_scope,
             )
             self._entries[key] = entry
 

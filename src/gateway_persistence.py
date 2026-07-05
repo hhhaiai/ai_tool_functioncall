@@ -173,6 +173,7 @@ def _init_schema(conn: sqlite3.Connection):
         _migration_v1_semantic_cache,
         _migration_v2_tool_cache,
         _migration_v3_memories,
+        _migration_v4_semantic_cache_scope,
     ]
 
     for version, migration in enumerate(migrations, start=1):
@@ -256,6 +257,18 @@ def _migration_v3_memories(cursor: sqlite3.Cursor):
     """)
 
 
+def _migration_v4_semantic_cache_scope(cursor: sqlite3.Cursor):
+    """Migration v4: Semantic cache tenant/runtime scope."""
+    cursor.execute("PRAGMA table_info(semantic_cache)")
+    existing_columns = {str(row[1]) for row in cursor.fetchall()}
+    if "scope_key" not in existing_columns:
+        cursor.execute("ALTER TABLE semantic_cache ADD COLUMN scope_key TEXT DEFAULT ''")
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_semantic_cache_scope
+            ON semantic_cache(scope_key);
+    """)
+
+
 # ---------------------------------------------------------------------------
 # Semantic Cache Persistence
 # ---------------------------------------------------------------------------
@@ -266,6 +279,7 @@ def save_semantic_cache_entry(
     embedding: list[float],
     response: dict,
     ttl_seconds: int,
+    scope_key: str = "",
 ) -> bool:
     """Save a semantic cache entry to database.
 
@@ -289,9 +303,9 @@ def save_semantic_cache_entry(
 
         conn.execute("""
             INSERT OR REPLACE INTO semantic_cache
-                (cache_key, query, embedding, response, created_at, last_accessed, access_count, ttl_seconds)
-            VALUES (?, ?, ?, ?, ?, ?, 0, ?)
-        """, (cache_key, query, embedding_blob, response_json, now, now, ttl_seconds))
+                (cache_key, query, embedding, response, created_at, last_accessed, access_count, ttl_seconds, scope_key)
+            VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+        """, (cache_key, query, embedding_blob, response_json, now, now, ttl_seconds, str(scope_key or "")))
 
         conn.commit()
         return True
@@ -317,14 +331,14 @@ def load_semantic_cache_entries(max_age_seconds: int | None = None) -> list[dict
         if max_age_seconds is not None:
             cutoff = time.time() - max_age_seconds
             cursor.execute("""
-                SELECT cache_key, query, embedding, response, created_at, last_accessed, access_count, ttl_seconds
+                SELECT cache_key, query, embedding, response, created_at, last_accessed, access_count, ttl_seconds, scope_key
                 FROM semantic_cache
                 WHERE created_at > ?
                 ORDER BY created_at DESC
             """, (cutoff,))
         else:
             cursor.execute("""
-                SELECT cache_key, query, embedding, response, created_at, last_accessed, access_count, ttl_seconds
+                SELECT cache_key, query, embedding, response, created_at, last_accessed, access_count, ttl_seconds, scope_key
                 FROM semantic_cache
                 ORDER BY created_at DESC
             """)
@@ -340,6 +354,7 @@ def load_semantic_cache_entries(max_age_seconds: int | None = None) -> list[dict
                 "last_accessed": row[5],
                 "access_count": row[6],
                 "ttl_seconds": row[7],
+                "scope_key": row[8] or "",
             })
 
         cursor.close()
@@ -466,6 +481,11 @@ def save_tool_cache_entry(
         conn.commit()
         return True
 
+    except RuntimeError as exc:
+        if "Database not initialized" in str(exc):
+            return False
+        _logger.error(f"Failed to save tool cache entry: {exc}")
+        return False
     except Exception as exc:
         _logger.error(f"Failed to save tool cache entry: {exc}")
         return False
@@ -526,6 +546,11 @@ def load_tool_cache_entry(tool_name: str, arguments_hash: str) -> dict | None:
             "access_count": access_count + 1,
         }
 
+    except RuntimeError as exc:
+        if "Database not initialized" in str(exc):
+            return None
+        _logger.error(f"Failed to load tool cache entry: {exc}")
+        return None
     except Exception as exc:
         _logger.error(f"Failed to load tool cache entry: {exc}")
         return None

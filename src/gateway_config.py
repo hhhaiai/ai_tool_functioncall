@@ -219,6 +219,7 @@ def _default_config() -> Json:
             "client_context_window": _env_int("GATEWAY_CLIENT_CONTEXT_WINDOW", 1048576),
             "client_auto_compact_token_limit": _env_int("GATEWAY_CLIENT_AUTO_COMPACT_TOKEN_LIMIT", 943718),
             "client_output_token_limit": _env_int("GATEWAY_CLIENT_OUTPUT_TOKEN_LIMIT", 131072),
+            "agent_planner_strict_every_turn": _env_bool("GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN", False),
         },
         "context": {
             "enabled": os.environ.get("GATEWAY_CONTEXT_ENABLED", "1").lower() in {"1", "true", "yes"},
@@ -235,6 +236,8 @@ def _default_config() -> Json:
             "memory_recall_limit": _env_int("GATEWAY_MEMORY_RECALL_LIMIT", 8),
             "memory_inject_max_chars": _env_int("GATEWAY_MEMORY_INJECT_MAX_CHARS", 4000),
             "memory_summary_max_chars": _env_int("GATEWAY_MEMORY_SUMMARY_MAX_CHARS", 900),
+            "memory_rollup_every_turns": _env_int("GATEWAY_MEMORY_ROLLUP_EVERY_TURNS", 8),
+            "memory_rollup_max_chars": _env_int("GATEWAY_MEMORY_ROLLUP_MAX_CHARS", 4000),
             "route_to_long_context": os.environ.get("GATEWAY_CONTEXT_ROUTE_LONG", "1").lower() in {"1", "true", "yes"},
             "long_context_upstream": {
                 "base_url": os.environ.get("GATEWAY_LONG_CONTEXT_BASE_URL", ""),

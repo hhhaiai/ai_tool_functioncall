@@ -174,13 +174,13 @@ class TestContextEdgeCases:
         from src.gateway_context import _memory_session_key
         body = {"metadata": {"session_id": "test-123"}, "messages": []}
         result = _memory_session_key(body)
-        assert result == "test-123"
+        assert result == "tenant:anonymous:session:test-123"
 
     def test_memory_session_key_empty_messages(self):
         from src.gateway_context import _memory_session_key
         body = {"messages": []}
         result = _memory_session_key(body)
-        assert result.startswith("session_")
+        assert result.startswith("tenant:anonymous:session_")
 
 
 # ============================================================================

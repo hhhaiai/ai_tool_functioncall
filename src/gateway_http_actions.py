@@ -6,8 +6,10 @@ Handles external HTTP action tools that can be configured via admin UI.
 from __future__ import annotations
 
 import json
+import ipaddress
 import os
 import re
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -63,6 +65,10 @@ def _http_action_schemas(path: str) -> list[Json]:
 
 
 _ENV_TEMPLATE_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_PRIVATE_NETWORK_ERROR = (
+    "HTTP action url targets localhost/private network; "
+    "set allow_private_network=true only for admin-approved service endpoints"
+)
 
 
 def _stringify_action_value(value: Any) -> str:
@@ -118,10 +124,66 @@ def _url_with_query(url: str, arguments: Json) -> str:
     return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(query_items)))
 
 
-def _validate_action_url(url: str) -> None:
+def _action_bool(action: Json, name: str) -> bool:
+    value = action.get(name)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _validate_action_url(url: str, action: Json | None = None) -> None:
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ToolExecutionError("HTTP action url must be absolute http(s)", failure_type="invalid_input")
+    if action and _action_bool(action, "allow_private_network"):
+        return
+    hostname = (parsed.hostname or "").strip().lower().strip("[]")
+    if hostname in {"localhost", "localhost.localdomain"} or hostname.endswith(".localhost"):
+        raise ToolExecutionError(_PRIVATE_NETWORK_ERROR, failure_type="invalid_input")
+    try:
+        ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        _validate_action_dns_targets(hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
+    else:
+        _validate_action_ip_target(ip)
+
+
+def _validate_action_ip_target(ip: ipaddress._BaseAddress) -> None:
+    if not ip.is_global or ip.is_multicast:
+        raise ToolExecutionError(_PRIVATE_NETWORK_ERROR, failure_type="invalid_input")
+
+
+def _validate_action_dns_targets(hostname: str, port: int) -> None:
+    try:
+        infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    except OSError:
+        return
+    for info in infos:
+        sockaddr = info[4]
+        if not sockaddr:
+            continue
+        address = str(sockaddr[0]).split("%", 1)[0]
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            continue
+        _validate_action_ip_target(ip)
+
+
+class _HttpActionRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, action: Json) -> None:
+        self._action = action
+        super().__init__()
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
+        _validate_action_url(newurl, self._action)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _http_action_opener(action: Json) -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(_HttpActionRedirectHandler(action))
 
 
 def _action_max_bytes(action: Json) -> int:
@@ -144,7 +206,7 @@ def _read_limited_response(resp: Any, max_bytes: int) -> str:
 
 def _call_http_action(action: Json, arguments: Json) -> str:
     url = str(action.get("url") or "").strip()
-    _validate_action_url(url)
+    _validate_action_url(url, action)
     method = str(action.get("method") or "POST").upper()
     timeout = float(action.get("timeout") or 30)
     max_bytes = _action_max_bytes(action)
@@ -157,7 +219,7 @@ def _call_http_action(action: Json, arguments: Json) -> str:
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _http_action_opener(action).open(req, timeout=timeout) as resp:
             response_data = _read_limited_response(resp, max_bytes)
             return f"status: {resp.status}\n\n{response_data}"
     except urllib.error.HTTPError as e:

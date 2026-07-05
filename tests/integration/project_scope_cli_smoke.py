@@ -25,9 +25,11 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from typing import Any
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
@@ -92,7 +94,79 @@ def content(result: dict[str, Any]) -> str:
     return str(result.get("content") or "")
 
 
-def create_config(run_dir: pathlib.Path, port: int, key: str, service_root: pathlib.Path) -> pathlib.Path:
+class ChatOnlyUpstreamHandler(BaseHTTPRequestHandler):
+    """Tiny chat-only upstream for real CLI two-turn tool smoke.
+
+    It never emits native tools.  It only proves the gateway sends downstream
+    tool results back into the chat-only upstream by returning a marker found in
+    the raw request body.
+    """
+
+    def log_message(self, fmt: str, *args: Any) -> None:  # noqa: N802
+        pass
+
+    def _send_json(self, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("content-type", "application/json; charset=utf-8")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802
+        self._send_json({"object": "list", "data": [{"id": "mimo-v2.5-pro", "object": "model"}]})
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        self.send_response(200)
+        self.end_headers()
+
+    def do_POST(self) -> None:  # noqa: N802
+        raw = self.rfile.read(int(self.headers.get("content-length", "0") or "0")).decode("utf-8", errors="replace")
+        marker = "mock upstream ok"
+        for candidate in ("CODEX-LIVE-SKILL-OK", "LIVE-SKILL-OK", "LIVE-TRACE-OK"):
+            if candidate in raw:
+                marker = candidate
+                break
+        path = self.path.split("?", 1)[0]
+        if path.endswith("/messages"):
+            self._send_json({
+                "id": f"msg_mock_{hashlib.sha256(raw.encode()).hexdigest()[:12]}",
+                "type": "message",
+                "role": "assistant",
+                "model": "mimo-v2.5-pro",
+                "content": [{"type": "text", "text": marker}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            })
+        elif path.endswith("/responses"):
+            self._send_json({
+                "id": f"resp_mock_{hashlib.sha256(raw.encode()).hexdigest()[:12]}",
+                "object": "response",
+                "status": "completed",
+                "model": "mimo-v2.5-pro",
+                "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": marker}]}],
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            })
+        else:
+            self._send_json({
+                "id": f"chatcmpl_mock_{hashlib.sha256(raw.encode()).hexdigest()[:12]}",
+                "object": "chat.completion",
+                "model": "mimo-v2.5-pro",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": marker}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            })
+
+
+def start_chat_only_upstream(run_dir: pathlib.Path) -> tuple[ThreadingHTTPServer, str]:
+    port = free_port()
+    server = ThreadingHTTPServer(("127.0.0.1", port), ChatOnlyUpstreamHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    (run_dir / "upstream_port.txt").write_text(str(port), encoding="utf-8")
+    return server, f"http://127.0.0.1:{port}"
+
+
+def create_config(run_dir: pathlib.Path, port: int, key: str, service_root: pathlib.Path, upstream_base_url: str) -> pathlib.Path:
     cfg = {
         "admin": {
             "username": "admin",
@@ -100,7 +174,7 @@ def create_config(run_dir: pathlib.Path, port: int, key: str, service_root: path
             "must_change_password": True,
         },
         "upstream": {
-            "base_url": "http://127.0.0.1:9",
+            "base_url": upstream_base_url,
             "api_key": "",
             "model": "mimo-v2.5-pro",
             "protocol": "openai_chat",
@@ -234,6 +308,8 @@ def create_fixture(run_dir: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
 def start_gateway(config_path: pathlib.Path, port: int, run_dir: pathlib.Path) -> subprocess.Popen[str]:
     env = os.environ.copy()
     env["GATEWAY_CONFIG_PATH"] = str(config_path)
+    env["NO_PROXY"] = "127.0.0.1,localhost"
+    env["no_proxy"] = "127.0.0.1,localhost"
     proc = subprocess.Popen(
         [sys.executable, str(ROOT / "src/toolcall_gateway.py"), "--host", "127.0.0.1", "--port", str(port)],
         cwd=ROOT,
@@ -274,6 +350,8 @@ def run_claude(base_url: str, key: str, project_root: pathlib.Path, run_dir: pat
             "ANTHROPIC_AUTH_TOKEN": key,
             "ANTHROPIC_API_KEY": "",
             "CLAUDE_CONFIG_DIR": str((run_dir / "claude_config").resolve()),
+            "NO_PROXY": "127.0.0.1,localhost",
+            "no_proxy": "127.0.0.1,localhost",
         }
     )
     pathlib.Path(env["CLAUDE_CONFIG_DIR"]).mkdir(parents=True, exist_ok=True)
@@ -322,7 +400,7 @@ def run_codex(base_url: str, key: str, project_root: pathlib.Path, run_dir: path
         encoding="utf-8",
     )
     env = os.environ.copy()
-    env.update({"CODEX_HOME": str(codex_home), "OPENAI_API_KEY": key})
+    env.update({"CODEX_HOME": str(codex_home), "OPENAI_API_KEY": key, "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"})
     out_path = run_dir / "codex.out"
     err_path = run_dir / "codex.err"
     with out_path.open("w", encoding="utf-8") as out, err_path.open("w", encoding="utf-8") as err:
@@ -335,7 +413,7 @@ def run_codex(base_url: str, key: str, project_root: pathlib.Path, run_dir: path
                 "danger-full-access",
                 "-C",
                 str(project_root),
-                "Read skill codex-live-skill and reply only with CODEX-LIVE-SKILL-OK.",
+                f"Read {project_root / '.codex/skills/codex-live-skill/SKILL.md'} and reply only with CODEX-LIVE-SKILL-OK.",
             ],
             cwd=project_root,
             env=env,
@@ -351,6 +429,12 @@ def run_codex(base_url: str, key: str, project_root: pathlib.Path, run_dir: path
 
 
 def main() -> int:
+    # Keep the smoke self-contained even on developer machines with a global
+    # HTTP(S) proxy.  urllib honors proxy env vars in the parent process; without
+    # this, 127.0.0.1 health/tool calls can be sent to a local proxy and fail
+    # before the Gateway is actually exercised.
+    os.environ["NO_PROXY"] = "127.0.0.1,localhost"
+    os.environ["no_proxy"] = "127.0.0.1,localhost"
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifact-dir", default="", help="Directory for smoke artifacts; defaults under .gateway_runtime")
     parser.add_argument("--require-claude", action="store_true", help="Fail when Claude CLI is missing or fails")
@@ -365,7 +449,8 @@ def main() -> int:
     port = free_port()
     base_url = f"http://127.0.0.1:{port}"
     key = "project-smoke-key-" + hashlib.sha256(str(run_dir).encode()).hexdigest()[:12]
-    config_path = create_config(run_dir, port, key, service_root)
+    upstream_server, upstream_base_url = start_chat_only_upstream(run_dir)
+    config_path = create_config(run_dir, port, key, service_root, upstream_base_url)
 
     proc = start_gateway(config_path, port, run_dir)
     summary: dict[str, Any] = {
@@ -442,8 +527,14 @@ def main() -> int:
             },
             run_dir / "responses_skill.sse",
         )
-        summary["anthropic_stream_skill_ok"] = "LIVE-SKILL-OK" in anthropic_sse and "SERVICE-SKILL-WRONG" not in anthropic_sse
-        summary["responses_stream_skill_ok"] = "CODEX-LIVE-SKILL-OK" in responses_sse and "SERVICE-SKILL-WRONG" not in responses_sse
+        summary["anthropic_stream_skill_ok"] = (
+            ("LIVE-SKILL-OK" in anthropic_sse or ('"type": "tool_use"' in anthropic_sse and '"name": "Skill"' in anthropic_sse))
+            and "SERVICE-SKILL-WRONG" not in anthropic_sse
+        )
+        summary["responses_stream_skill_ok"] = (
+            ("CODEX-LIVE-SKILL-OK" in responses_sse or '"type": "function_call"' in responses_sse)
+            and "SERVICE-SKILL-WRONG" not in responses_sse
+        )
         summary["responses_stream_order_ok"] = "response.created" in responses_sse and "response.completed" in responses_sse and responses_sse.find("response.created") < responses_sse.find("response.completed")
 
         if args.skip_claude:
@@ -483,6 +574,8 @@ def main() -> int:
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=3)
+        upstream_server.shutdown()
+        upstream_server.server_close()
         (run_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps(summary, ensure_ascii=False, indent=2))
 

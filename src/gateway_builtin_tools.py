@@ -47,7 +47,9 @@ from .gateway_mcp import (
     _mcp_server_by_name,
     _mcp_list_server_tools,
     _mcp_call_tool,
+    _mcp_validate_service_file_arguments,
 )
+from .gateway_http_actions import _http_action_opener, _validate_action_url
 from .gateway_config import _config_env
 
 _logger = logging.getLogger(__name__)
@@ -56,6 +58,14 @@ Json = dict[str, Any]
 
 _WORKSPACE_ROOT_OVERRIDE: contextvars.ContextVar[pathlib.Path | None] = contextvars.ContextVar(
     "gateway_workspace_root_override",
+    default=None,
+)
+_RUNTIME_SCOPE_OVERRIDE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "gateway_runtime_scope_override",
+    default=None,
+)
+_CLIENT_ID_SCOPE_OVERRIDE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "gateway_client_id_scope_override",
     default=None,
 )
 
@@ -112,6 +122,66 @@ def _workspace_root():
         "No workspace context available. Internal error.",
         failure_type="internal_error"
     )
+
+def _runtime_scope_key() -> str:
+    """Return a request/client scope for long-lived in-memory tool state.
+
+    Remote Gateway deployments can serve many users at once.  Process-global
+    maps (exec sessions, spawned agents, team placeholders, pending user
+    questions) must therefore never be keyed by the caller-provided id alone:
+    two clients can both choose ``session_id=dev``.  The protocol still returns
+    the public id unchanged, but internally the id is namespaced by the
+    request/workspace scope set by gateway_tool_runtime._workspace_scope().
+    """
+    scoped = _RUNTIME_SCOPE_OVERRIDE.get()
+    if scoped:
+        return scoped
+    # Fallback for direct unit tests or internal calls outside request
+    # orchestration.  This remains workspace-scoped and never uses cwd.
+    try:
+        root = str(_workspace_root())
+    except Exception:
+        root = "no-workspace"
+    return f"workspace:{uuid.uuid5(uuid.NAMESPACE_URL, root).hex[:24]}"
+
+def _scoped_runtime_id(public_id: str) -> str:
+    return f"{_runtime_scope_key()}:{public_id}"
+
+def _memory_tenant_scope_key() -> str:
+    """Return the request tenant key for direct Gateway Memory tool calls."""
+    scoped_client = _CLIENT_ID_SCOPE_OVERRIDE.get()
+    if isinstance(scoped_client, str) and scoped_client.strip():
+        try:
+            from .gateway_context import _stable_memory_key_part
+            return _stable_memory_key_part(scoped_client) or "anonymous"
+        except Exception:
+            return scoped_client.strip()
+    scoped_runtime = _RUNTIME_SCOPE_OVERRIDE.get()
+    if isinstance(scoped_runtime, str) and scoped_runtime.startswith("tenant:"):
+        rest = scoped_runtime[len("tenant:"):]
+        markers = (":session:", ":conversation:", ":thread:", ":anon:", ":session_")
+        positions = [rest.find(marker) for marker in markers if rest.find(marker) >= 0]
+        if positions:
+            return rest[: min(positions)] or "anonymous"
+        return rest or "anonymous"
+    return "anonymous"
+
+def _memory_tool_session_key(args: Json) -> str:
+    """Namespace public Memory writes by the current Gateway request tenant."""
+    from .gateway_context import _stable_memory_key_part
+
+    tenant = _memory_tenant_scope_key()
+    raw = str(args.get("session_key") or args.get("session_id") or "manual").strip() or "manual"
+    if raw.startswith("tenant:"):
+        rest = raw[len("tenant:"):]
+        markers = (":session:", ":conversation:", ":thread:", ":anon:", ":session_")
+        positions = [(rest.find(marker), marker) for marker in markers if rest.find(marker) >= 0]
+        if positions:
+            pos, marker = min(positions, key=lambda item: item[0])
+            suffix = rest[pos + len(marker):]
+            label = "session" if marker == ":session_" else marker.strip(":")
+            return f"tenant:{tenant}:{label}:{_stable_memory_key_part(suffix) or 'manual'}"
+    return f"tenant:{tenant}:session:{_stable_memory_key_part(raw) or 'manual'}"
 
 def _resolve_workspace_path(value: str | None, *, default: str = ".") -> pathlib.Path:
     root = _workspace_root().resolve()
@@ -562,6 +632,7 @@ def _tool_exec_shell_start(args: Json) -> str:
         raise ToolExecutionError("missing command", failure_type="invalid_input")
     cwd = _resolve_workspace_path(str(args.get("cwd") or args.get("workdir") or "."))
     session_id = str(args.get("session_id") or f"exec_{uuid.uuid4().hex[:12]}")
+    scoped_session_id = _scoped_runtime_id(session_id)
     proc = subprocess.Popen(
         command,
         cwd=str(cwd),
@@ -572,7 +643,7 @@ def _tool_exec_shell_start(args: Json) -> str:
         bufsize=0,
     )
     with EXEC_SESSIONS_LOCK:
-        EXEC_SESSIONS[session_id] = proc
+        EXEC_SESSIONS[scoped_session_id] = proc
     output = _read_exec_available(proc, float(args.get("read_timeout") or 0.05))
     return json.dumps({"session_id": session_id, "pid": proc.pid, "running": proc.poll() is None, "output": output}, ensure_ascii=False)
 
@@ -580,8 +651,9 @@ def _exec_session(args: Json) -> tuple[str, subprocess.Popen]:
     session_id = str(args.get("session_id") or args.get("id") or "")
     if not session_id:
         raise ToolExecutionError("missing session_id", failure_type="invalid_input")
+    scoped_session_id = _scoped_runtime_id(session_id)
     with EXEC_SESSIONS_LOCK:
-        proc = EXEC_SESSIONS.get(session_id)
+        proc = EXEC_SESSIONS.get(scoped_session_id)
     if not proc:
         raise ToolExecutionError(f"exec session not found: {session_id}", failure_type="not_found")
     return session_id, proc
@@ -607,7 +679,7 @@ def _tool_exec_wait(args: Json) -> str:
         return json.dumps({"session_id": session_id, "running": True, "timeout": True, "output": output}, ensure_ascii=False)
     output = _read_exec_available(proc, 0)
     with EXEC_SESSIONS_LOCK:
-        EXEC_SESSIONS.pop(session_id, None)
+        EXEC_SESSIONS.pop(_scoped_runtime_id(session_id), None)
     return json.dumps({"session_id": session_id, "running": False, "exit_code": proc.returncode, "output": output}, ensure_ascii=False)
 
 def _tool_exec_kill(args: Json) -> str:
@@ -621,7 +693,7 @@ def _tool_exec_kill(args: Json) -> str:
             proc.wait(timeout=2)
     output = _read_exec_available(proc, 0)
     with EXEC_SESSIONS_LOCK:
-        EXEC_SESSIONS.pop(session_id, None)
+        EXEC_SESSIONS.pop(_scoped_runtime_id(session_id), None)
     return json.dumps({"session_id": session_id, "running": False, "exit_code": proc.returncode, "output": output}, ensure_ascii=False)
 
 def _tool_git(args: Json) -> str:
@@ -721,10 +793,23 @@ def _tool_apply_patch(args: Json) -> str:
         raise ToolExecutionError(output.strip() or "apply_patch failed", failure_type="execution_failed")
     return output.strip() or "patch applied"
 
+
+def _network_tool_url_policy() -> Json:
+    allow_private = os.environ.get("GATEWAY_ALLOW_PRIVATE_NETWORK_TOOLS", "").strip().lower() in {"1", "true", "yes", "on"}
+    try:
+        from .gateway_config import _gateway_config
+        allow_private = allow_private or bool(_gateway_config().get("allow_private_network_tools", False))
+    except Exception:
+        pass
+    return {"allow_private_network": allow_private}
+
+
 def _tool_fetch_url(args: Json) -> str:
     url = str(args.get("url") or "")
     if not url.startswith(("http://", "https://")):
         raise ToolExecutionError("url must start with http:// or https://", failure_type="invalid_input")
+    url_policy = _network_tool_url_policy()
+    _validate_action_url(url, url_policy)
     timeout = float(args.get("timeout") or os.environ.get("GATEWAY_FETCH_TIMEOUT", "20"))
     headers = {"user-agent": "ToolCallGateway/1.0"}
     if isinstance(args.get("headers"), dict):
@@ -741,7 +826,7 @@ def _tool_fetch_url(args: Json) -> str:
         data = body if isinstance(body, bytes) else str(body).encode("utf-8")
     method = str(args.get("method") or ("POST" if data is not None else "GET")).upper()
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _http_action_opener(url_policy).open(req, timeout=timeout) as resp:
         data = resp.read(int(args.get("max_bytes") or 200_000))
         content_type = resp.headers.get("content-type", "")
         status = resp.status
@@ -764,6 +849,8 @@ def _tool_web_search(args: Json) -> str:
     base_url = str(args.get("search_url") or os.environ.get("GATEWAY_SEARCH_URL") or "https://duckduckgo.com/html/")
     separator = "&" if "?" in base_url else "?"
     url = base_url + separator + urllib.parse.urlencode({"q": query})
+    url_policy = _network_tool_url_policy()
+    _validate_action_url(url, url_policy)
     req = urllib.request.Request(
         url,
         headers={
@@ -772,7 +859,7 @@ def _tool_web_search(args: Json) -> str:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=float(args.get("timeout") or os.environ.get("GATEWAY_SEARCH_TIMEOUT", "15"))) as resp:
+        with _http_action_opener(url_policy).open(req, timeout=float(args.get("timeout") or os.environ.get("GATEWAY_SEARCH_TIMEOUT", "15"))) as resp:
             html_text = resp.read(int(args.get("max_bytes") or 500_000)).decode("utf-8", errors="replace")
     except urllib.error.URLError as exc:
         raise ToolExecutionError(f"web search connection failed: {exc.reason}", failure_type="execution_failed") from exc
@@ -949,6 +1036,8 @@ def _mcp_servers_for_args(args: Json) -> list[Json]:
     return servers
 
 def _mcp_request_server(server: Json, method: str, params: Json | None = None) -> Json:
+    if method in {"resources/read", "prompts/get"}:
+        _mcp_validate_service_file_arguments(server, params or {}, tool_name=method)
     if _mcp_use_pool(server):
         return _mcp_get_session(server).request(method, params or {})
 
@@ -1063,8 +1152,14 @@ def _tool_memory(args: Json) -> str:
     workspace = str(_workspace_root())
     if action in {"list", "read", "recall"}:
         include_all = bool(args.get("all_workspaces") or args.get("include_all_workspaces"))
+        if include_all:
+            raise ToolExecutionError(
+                "cross-workspace memory listing is available only through admin APIs",
+                failure_type="permission_denied",
+            )
+        tenant_key = _memory_tenant_scope_key()
         return json.dumps(
-            {"memories": _sqlite_tail_memories(int(args.get("limit") or 50), None if include_all else workspace)},
+            {"memories": _sqlite_tail_memories(int(args.get("limit") or 50), workspace, tenant_key=tenant_key)},
             ensure_ascii=False,
             indent=2,
         )
@@ -1074,7 +1169,7 @@ def _tool_memory(args: Json) -> str:
             raise ToolExecutionError("missing memory summary/content", failure_type="invalid_input")
         keywords = args.get("keywords") if isinstance(args.get("keywords"), list) else _memory_extract_keywords(summary)
         _sqlite_insert_memory(
-            str(args.get("session_key") or "manual"),
+            _memory_tool_session_key(args),
             workspace,
             str(args.get("kind") or "manual"),
             summary,
@@ -1172,6 +1267,7 @@ def _tool_spawn_agent(args: Json) -> str:
     prompt = _agent_prompt_from_args(args)
     model = args.get("model")
     agent_id = str(args.get("id") or args.get("agent_id") or f"agent_{uuid.uuid4().hex[:12]}")
+    scoped_agent_id = _scoped_runtime_id(agent_id)
 
     def run() -> str:
         return _tool_agent({"prompt": prompt, "model": model, "chunk_tokens": args.get("chunk_tokens"), "max_chunks": args.get("max_chunks"), "max_workers": args.get("max_workers")})
@@ -1179,7 +1275,7 @@ def _tool_spawn_agent(args: Json) -> str:
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
     future = AGENT_EXECUTOR.submit(run)
     with AGENT_SESSIONS_LOCK:
-        AGENT_SESSIONS[agent_id] = {"future": future, "prompt": prompt, "created_at": now, "updated_at": now, "messages": []}
+        AGENT_SESSIONS[scoped_agent_id] = {"future": future, "prompt": prompt, "created_at": now, "updated_at": now, "messages": [], "public_id": agent_id}
     return json.dumps({"id": agent_id, "status": "running", "object": "gateway.agent"}, ensure_ascii=False)
 
 
@@ -1188,8 +1284,9 @@ def _tool_send_input(args: Json) -> str:
     message = str(args.get("message") or args.get("input") or args.get("text") or "")
     if not agent_id:
         raise ToolExecutionError("missing agent target/id", failure_type="invalid_input")
+    scoped_agent_id = _scoped_runtime_id(agent_id)
     with AGENT_SESSIONS_LOCK:
-        item = AGENT_SESSIONS.get(agent_id)
+        item = AGENT_SESSIONS.get(scoped_agent_id)
         if not item:
             raise ToolExecutionError(f"agent not found: {agent_id}", failure_type="not_found")
         item.setdefault("messages", []).append({"role": "user", "content": message, "ts": _dt.datetime.now(_dt.timezone.utc).isoformat()})
@@ -1218,8 +1315,9 @@ def _tool_wait_agent(args: Json) -> str:
     deadline = _dt.datetime.now().timestamp() + max(timeout, 0)
     results: list[Json] = []
     for agent_id in targets:
+        scoped_agent_id = _scoped_runtime_id(agent_id)
         with AGENT_SESSIONS_LOCK:
-            item = AGENT_SESSIONS.get(agent_id)
+            item = AGENT_SESSIONS.get(scoped_agent_id)
         if not item:
             results.append({"id": agent_id, "status": "not_found"})
             continue
@@ -1240,8 +1338,9 @@ def _tool_close_agent(args: Json) -> str:
     agent_id = str(args.get("target") or args.get("agent_id") or args.get("id") or "")
     if not agent_id:
         raise ToolExecutionError("missing agent target/id", failure_type="invalid_input")
+    scoped_agent_id = _scoped_runtime_id(agent_id)
     with AGENT_SESSIONS_LOCK:
-        item = AGENT_SESSIONS.pop(agent_id, None)
+        item = AGENT_SESSIONS.pop(scoped_agent_id, None)
     if not item:
         raise ToolExecutionError(f"agent not found: {agent_id}", failure_type="not_found")
     future = item.get("future")
@@ -1253,8 +1352,9 @@ def _tool_resume_agent(args: Json) -> str:
     agent_id = str(args.get("id") or args.get("agent_id") or args.get("target") or "")
     if not agent_id:
         raise ToolExecutionError("missing agent id", failure_type="invalid_input")
+    scoped_agent_id = _scoped_runtime_id(agent_id)
     with AGENT_SESSIONS_LOCK:
-        item = AGENT_SESSIONS.get(agent_id)
+        item = AGENT_SESSIONS.get(scoped_agent_id)
     if not item:
         raise ToolExecutionError(f"agent not found: {agent_id}", failure_type="not_found")
     return json.dumps(_agent_session_status(agent_id, item), ensure_ascii=False, indent=2)
@@ -1263,12 +1363,13 @@ def _tool_resume_agent(args: Json) -> str:
 def _tool_request_user_input(args: Json) -> str:
     request_id = str(args.get("id") or f"question_{uuid.uuid4().hex[:12]}")
     payload = {"id": request_id, "questions": args.get("questions") or args.get("question") or args, "status": "pending_user_input"}
-    PENDING_USER_QUESTIONS[request_id] = payload
+    PENDING_USER_QUESTIONS[_scoped_runtime_id(request_id)] = payload
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 def _tool_team_create(args: Json) -> str:
     team_id = str(args.get("id") or args.get("team_id") or f"team_{uuid.uuid4().hex[:12]}")
+    scoped_team_id = _scoped_runtime_id(team_id)
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
     payload = {
         "id": team_id,
@@ -1281,7 +1382,7 @@ def _tool_team_create(args: Json) -> str:
         "updated_at": now,
     }
     with TEAM_SESSIONS_LOCK:
-        TEAM_SESSIONS[team_id] = payload
+        TEAM_SESSIONS[scoped_team_id] = payload
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
@@ -1290,12 +1391,14 @@ def _tool_send_message(args: Json) -> str:
     message = str(args.get("message") or args.get("content") or args.get("text") or "")
     if not target:
         raise ToolExecutionError("missing message target", failure_type="invalid_input")
+    scoped_target = _scoped_runtime_id(target)
     with AGENT_SESSIONS_LOCK:
-        if target in AGENT_SESSIONS:
-            return _tool_send_input({"target": target, "message": message})
+        is_agent = scoped_target in AGENT_SESSIONS
+    if is_agent:
+        return _tool_send_input({"target": target, "message": message})
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
     with TEAM_SESSIONS_LOCK:
-        team = TEAM_SESSIONS.get(target)
+        team = TEAM_SESSIONS.get(scoped_target)
         if not team:
             raise ToolExecutionError(f"target not found: {target}", failure_type="not_found")
         item = {"from": args.get("sender") or args.get("from") or "gateway", "content": message, "ts": now}
@@ -1308,8 +1411,9 @@ def _tool_team_delete(args: Json) -> str:
     team_id = str(args.get("id") or args.get("team_id") or args.get("target") or "")
     if not team_id:
         raise ToolExecutionError("missing team id", failure_type="invalid_input")
+    scoped_team_id = _scoped_runtime_id(team_id)
     with TEAM_SESSIONS_LOCK:
-        previous = TEAM_SESSIONS.pop(team_id, None)
+        previous = TEAM_SESSIONS.pop(scoped_team_id, None)
     if not previous:
         raise ToolExecutionError(f"team not found: {team_id}", failure_type="not_found")
     return json.dumps({"id": team_id, "deleted": True, "previous": previous}, ensure_ascii=False, indent=2)
@@ -1648,7 +1752,7 @@ def _build_builtin_tools() -> dict[str, GatewayTool]:
         GatewayTool("exec_kill", "Terminate an exec_shell_start session.", _json_schema({"session_id": {"type": "string"}, "timeout": {"type": "number"}}, ["session_id"]), _tool_exec_kill, "execute_code", aliases=("kill_shell", "BashKill", "KillBash", "kill_bash")),
         GatewayTool("code_interpreter", "Run Python code locally and return stdout/stderr. Disabled unless GATEWAY_ALLOW_SHELL_TOOLS=1.", _json_schema({"code": {"type": "string"}, "description": {"type": "string"}, "language": {"type": "string"}, "timeout": {"type": "number"}, "cwd": {"type": "string"}}, ["code"]), _tool_code_interpreter, "execute_code", aliases=("python_interpreter", "python_exec")),
         GatewayTool("Git", "Run safe read-only git status/diff/log/show/branch commands.", _json_schema({"action": {"type": "string"}, "path": {"type": "string"}, "limit": {"type": "integer"}, "cached": {"type": "boolean"}}, ["action"]), _tool_git, "read_local", aliases=("git", "git_status", "git_diff", "git_log", "git_show")),
-        GatewayTool("JsonQuery", "Read JSON data/file and return a simple dot-path query.", _json_schema({"data": {}, "file_path": {"type": "string"}, "query": {"type": "string"}}), _tool_json_query, "pure", aliases=("json_query", "jq")),
+        GatewayTool("JsonQuery", "Query JSON data; file_path/path form is downstream workspace file access in cloud mode.", _json_schema({"data": {}, "file_path": {"type": "string"}, "query": {"type": "string"}}), _tool_json_query, "pure", aliases=("json_query", "jq")),
         GatewayTool("PythonSymbols", "Return Python class/function/import symbols for a file.", _json_schema({"file_path": {"type": "string"}, "path": {"type": "string"}}, ["file_path"]), _tool_python_symbols, "read_local", aliases=("python_symbols", "lsp_document_symbols")),
         GatewayTool("apply_patch", "Apply a Codex-style patch in the workspace. Disabled unless GATEWAY_ALLOW_WRITE_TOOLS=1.", _json_schema({"patch": {"type": "string"}}, ["patch"]), _tool_apply_patch, "write_local"),
         GatewayTool("WebFetch", "Fetch a URL over HTTP(S), including method/headers/body/json/form.", _json_schema({"url": {"type": "string"}, "method": {"type": "string"}, "headers": {"type": "object"}, "body": {"type": "string"}, "json": {}, "form": {"type": "object"}, "max_bytes": {"type": "integer"}}, ["url"]), _tool_fetch_url, "read_network", aliases=("fetch_url", "web_fetch", "fetch", "open")),
@@ -1686,7 +1790,7 @@ def _build_builtin_tools() -> dict[str, GatewayTool]:
         # --- Real computer_use / GUI tools (no placeholders) ---
         GatewayTool("computer_use", "Take a screenshot of the current display. Returns path and optional base64.", _json_schema({"include_base64": {"type": "boolean"}}), _tool_computer_use_real, "gui", aliases=("computer_use_preview", "screenshot")),
         GatewayTool("computer_call", "Take a screenshot — alias for computer_use.", _json_schema({"include_base64": {"type": "boolean"}}), _tool_computer_use_real, "gui"),
-        GatewayTool("image_generation", "Generate an image from a text prompt via Pollinations.ai (free) or configured API.", _json_schema({"prompt": {"type": "string"}, "size": {"type": "string"}}, ["prompt"]), _tool_image_generation_real, "gui", aliases=("generate_image",)),
+        GatewayTool("image_generation", "Generate an image from a text prompt via Pollinations.ai (free) or configured API.", _json_schema({"prompt": {"type": "string"}, "size": {"type": "string"}}, ["prompt"]), _tool_image_generation_real, "read_network", aliases=("generate_image",)),
         GatewayTool("click", "Click at (x, y) on screen. Supports left/right/middle and double-click.", _json_schema({"x": {"type": "integer"}, "y": {"type": "integer"}, "button": {"type": "string"}, "double": {"type": "boolean"}}, ["x", "y"]), _tool_click_real, "gui", aliases=("mouse_click",)),
         GatewayTool("type_text", "Type a text string via real keyboard events.", _json_schema({"text": {"type": "string"}, "interval": {"type": "number"}}, ["text"]), _tool_type_text_real, "gui", aliases=("type_input", "keyboard_type")),
         GatewayTool("press_key", "Press a key or key combo (e.g. 'command+a', 'ctrl+shift+s', 'Enter').", _json_schema({"key": {"type": "string"}}, ["key"]), _tool_press_key_real, "gui", aliases=("key_press", "hotkey")),
