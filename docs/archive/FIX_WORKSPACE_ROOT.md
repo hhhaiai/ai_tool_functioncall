@@ -228,7 +228,7 @@ python3 -m src.gateway_app
 # 发送测试请求
 curl -X POST http://localhost:8885/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-sanbo" \
+  -H "Authorization: Bearer <DOWNSTREAM_API_KEY>" \
   -d '{
     "model": "mimo-v2.5-pro",
     "workspace_root": "/Users/test/project1",

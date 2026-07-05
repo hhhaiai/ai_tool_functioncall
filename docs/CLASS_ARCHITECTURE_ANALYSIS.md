@@ -149,7 +149,7 @@ _parallel_tool_execution(calls: list[ToolCall]) -> list[ToolResult]
 **执行/下发策略**:
 - ✅ Gateway-owned 工具真执行：HTTP Action/MCP/WebSearch/WebFetch/calculator/Memory 等。
 - ✅ 用户侧机器工具默认下发：Read/Grep/Glob/Write/Edit/Bash/Skill/GUI/local agent 以 Anthropic `tool_use`、OpenAI Chat `tool_calls` 或 Responses `function_call` 返回给下游客户端。
-- ✅ 显式本地代理模式：`gateway.execute_user_side_tools_in_gateway=true` 或 legacy `delegate_tools_to_downstream=false` 时，才允许用户侧工具在 Gateway 服务机执行。
+- ✅ 显式本地代理模式：只有 `gateway.execute_user_side_tools_in_gateway=true` 才允许用户侧工具在 Gateway 服务机执行；`delegate_tools_to_downstream=false` 不再授权云端本地执行用户 workspace 工具。
 - ✅ 工具结果缓存仅用于可缓存且由 Gateway 实际执行的工具。
 
 **安全特性**:

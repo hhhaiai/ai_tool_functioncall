@@ -247,7 +247,7 @@ local mock smoke（临时 127.0.0.1:9011/8899）
 
 42. **Claude Code 本地文件读取 smoke 中弱上游只输出“我要读取”但不发工具调用**
    - 问题：当上游标记不支持 native tools、Gateway 走文本工具适配时，真实上游有时不会按 `<function=Read>` 发起工具调用，而是只回答“Let me read that file”，导致本地文件读取类 smoke exit 0 但没有读到文件内容。
-   - 修复：local planner 的路径识别从仅支持 `@path` 扩展到绝对路径、相对路径和常见源码/文本文件名；对“read/show/cat/open/查看/读取”等点名文件请求，默认不在 Gateway 服务机读文件，而是直接合成下游原生工具请求（Anthropic `tool_use` / Chat `tool_calls` / Responses `function_call`），要求客户端在用户机器执行并把 tool_result 返回 Gateway。只有显式 `gateway.execute_user_side_tools_in_gateway=true` 或 legacy `delegate_tools_to_downstream=false` 才保留旧本地代理式执行。
+   - 修复：local planner 的路径识别从仅支持 `@path` 扩展到绝对路径、相对路径和常见源码/文本文件名；对“read/show/cat/open/查看/读取”等点名文件请求，默认不在 Gateway 服务机读文件，而是直接合成下游原生工具请求（Anthropic `tool_use` / Chat `tool_calls` / Responses `function_call`），要求客户端在用户机器执行并把 tool_result 返回 Gateway。只有显式 `gateway.execute_user_side_tools_in_gateway=true` 才保留旧本地代理式执行；`delegate_tools_to_downstream=false` 不再授权云端本地执行用户 workspace 工具。
 
 43. **服务启动目录与下游项目目录必须隔离**
    - 问题：Gateway 作为中游服务启动在自身仓库时，不能把服务 cwd 当成 Claude Code/Codex 的项目目录；`/Users/sanbo/Desktop/PersonalAIBrain/.traces` 这类路径属于下游项目级目录，Skills/plugin/Memory 也必须按下游项目根隔离。

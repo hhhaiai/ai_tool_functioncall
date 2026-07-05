@@ -254,6 +254,10 @@ curl http://127.0.0.1:8885/healthz
 
 HTTP Action 执行遵循真实 executor 契约：`GET` / `DELETE` 使用 query，`POST` / `PUT` / `PATCH` 使用 JSON body，`headers` 可通过 `${ENV_NAME}` 注入环境变量，`max_bytes` 默认限制响应体为 1MB；HTTP/URL/响应超限错误会记录为 tool failure，且默认不重试以避免外部副作用重复执行。
 
+云端部署下，HTTP Action 默认拒绝 `localhost` / 私网 / link-local URL，并会检查域名解析结果与 HTTP redirect 目标；只有管理员确认这是 Gateway 服务侧内部 action endpoint 时，才在单个 action 上设置 `allow_private_network: true`。MCP `tools/call`、`resources/read`、`prompts/get` 默认拒绝下游参数中的服务端文件目标（如 `/etc/passwd`、`file:///...`、`../...`、`src/file.py`），避免把 Gateway 服务端 FS 当用户 workspace；确需服务侧 filesystem MCP 时，在对应 MCP server/tool 上显式设置 `allow_service_file_arguments: true`。
+
+Gateway-owned `WebFetch` / `WebSearch` 也默认复用同一网络边界：下游不能通过 URL、`search_url`、DNS 解析或 redirect 访问 Gateway 服务端私网。`image_generation` 的 OpenAI/Pollinations/Hugging Face provider URL 也走同一校验，并用 `GATEWAY_IMAGE_MAX_DIMENSION` 限制下游传入的图片尺寸（默认 2048，硬上限 4096）。只有管理员明确设置 `gateway.allow_private_network_tools=true` 或 `GATEWAY_ALLOW_PRIVATE_NETWORK_TOOLS=1` 时，才允许这些通用网络/provider 工具访问服务侧私网；下游请求参数里的 `allow_private_network` 不会授权绕过。
+
 Gateway 会在读取前限制 HTTP POST 请求体大小：`gateway.max_request_body_bytes` / `GATEWAY_MAX_REQUEST_BODY_BYTES` 默认 64MB，超限返回结构化 413，避免 API 请求或 Admin form 在进入上下文压缩/业务校验前占用过多内存。配置了 downstream key 时，受保护 `/v1/*` 和 direct-tool POST 会先校验 key，再读取/解析 JSON body；未授权 malformed/oversized body 仍返回 401。
 
 请求/响应日志、tool failure 内容和 Admin 配置展示会遮盖常见敏感字段，包括 `Authorization`、`X-API-Key`、`Cookie`、token、secret、password、`key_hash` 等；`must_change_password` 等非敏感状态字段会保留原值。请求/响应日志与 tool failure 内容在遮盖之后会按 `gateway.max_log_payload_chars` / `GATEWAY_MAX_LOG_PAYLOAD_CHARS` 截断，避免长 prompt、大响应或失败详情导致 SQLite/JSONL 日志膨胀。
@@ -487,7 +491,7 @@ Gateway streaming passthrough internal fields       OK，转发上游前剥离 w
 Claude Code Primary working directory               OK，优先于旧摘要 Worktree，工具/Skills/项目级 .traces 按下游项目根隔离
 Codex Responses <environment_context><cwd>           OK，Skills 和工具路径按 Codex 项目根隔离
 Gateway Skill/list_skills/read_skill                 OK，Admin/direct 能查看 Gateway 可见 skills；对话用户侧 Skill 默认下发给客户端
-Gateway Memory/RecallMemory                         OK，默认只列出当前下游项目根，服务目录记忆不串入项目
+Gateway Memory/RecallMemory                         OK，按认证 downstream client + 当前下游项目根隔离；服务目录/其它租户记忆不串入项目，公开 tool 不允许 all_workspaces 全局列表
 Live Claude Code CLI + Codex CLI project smoke       OK，可复跑 `tests/integration/project_scope_cli_smoke.py --require-claude --require-codex`；示例 artifact `.gateway_runtime/project-scope-cli-smoke-20260525-035342/summary.json`，pass=true
 Mimo context                                        1048576 tokens（1M）
 ```

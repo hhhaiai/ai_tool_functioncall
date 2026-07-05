@@ -13,7 +13,7 @@
 claude_aidebug() {
     export ANTHROPIC_BASE_URL="http://127.0.0.1:8885"
     export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-    export ANTHROPIC_AUTH_TOKEN="sk-sanbo"
+    export ANTHROPIC_AUTH_TOKEN="<DOWNSTREAM_API_KEY>"
     export ANTHROPIC_API_KEY=""
     # version 2.x.x
     export ANTHROPIC_DEFAULT_OPUS_MODEL="gpt-5.5"
@@ -39,7 +39,7 @@ claude_aidebug() {
    ```bash
    curl http://127.0.0.1:8885/v1/chat/completions \
      -H "Content-Type: application/json" \
-     -H "Authorization: Bearer sk-sanbo" \
+     -H "Authorization: Bearer <DOWNSTREAM_API_KEY>" \
      -d '{"model":"gpt-5.5","messages":[{"role":"user","content":"你好"}]}'
    ```
 
@@ -102,7 +102,7 @@ lsof -ti:8885 | xargs kill -9
 **检查清单**:
 1. Gateway 是否启动：`curl http://127.0.0.1:8885/`
 2. 环境变量是否设置：`echo $ANTHROPIC_BASE_URL`
-3. 认证token是否正确：`sk-sanbo`
+3. 认证token是否正确：`<DOWNSTREAM_API_KEY>`
 
 ## 下一步测试
 
