@@ -113,6 +113,25 @@ class TestClientPermissions(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertIn("execute", reason)
 
+    def test_write_category_covers_destructive_file_tools(self):
+        client = ClientPermissions(
+            client_id="test",
+            deny_categories={"write"},
+            default_allow=True,
+        )
+        self.assertFalse(client.is_allowed("DeletePath")[0])
+        self.assertFalse(client.is_allowed("MovePath")[0])
+        self.assertFalse(client.is_allowed("MultiEdit")[0])
+
+    def test_category_checks_canonical_name_for_aliases(self):
+        client = ClientPermissions(
+            client_id="test",
+            deny_categories={"write"},
+            default_allow=True,
+        )
+        self.assertFalse(client.is_allowed("rm")[0])
+        self.assertFalse(client.is_allowed("edit_file")[0])
+
     def test_category_precedence_over_default(self):
         client = ClientPermissions(
             client_id="test",
@@ -272,6 +291,22 @@ class TestPermissionManager(unittest.TestCase):
         allowed = manager.get_allowed_tools("client1")
         self.assertIn("Read", allowed)
         self.assertIn("Write", allowed)
+
+    def test_get_allowed_tools_respects_restrictive_client_when_global_default_allows(self):
+        config = {
+            "permissions": {
+                "enabled": True,
+                "default_allow": True,
+                "clients": {
+                    "client1": {
+                        "rules": [{"pattern": "Read", "allow": True}],
+                        "default_allow": False,
+                    }
+                },
+            }
+        }
+        manager = PermissionManager(config)
+        self.assertEqual(manager.get_allowed_tools("client1"), {"Read"})
 
     def test_no_client_config(self):
         config = {

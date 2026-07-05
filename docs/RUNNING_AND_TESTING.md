@@ -200,7 +200,7 @@ curl http://127.0.0.1:8885/healthz
 | `upstream.model` | `mimo-v2.5-pro`（模板） | 默认模型名称 |
 | `upstream.protocol` | openai_chat | 上游协议类型 |
 | `upstream.max_input_tokens` / `max_output_tokens` | 1048576 / 131072（Mimo 模板） | 上游上下文/输出预算声明；客户端片段按 1M 同步 |
-| `upstream.tools_enabled` | adapter（Mimo 模板） | 工具模式：`auto` 按能力自动选择；`native` 发送原生 tools；`native_only` 能力不足即失败；`adapter`/`text_only`/`off` 走 Gateway 文本工具适配 |
+| `upstream.tools_enabled` | adapter（默认） | 默认按上游不支持 tool calls/function calls 处理，走 Gateway Agent Planner adapter；`auto` / `native` 只用于显式兼容实验，不作为默认路径 |
 | `upstream.paths.models` | `/v1/models` | Admin UI 模型自动获取和 `/v1/models` 转发使用的上游路径 |
 | `upstream.capabilities.supports_tools` / `supports_function_calls` | false（Mimo 模板） | 上游是否原生支持当前客户端所需 tools/function calls；Mimo `/v1/messages` forced probe 可返回 `tool_use`，但 `/v1/responses` function_call 未证实，Claude Code/Codex 默认由 Gateway adapter 转成下游原生工具请求 |
 | `upstream.capabilities.supports_vision` | false | 上游是否支持图片/截图/识图输入；在 Admin UI 明确展示和保存 |

@@ -23,14 +23,20 @@ Json = dict[str, Any]
 TOOL_CATEGORIES = {
     "read": {
         "Read", "Grep", "Glob", "ListMcpResourcesTool", "ReadMcpResourceTool",
-        "TaskGet", "TaskList", "CronList",
+        "TaskGet", "TaskList", "CronList", "LS", "Tree", "FileInfo",
+        "ReadManyFiles", "PythonSymbols", "JsonQuery", "LSP", "view_image",
+        "list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource",
+        "mcp_list_tools", "mcp_get_prompt",
     },
     "write": {
         "Write", "Edit", "NotebookEdit", "TaskCreate", "TaskUpdate",
-        "CronCreate", "CronDelete",
+        "CronCreate", "CronDelete", "MultiEdit", "RegexEdit", "CopyPath",
+        "MovePath", "DeletePath", "CreateDirectory", "TodoWrite", "apply_patch",
     },
     "execute": {
         "Bash", "EnterWorktree", "ExitWorktree", "EnterPlanMode", "ExitPlanMode",
+        "Git", "code_interpreter", "exec_shell_start", "exec_wait", "exec_kill",
+        "write_stdin",
     },
     "network": {
         "WebFetch", "WebSearch", "Agent",
@@ -39,6 +45,27 @@ TOOL_CATEGORIES = {
         "Skill", "ScheduleWakeup", "AskUserQuestion",
     },
 }
+
+
+def _tool_match_names(tool_name: str) -> set[str]:
+    """Return user-provided and canonical registry names for permission checks."""
+    names = {str(tool_name or "")}
+    try:
+        try:
+            from .gateway_builtin_tools import BUILTIN_TOOLS
+        except ImportError:
+            try:
+                from src.gateway_builtin_tools import BUILTIN_TOOLS
+            except ImportError:
+                from gateway_builtin_tools import BUILTIN_TOOLS
+        tool = BUILTIN_TOOLS.get(tool_name)
+        canonical = getattr(tool, "name", "") if tool else ""
+        if canonical:
+            names.add(str(canonical))
+    except Exception:
+        pass
+    names.discard("")
+    return names
 
 
 @dataclass
@@ -50,7 +77,7 @@ class PermissionRule:
 
     def matches(self, tool_name: str) -> bool:
         """Check if this rule matches the given tool name."""
-        return fnmatch.fnmatch(tool_name, self.pattern)
+        return any(fnmatch.fnmatch(name, self.pattern) for name in _tool_match_names(tool_name))
 
 
 @dataclass
@@ -76,8 +103,9 @@ class ClientPermissions:
                 return (rule.allow, reason)
 
         # Check category-based permissions
+        tool_names = _tool_match_names(tool_name)
         for category, tools in TOOL_CATEGORIES.items():
-            if tool_name in tools:
+            if tool_names & tools:
                 if category in self.deny_categories:
                     return (False, f"category '{category}' is denied")
                 if category in self.allow_categories:
@@ -196,7 +224,7 @@ class PermissionManager:
         Get set of explicitly allowed tool names for a client.
         Returns empty set if all tools are allowed by default.
         """
-        if not self.enabled or self.default_allow:
+        if not self.enabled:
             return set()
 
         allowed = set()
@@ -207,6 +235,10 @@ class PermissionManager:
                 for rule in client_perms.rules:
                     if rule.allow and "*" not in rule.pattern:
                         allowed.add(rule.pattern)
+            return allowed
+
+        if self.default_allow:
+            return set()
 
         return allowed
 

@@ -5411,6 +5411,7 @@ while True:
                         }
                     ],
                 }
+                cfg["upstream"]["tools_enabled"] = "native"
                 cfg["upstream"]["capabilities"]["supports_tools"] = True
                 cfg["upstream"]["capabilities"]["supports_function_calls"] = True
                 gateway.save_config(cfg)
@@ -13280,7 +13281,7 @@ class ToolCallDefaultTests(unittest.TestCase):
         from src.gateway_streaming import _should_use_text_tool_adapter, _tools_enabled_for_upstream, _upstream_native_tools_capable
         tools_enabled = _tools_enabled_for_upstream()
         native_capable = _upstream_native_tools_capable()
-        self.assertEqual(tools_enabled, "auto")
+        self.assertEqual(tools_enabled, "adapter")
         self.assertFalse(native_capable)
         self.assertTrue(_should_use_text_tool_adapter(tools_enabled, native_capable),
                         "Text tool adapter must be the default when upstream doesn't support native tools")

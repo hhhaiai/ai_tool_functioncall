@@ -890,7 +890,7 @@ def _render_html(**kw):
 <label class="field"><span>最大输入</span><input name="max_input_tokens" type="number" value="{E(upstream.get("max_input_tokens",1048576))}"></label>
 <label class="field"><span>最大输出</span><input name="max_output_tokens" type="number" value="{E(upstream.get("max_output_tokens",131072))}"></label>
 <label class="field"><span>并发</span><input name="max_concurrency" type="number" value="{E(upstream.get("max_concurrency",32))}"></label>
-<label class="field"><span>Tools</span><select name="tools_enabled"><option value="auto"{S(upstream.get("tools_enabled"),"auto")}>Auto</option><option value="adapter"{S(upstream.get("tools_enabled"),"adapter")}>Adapter</option><option value="native"{S(upstream.get("tools_enabled"),"native")}>Native</option><option value="off"{S(upstream.get("tools_enabled"),"off")}>Off</option></select></label>
+<label class="field"><span>Tools</span><select name="tools_enabled"><option value="adapter"{S(upstream.get("tools_enabled","adapter"),"adapter")}>Adapter (default)</option><option value="auto"{S(upstream.get("tools_enabled"),"auto")}>Auto (explicit)</option><option value="native"{S(upstream.get("tools_enabled"),"native")}>Native</option><option value="off"{S(upstream.get("tools_enabled"),"off")}>Off</option></select></label>
 <div class="field full"><h3>能力</h3><div class="check-grid">{cap_inputs}</div></div>
 <div class="field full"><button type="submit">保存配置</button></div>
 </form></div>
@@ -901,7 +901,7 @@ def _render_html(**kw):
 <label class="field"><span>API Key</span><input name="api_key" id="api_key" type="password" placeholder="sk-..."></label>
 <label class="field"><span>模型</span><input name="model" id="model" required list="upstream-model-options" placeholder="gpt-4o"><datalist id="upstream-model-options"></datalist></label>
 <label class="field"><span>协议</span><select name="protocol" id="protocol"><option value="openai-chat">OpenAI Chat</option><option value="openai-responses">OpenAI Responses</option><option value="anthropic">Anthropic</option></select></label>
-<label class="field"><span>Tools</span><select name="tools_enabled"><option value="auto">Auto</option><option value="native">Native</option><option value="prompt">Prompt</option><option value="off">Off</option></select></label>
+<label class="field"><span>Tools</span><select name="tools_enabled"><option value="adapter" selected>Adapter (default)</option><option value="auto">Auto (explicit)</option><option value="native">Native</option><option value="prompt">Prompt</option><option value="off">Off</option></select></label>
 <label class="field"><span>上下文</span><input name="context_window" type="number" value="128000"></label>
 <label class="field"><span>最大输出</span><input name="max_tokens" type="number" value="16384"></label>
 <label class="field wide"><span>Models Path</span><input name="path_models" id="path_models" placeholder="/v1/models"></label>

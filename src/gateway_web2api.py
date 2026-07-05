@@ -365,8 +365,16 @@ class Web2ApiEngine:
         Returns:
             Structured extraction result
         """
-        # Check cache
-        cache_key = self._make_cache_key(url, selectors or regex_patterns)
+        # Check cache. Output-shaping options must be part of the key so a
+        # previous compact extraction cannot satisfy a later request that asks
+        # for links/raw HTML or a different extraction mode.
+        cache_key = self._make_cache_key(url, {
+            "selectors": selectors or {},
+            "regex_patterns": regex_patterns or {},
+            "extraction_mode": extraction_mode,
+            "include_raw_html": include_raw_html,
+            "include_links": include_links,
+        })
         cached = self._get_cached(cache_key)
         if cached:
             return cached

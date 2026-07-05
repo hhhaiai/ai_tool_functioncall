@@ -161,7 +161,7 @@ def _default_config() -> Json:
             "api_key": os.environ.get("UPSTREAM_API_KEY", ""),
             "model": os.environ.get("UPSTREAM_MODEL", ""),
             "protocol": _env_upstream_protocol(),
-            "tools_enabled": os.environ.get("GATEWAY_TOOLS_ENABLED", "auto"),
+            "tools_enabled": os.environ.get("GATEWAY_TOOLS_ENABLED", "adapter"),
             "native_tools_verified": False,
             "use_for_coding": True,
             "timeout_seconds": _env_float("UPSTREAM_TIMEOUT", 60.0),
@@ -557,7 +557,7 @@ def _profile_from_admin_form(form: dict[str, str], existing: Json | None = None)
         profile["api_key"] = profile.get("api_key", "")
     profile["model"] = form.get("model", "").strip() or profile.get("model", "")
     profile["protocol"] = form.get("protocol", "openai_chat").strip()
-    profile["tools_enabled"] = form.get("tools_enabled", form.get("tool_mode", "auto")).strip()
+    profile["tools_enabled"] = form.get("tools_enabled", form.get("tool_mode", "adapter")).strip()
     profile["timeout_seconds"] = _admin_form_float(
         form,
         ("upstream_timeout_seconds", "timeout_seconds", "timeout"),

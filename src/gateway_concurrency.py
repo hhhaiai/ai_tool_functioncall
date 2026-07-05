@@ -254,6 +254,19 @@ class LoadBalancer:
                 if health.consecutive_failures >= 3:
                     health.is_healthy = False
 
+    def report_request_start(self, url: str):
+        """Record that a request is currently using an upstream."""
+        with self._lock:
+            if url in self._health:
+                self._health[url].active_connections += 1
+
+    def report_request_end(self, url: str):
+        """Record that a request stopped using an upstream."""
+        with self._lock:
+            if url in self._health:
+                health = self._health[url]
+                health.active_connections = max(0, health.active_connections - 1)
+
     def check_health(self, url: str) -> bool:
         """Check if an upstream is healthy."""
         if url not in self._health:
@@ -293,6 +306,7 @@ class LoadBalancer:
                 "response_time": h.response_time,
                 "success_rate": h.success_rate,
                 "consecutive_failures": h.consecutive_failures,
+                "active_connections": h.active_connections,
             }
             for url, h in self._health.items()
         }
@@ -425,7 +439,9 @@ class ConcurrentRequestExecutor:
             if not upstream:
                 return {"success": False, "error": "No upstream available"}
 
-            url = upstream.get("url", "") + path
+            upstream_url = upstream.get("url", "")
+            url = upstream_url + path
+            self._load_balancer.report_request_start(upstream_url)
 
             try:
                 start = time.time()
@@ -435,23 +451,25 @@ class ConcurrentRequestExecutor:
                     content = resp.read().decode("utf-8", errors="replace")
 
                     # Report success
-                    self._load_balancer.report_success(upstream.get("url", ""), response_time)
+                    self._load_balancer.report_success(upstream_url, response_time)
 
                     return {
                         "success": True,
                         "status_code": resp.status,
                         "content": content,
                         "response_time": response_time,
-                        "upstream": upstream.get("url", ""),
+                        "upstream": upstream_url,
                     }
 
             except Exception as e:
                 last_error = e
-                self._load_balancer.report_failure(upstream.get("url", ""))
+                self._load_balancer.report_failure(upstream_url)
 
                 # Wait before retry
                 if attempt < self._config.retry_count:
                     time.sleep(self._config.retry_delay * (attempt + 1))
+            finally:
+                self._load_balancer.report_request_end(upstream_url)
 
         return {
             "success": False,

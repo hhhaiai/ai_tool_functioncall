@@ -308,6 +308,25 @@ class TestWeb2ApiEngine:
         assert engine.fetch_page.call_count == 1
         assert result1 == result2
 
+    def test_cache_key_includes_output_options(self):
+        engine = Web2ApiEngine(cache_ttl_seconds=60)
+        mock_result = {
+            "url": "http://example.com",
+            "html": SAMPLE_HTML,
+            "text": "test",
+            "title": "Test",
+            "status": 200,
+            "success": True,
+        }
+        engine.fetch_page = MagicMock(return_value=mock_result)
+
+        compact = engine.extract_structured("http://example.com")
+        with_links = engine.extract_structured("http://example.com", include_links=True)
+
+        assert "links" not in compact
+        assert "links" in with_links
+        assert engine.fetch_page.call_count == 2
+
     def test_stats(self):
         engine = Web2ApiEngine()
         stats = engine.stats

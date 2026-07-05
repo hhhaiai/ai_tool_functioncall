@@ -1,10 +1,16 @@
 # Gateway 项目进度跟踪
 
-> 最后更新: 2026-06-27
+> 最后更新: 2026-07-05
 
 ## 项目概述
 
 AI Gateway 中游服务 - 将各种上游 API（不支持/部分支持 tool calls）封装为完整支持 tool calls 的统一接口，支持无限上下文、智能缓存、协议转换。完美支持下游 Claude Code / Codex 用户。
+
+## 2026-07-05 当前校准
+
+- 默认上游按**不支持 tool calls / function calls** 处理；默认配置为 `upstream.tools_enabled=adapter` 且 `supports_tools=false` / `supports_function_calls=false`。`auto` / `native` 仅用于显式兼容实验，不作为默认路径。
+- 当前 `src/` 生产代码包含 57 个类；逐文件、逐类审计与本轮优化记录见 `docs/CURRENT_FILE_CLASS_AUDIT_2026-07-05.md`。
+- 本轮已修复：并发 least-connections active connection 计数、Web2API cache key 输出选项污染、curl payload temp file 异常泄漏、权限类别/别名覆盖不全。
 
 ## 功能进度
 

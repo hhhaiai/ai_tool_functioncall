@@ -118,6 +118,7 @@ class NativeProxyClient:
         for key, value in headers.items():
             cmd.extend(["-H", f"{key}: {value}"])
 
+        temp_file = None
         if data:
             # Write data to temp file for large payloads
             with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.json') as f:
@@ -132,12 +133,6 @@ class NativeProxyClient:
                 timeout=self.timeout,
                 check=False
             )
-
-            if data:
-                try:
-                    os.unlink(temp_file)
-                except:
-                    pass
 
             output = result.stdout.decode('utf-8')
 
@@ -174,6 +169,12 @@ class NativeProxyClient:
                 raise
             from .gateway_errors import GatewayError
             raise GatewayError(f"upstream request failed: {e}") from e
+        finally:
+            if temp_file:
+                try:
+                    os.unlink(temp_file)
+                except OSError:
+                    pass
 
     def _do_request(self, method: str, path: str, body: Json | None = None) -> Json:
         url = self._url(path)

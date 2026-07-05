@@ -2,6 +2,17 @@
 
 > 最后更新: 2026-07-05
 
+## 2026-07-05 默认弱上游与逐类审计校准
+
+当前默认路径已按“上游不支持 tool calls / function calls”收敛：`upstream.tools_enabled=adapter`，`supports_tools=false`，`supports_function_calls=false`。`auto` / `native` 只保留给显式兼容实验，不再作为 Claude Code / Codex 稳定接入的默认路径。
+
+本轮新增当前版逐文件 / 逐类审计：[`docs/CURRENT_FILE_CLASS_AUDIT_2026-07-05.md`](CURRENT_FILE_CLASS_AUDIT_2026-07-05.md)。当前 `src/` 生产代码共 57 个类；保留核心类，仅对有明确证据的问题做外科修复：
+
+- `LoadBalancer` / `ConcurrentRequestExecutor`：维护 active connection，修复 least-connections 策略缺少实时计数的问题。
+- `Web2ApiEngine`：cache key 纳入 `extraction_mode` / `include_raw_html` / `include_links`，避免输出形态互相污染。
+- `NativeProxyClient`：curl payload 临时文件在 timeout/异常时也会清理。
+- `PermissionRule` / `ClientPermissions` / `PermissionManager`：权限类别覆盖 destructive/write 工具，并按 canonical 工具名处理别名。
+
 ## 2026-06-26 Chat-only 上游原生工具协议适配状态
 
 当前已完成对真实上游 `http://47.85.40.209:8885` 的弱工具能力适配。该上游普通对话、Responses、Messages 和 stream 可用，但 native tools/function calls 实测不可用；Gateway 现在以 `adapter` 模式在外层合成真实协议级工具轮次，并让 Codex / Claude Code 在用户机器执行本地工具。

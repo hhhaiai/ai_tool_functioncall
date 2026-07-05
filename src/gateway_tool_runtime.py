@@ -1639,7 +1639,7 @@ def _extract_tool_calls(path: str, response: Json) -> list[ToolCall]:
 def _text_tool_call_fallback_enabled() -> bool:
     gateway = _gateway_config()
     upstream = _upstream_config()
-    tools_enabled = str(upstream.get("tools_enabled", "auto") or "auto").strip().lower()
+    tools_enabled = str(upstream.get("tools_enabled", "adapter") or "adapter").strip().lower()
     if tools_enabled in {"off", "disabled", "false", "0", "none"}:
         return False
     capabilities = upstream.get("capabilities") if isinstance(upstream.get("capabilities"), dict) else {}
@@ -1769,7 +1769,7 @@ def _detect_intent_tool_calls(path: str, response: Json, body: Json) -> list[Too
         bool(capabilities.get("supports_tools", upstream_cfg.get("supports_tools", False)))
         and bool(capabilities.get("supports_function_calls", upstream_cfg.get("supports_function_calls", False)))
     )
-    tools_enabled = str(upstream_cfg.get("tools_enabled", "auto") or "auto").strip().lower()
+    tools_enabled = str(upstream_cfg.get("tools_enabled", "adapter") or "adapter").strip().lower()
     if tools_enabled in {"off", "disabled", "false", "0", "none"}:
         return []
     if native_capable and tools_enabled not in {"off", "disabled", "false", "0", "none", "text_only", "adapter"}:
@@ -3308,7 +3308,7 @@ def _weak_upstream_text_tools_active(gateway_mode: str) -> bool:
     if gateway_mode in {"passthrough", "native_passthrough", "proxy"}:
         return False
     upstream = _upstream_config()
-    tools_enabled = str(upstream.get("tools_enabled", "auto") or "auto").strip().lower()
+    tools_enabled = str(upstream.get("tools_enabled", "adapter") or "adapter").strip().lower()
     capabilities = upstream.get("capabilities") if isinstance(upstream.get("capabilities"), dict) else {}
     native_capable = bool(capabilities.get("supports_tools", False)) and bool(capabilities.get("supports_function_calls", False))
     if tools_enabled in {"text_only", "adapter", "prompt"}:

@@ -184,6 +184,19 @@ class TestLoadBalancer:
         status = balancer.get_health_status()
         assert status["http://upstream1.com"]["is_healthy"] is False
 
+    def test_request_active_connection_count(self):
+        upstreams = [{"url": "http://upstream1.com"}]
+        config = ConcurrencyConfig()
+        balancer = LoadBalancer(upstreams, config)
+
+        balancer.report_request_start("http://upstream1.com")
+        status = balancer.get_health_status()
+        assert status["http://upstream1.com"]["active_connections"] == 1
+
+        balancer.report_request_end("http://upstream1.com")
+        status = balancer.get_health_status()
+        assert status["http://upstream1.com"]["active_connections"] == 0
+
 
 class TestRequestQueue:
     def test_queue_creation(self):
@@ -254,6 +267,38 @@ class TestConcurrentRequestExecutor:
         upstreams = [{"url": "http://example.com"}]
         config = ConcurrencyConfig()
         executor = ConcurrentRequestExecutor(upstreams, config)
+        executor.shutdown()
+
+    def test_execute_single_tracks_active_connection_during_request(self):
+        upstreams = [{"url": "http://example.com"}]
+        config = ConcurrencyConfig(retry_count=0)
+        executor = ConcurrentRequestExecutor(upstreams, config)
+        observed_counts = []
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b"ok"
+
+        def fake_urlopen(req, timeout):
+            observed_counts.append(
+                executor._load_balancer.get_health_status()["http://example.com"]["active_connections"]
+            )
+            return FakeResponse()
+
+        with patch("src.gateway_concurrency.urlopen", fake_urlopen):
+            result = executor.execute_single("/v1/test")
+
+        assert result["success"] is True
+        assert observed_counts == [1]
+        assert executor._load_balancer.get_health_status()["http://example.com"]["active_connections"] == 0
         executor.shutdown()
 
 

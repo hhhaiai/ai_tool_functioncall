@@ -46,7 +46,7 @@ def mock_upstream_config() -> dict[str, Any]:
         "api_key": "",  # Never store real keys in test code
         "model": "test-model",
         "protocol": "openai_chat",
-        "tools_enabled": "auto",
+        "tools_enabled": "adapter",
         "timeout_seconds": 30,
         "max_input_tokens": 128000,
         "max_output_tokens": 4096,

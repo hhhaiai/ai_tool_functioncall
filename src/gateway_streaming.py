@@ -598,7 +598,7 @@ def _tools_enabled_for_upstream() -> str:
     """Check if tools should be enabled for the upstream API."""
     from .gateway_config import _upstream_config
     cfg = _upstream_config()
-    return str(cfg.get("tools_enabled", "auto") or "auto").strip().lower()
+    return str(cfg.get("tools_enabled", "adapter") or "adapter").strip().lower()
 
 
 def _upstream_native_tools_capable() -> bool:

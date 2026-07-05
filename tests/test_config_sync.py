@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -35,6 +36,26 @@ class SyncActiveUpstreamTests(unittest.TestCase):
     def _read(self) -> dict:
         with open(self._tmp.name, "r", encoding="utf-8") as fh:
             return json.load(fh)
+
+    def test_default_config_assumes_weak_upstream_adapter(self):
+        """Default upstream must be treated as not supporting tool calls."""
+        with patch.dict(
+            os.environ,
+            {
+                "GATEWAY_TOOLS_ENABLED": "",
+                "UPSTREAM_SUPPORTS_TOOLS": "",
+                "UPSTREAM_SUPPORTS_FUNCTION_CALLS": "",
+            },
+            clear=False,
+        ):
+            os.environ.pop("GATEWAY_TOOLS_ENABLED", None)
+            os.environ.pop("UPSTREAM_SUPPORTS_TOOLS", None)
+            os.environ.pop("UPSTREAM_SUPPORTS_FUNCTION_CALLS", None)
+            cfg = gateway._default_config()
+
+        self.assertEqual(cfg["upstream"]["tools_enabled"], "adapter")
+        self.assertFalse(cfg["upstream"]["capabilities"]["supports_tools"])
+        self.assertFalse(cfg["upstream"]["capabilities"]["supports_function_calls"])
 
     def test_main_upstream_overrides_stale_profile(self):
         """User edits on the top-level upstream must win over the profile list."""
