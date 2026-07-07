@@ -36,7 +36,11 @@ class UpstreamHandler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
         length = int(self.headers.get("content-length") or "0")
         body = json.loads(self.rfile.read(length).decode("utf-8"))
-        UpstreamHandler.seen.append({"path": self.path, "body": body})
+        UpstreamHandler.seen.append({
+            "path": self.path,
+            "body": body,
+            "headers": {str(k).lower(): str(v) for k, v in self.headers.items()},
+        })
         idx = len(UpstreamHandler.seen)
         payload = json.dumps(
             {
@@ -69,11 +73,24 @@ def _assert(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
-def _post_json(base_url: str, path: str, body: Json, *, stream: bool = False) -> Json | str:
+def _post_json(
+    base_url: str,
+    path: str,
+    body: Json,
+    *,
+    stream: bool = False,
+    headers: Json | None = None,
+) -> Json | str:
+    request_headers = {"content-type": "application/json"}
+    caller_headers = {str(k): str(v) for k, v in (headers or {}).items()}
+    lower_header_names = {key.lower() for key in caller_headers}
+    if "authorization" not in lower_header_names and "x-api-key" not in lower_header_names:
+        request_headers["authorization"] = "Bearer local-gateway-key"
+    request_headers.update(caller_headers)
     req = urllib.request.Request(
         f"{base_url}{path}",
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        headers={"authorization": "Bearer local-gateway-key", "content-type": "application/json"},
+        headers=request_headers,
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=20) as resp:
@@ -138,6 +155,7 @@ def main() -> None:
         cfg["gateway"]["local_planner_enabled"] = False
         cfg["upstream"]["base_url"] = f"http://127.0.0.1:{upstream.server_address[1]}"
         cfg["upstream"]["model"] = "strict-fake"
+        cfg["upstream"]["api_key"] = "upstream-secret-for-strict-smoke"
         cfg["upstream"]["protocol"] = "openai_chat"
         cfg["upstream"]["tools_enabled"] = "adapter"
         cfg["upstream"]["capabilities"]["supports_tools"] = False
@@ -154,11 +172,21 @@ def main() -> None:
         canonical_non_stream_specs = [
             (
                 "/v1/chat/completions",
-                {"model": "downstream", "metadata": {"session_id": "proto-chat", "user_id": tenant}, "messages": [{"role": "user", "content": "hi chat"}]},
+                {
+                    "model": "downstream",
+                    "metadata": {"session_id": "proto-chat", "user_id": tenant},
+                    "messages": [{"role": "user", "content": "hi chat"}],
+                    "response_format": {"type": "json_object"},
+                },
             ),
             (
                 "/v1/responses",
-                {"model": "downstream", "metadata": {"session_id": "proto-responses", "user_id": tenant}, "input": "hi responses"},
+                {
+                    "model": "downstream",
+                    "metadata": {"session_id": "proto-responses", "user_id": tenant},
+                    "input": "hi responses",
+                    "text": {"format": {"type": "json_object"}},
+                },
             ),
             (
                 "/v1/messages",
@@ -177,7 +205,10 @@ def main() -> None:
         non_stream_specs = canonical_non_stream_specs + alias_non_stream_specs
         non_stream_results: list[Json] = []
         for path, payload in non_stream_specs:
-            response = _post_json(base_url, path, payload)
+            headers = {"anthropic-version": "2023-06-01"} if "/messages" in path else None
+            if path.endswith("/responses"):
+                headers = {"x-api-key": "local-gateway-key"}
+            response = _post_json(base_url, path, payload, headers=headers)
             _assert(isinstance(response, dict), f"{path}: non-json response")
             ctx = _response_context(response)
             _assert(ctx.get("agent_planner_strict_every_turn") is True, f"{path}: strict context missing")
@@ -188,7 +219,13 @@ def main() -> None:
         canonical_stream_specs = [
             (
                 "/v1/chat/completions",
-                {"model": "downstream", "stream": True, "metadata": {"session_id": "proto-chat-stream", "user_id": tenant}, "messages": [{"role": "user", "content": "hi chat stream"}]},
+                {
+                    "model": "downstream",
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                    "metadata": {"session_id": "proto-chat-stream", "user_id": tenant},
+                    "messages": [{"role": "user", "content": "hi chat stream"}],
+                },
             ),
             (
                 "/v1/responses",
@@ -212,7 +249,7 @@ def main() -> None:
         stream_specs = canonical_stream_specs + alias_stream_specs
         stream_payloads: list[str] = []
         for path, payload in stream_specs:
-            sse = _post_json(base_url, path, payload, stream=True)
+            sse = _post_json(base_url, path, payload, stream=True, headers={"anthropic-version": "2023-06-01"} if "/messages" in path else None)
             _assert(isinstance(sse, str) and ("data:" in sse or "event:" in sse), f"{path}: SSE data missing")
             _assert("[DONE]" in sse or "response.completed" in sse or "message_stop" in sse, f"{path}: SSE completion missing")
             stream_payloads.append(sse)
@@ -225,6 +262,18 @@ def main() -> None:
             _assert("gateway_agent_planner" not in body, "upstream payload leaked gateway_agent_planner")
             _assert("Gateway Agent Planner evidence/envelope" in serialized_body, "upstream payload missing planner synthesis prompt")
             _assert("tools" not in body and "tool_choice" not in body, "upstream payload leaked tool surface")
+
+        chat_upstream_bodies = [item["body"] for item in UpstreamHandler.seen if item["body"].get("messages") and "hi chat" in json.dumps(item["body"], ensure_ascii=False)]
+        _assert(any(body.get("response_format") == {"type": "json_object"} for body in chat_upstream_bodies), "chat response_format was not preserved to upstream")
+        _assert(any(item["body"].get("stream_options", {}).get("include_usage") is True for item in UpstreamHandler.seen), "stream_options.include_usage was not preserved to upstream")
+        response_bodies = [item["body"] for item in UpstreamHandler.seen if item["body"].get("input") == "hi responses" or "hi responses" in json.dumps(item["body"], ensure_ascii=False)]
+        _assert(any("gateway agent planner evidence/envelope" in json.dumps(body, ensure_ascii=False).lower() for body in response_bodies), "responses text.format case did not preserve planner envelope")
+        _assert(all("text" not in body for body in response_bodies), "responses text.format leaked to OpenAI-chat upstream instead of being converted away")
+        for item in UpstreamHandler.seen:
+            headers = item["headers"]
+            _assert("x-api-key" not in headers, f"downstream x-api-key leaked to OpenAI-chat upstream: {headers}")
+            _assert("anthropic-version" not in headers, f"downstream anthropic-version leaked to OpenAI-chat upstream: {headers}")
+            _assert(headers.get("authorization") != "Bearer local-gateway-key", f"downstream bearer leaked to upstream: {headers}")
 
         qs = urllib.parse.urlencode({"limit": "120", "tenant_contains": tenant})
         audit = _admin_json(base_url, f"/admin/agent-runtime-audit.json?{qs}")["audit"]
