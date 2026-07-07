@@ -66,9 +66,14 @@
 当前回归测试（以实际门禁输出为准）：
 
 ```bash
-python3 -m pytest -q
-# 886 passed, 2 skipped
+# smoke-level Agent Planner / protocol / public-surface acceptance
+./scripts/agent_planner_acceptance.sh
+
+# 发布前 full gate（包含全量 pytest）
+./scripts/agent_planner_acceptance.sh --full
 ```
+
+最近一次发布收口验证（2026-07-07）：`./scripts/agent_planner_acceptance.sh --full` PASS，全量 pytest `1053 passed, 2 skipped, 21 warnings in 49.58s`；启动 8885 后 scoped live audit `12/12 proven/current_scope`。生产/公网部署前仍必须更换默认 Admin 密码。
 
 本轮真实测试上游 / Mimo 兼容结论（2026-05-25，地址只保存在本地 ignored 配置或环境变量中）：
 

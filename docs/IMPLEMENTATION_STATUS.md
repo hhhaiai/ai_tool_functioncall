@@ -1,6 +1,25 @@
 # Gateway 实现状态文档
 
-> 最后更新: 2026-07-05
+> 最后更新: 2026-07-07
+
+
+## 2026-07-07 发布收口状态
+
+当前阶段：**可发布 / Release Ready（受控环境）**。核心实现已按弱上游 adapter、Gateway-owned / downstream-owned 工具边界、严格 Agent Planner runtime 和长上下文隔离收敛；当前发布判定不再依赖旧的裸 `pytest` 数字，而依赖：
+
+1. `./scripts/agent_planner_acceptance.sh --full`；
+2. 启动 8885 后的 scoped live audit；
+3. `git diff --check` 和 staged secret scan；
+4. 工作区无未提交发布改动。
+
+本轮已提交 strict protocol smoke 增强，覆盖：下游 `x-api-key` / `anthropic-version` / local bearer 不上游泄露、OpenAI Chat `response_format` 和 streaming `stream_options.include_usage` 保留、Responses `text.format` 不泄露给 OpenAI-chat 上游、Planner envelope 仍只保留为受控 system evidence。
+
+2026-07-07 发布证据：
+
+- `./scripts/agent_planner_acceptance.sh --full`：PASS；focused gate `70 passed, 1 warning`；full pytest `1053 passed, 2 skipped, 21 warnings in 49.58s`。
+- 8885 live health：`mode=orchestrate`，`fake_prompt_tools=false`，`supported_paths=21`。
+- scoped live audit：tenant `release-live-user-20260707`，workspace `/Users/sanbo/Desktop/ai_tool_functioncall`，session `release-live-session-20260707-1038`，`overall_status=proven/current_scope`，`12/12` requirements proven，`missing_session_count=0`，streaming/non-streaming synthesis sources both present，`session_rollup=1`。
+- 发布 caveat：当前本地 Admin 仍显示 `admin / admin`；受控本地可用，公网/生产前必须改 Admin 密码或 hash。
 
 ## 2026-07-05 默认弱上游与逐类审计校准
 
@@ -29,7 +48,7 @@
 验证结果：
 ```bash
 python3 -m pytest -q
-# 896 passed, 2 skipped, 21 warnings
+# 历史结果：896 passed, 2 skipped, 21 warnings（当前发布以 agent_planner_acceptance.sh --full 为准）
 
 python3 tests/integration/project_scope_cli_smoke.py --require-claude --require-codex
 # pass: true
@@ -55,7 +74,7 @@ python3 tests/integration/project_scope_cli_smoke.py --require-claude --require-
 ```bash
 python3 -m compileall -q src tests
 python3 -m pytest -q
-# 886 passed, 2 skipped
+# 历史结果：886 passed, 2 skipped（当前发布以 agent_planner_acceptance.sh --full 为准）
 
 local mock smoke
 # OK: healthz, models, chat, direct calculator, user-side LS delegation
@@ -416,34 +435,24 @@ gunicorn src.gateway_app:app -w 4 -b 0.0.0.0:8885
 | 边界条件 | test_edge_cases.py | ✅ |
 | 稳定性 | test_stability.py | ✅ |
 | 集成测试 | test_gateway_e2e.py | ✅ |
-| **总计** | **886 passed, 2 skipped** | ✅ |
+| **发布门禁** | **`./scripts/agent_planner_acceptance.sh --full`，结果以最新运行输出为准** | ✅ |
 
 ---
 
 ## 后续迭代
 
-### Phase 2.5 (当前必须补齐): Agent Planner
+### Phase 2.5: Agent Planner Runtime（已收敛，发布前重验）
 
-用户已用原生支持 tool 的 API 对比 `分析这套项目`，确认当前 gateway adapter 与原生工具 Agent 差距很大。
-因此 “Tool Calls 完整支持” 需要降级解释为：协议转换、工具请求表面化、部分弱上游兜底已实现；**完整外层 Agent Planner 尚未完成**。
+此前“完整外层 Agent Planner 未完成”的旧状态已经过期。当前实现已进入严格 Agent Planner runtime 收口：项目分析、工具边界、streaming/non-streaming parity、历史 follow-up 防污染、多租户/多 workspace 隔离、工具结果/语义缓存 scope、公开 surface 与 admin audit 都纳入 `docs/agent-runtime-completion-matrix.md` 的 45 项验收矩阵。
 
-当前已完成的校正：
+当前保留的发布前要求不是继续补核心架构，而是每次发布前重新验证：
 
-- `分析这套项目` 在 `Skill` 声明且 `codebase-onboarding` 可用时，会优先返回 `Skill(codebase-onboarding)`。
-- 修复弱上游文本 fallback 中 `files to analyze` 被误识别为 `LS(path="to")` 的问题。
-- 当 `LS/Glob` 未声明但 `Bash` 声明时，项目分析 fallback 使用声明过的 shell 工具。
-- `/config` 已作为管理 UI 别名可访问。
+- `./scripts/agent_planner_acceptance.sh --full` 通过；
+- 8885 服务启动后 scoped live audit 显示当前 tenant/workspace/session `missing_session_count=0`；
+- admin/global audit 只作为概览，不能替代 scoped proof；
+- 新增公开路径、能力声明或上游配置变更后必须补对应 gate。
 
-仍缺的核心能力：
-
-- planner state：已新增 `.gateway_runtime/agent_planner.sqlite3` 基础状态存储，仍需扩展更多 workflow；
-- workflow planner：已覆盖项目分析主路径 `Skill -> project structure -> key file read -> synthesis`，并迁入显式 Skill/shell/read/list/web/custom-function/code_search/test-build/edit/write/fix-loop 诊断读取、结构化 patch->Edit、Edit/Write 后自动验证；仍需真实客户端多轮执行验证；
-- evidence compaction：已实现周期性 LLM summary 优先、rolling extractive fallback；
-- final synthesis prompt：已在非流式路径注入 planner evidence，chat-only upstream 不再负责猜工具；
-- streaming parity：已接入 direct planner/evidence injection，仍需覆盖更多 streaming 多轮验收；
-- 完整验收：`分析这套项目` 已具备多轮规划骨架，但还需真实 Claude Code/Codex 长链路 smoke。
-
-设计文档：[agent-planner-gap-analysis.md](agent-planner-gap-analysis.md)
+设计与验收文档：[agent-planner-gap-analysis.md](agent-planner-gap-analysis.md)、[agent-runtime-completion-matrix.md](agent-runtime-completion-matrix.md)
 
 ### 2026-06-26 实现增量: gateway_agent_planner.py
 
@@ -3668,7 +3677,7 @@ python3 -m pytest -q \
   Agent Planner acceptance gate: PASS
 
 python3 -m pytest -q
-  1041 passed, 2 skipped, 21 warnings in 52.90s
+  historical result: 1041 passed, 2 skipped, 21 warnings in 52.90s
 ```
 
 ## 2026-07-05 Tool result cache runtime/tenant 边界
