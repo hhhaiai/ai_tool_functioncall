@@ -1,0 +1,19 @@
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+extend-exclude = [".gateway_runtime", "docs/superpowers"]
+
+[tool.ruff.lint]
+# Start with correctness gates that are actionable on the current legacy tree.
+# Broader style/import cleanup belongs to the planned module-splitting phase.
+select = ["E9", "F63", "F7", "F82"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+follow_imports = "skip"
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+check_untyped_defs = true
+

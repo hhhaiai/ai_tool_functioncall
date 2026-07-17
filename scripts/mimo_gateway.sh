@@ -8,7 +8,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ACTION="${1:-start}"
-HOST="${GATEWAY_HOST:-0.0.0.0}"
+HOST="${GATEWAY_HOST:-127.0.0.1}"
 PORT="${GATEWAY_PORT:-8885}"
 CONFIG_PATH="${GATEWAY_CONFIG_PATH:-$ROOT_DIR/.gateway_service.json}"
 LOG_DIR="${GATEWAY_RUNTIME_DIR:-$ROOT_DIR/.gateway_runtime}"
@@ -20,13 +20,14 @@ LAUNCHD_DOMAIN="gui/$(id -u)"
 SCREEN_NAME="${GATEWAY_SCREEN_NAME:-ai-tool-functioncall-gateway-${PORT}}"
 configured_value() {
   local key="$1" fallback="$2"
-  CONFIG_PATH="$CONFIG_PATH" CONFIG_KEY="$key" CONFIG_FALLBACK="$fallback" python3 - <<'PY'
-import json, os, pathlib
-path = pathlib.Path(os.environ.get("CONFIG_PATH") or "")
+  ROOT_DIR="$ROOT_DIR" CONFIG_PATH="$CONFIG_PATH" CONFIG_KEY="$key" CONFIG_FALLBACK="$fallback" python3 - <<'PY'
+import os, pathlib, sys
 key = os.environ.get("CONFIG_KEY") or ""
 fallback = os.environ.get("CONFIG_FALLBACK") or ""
 try:
-    cfg = json.loads(path.read_text())
+    sys.path.insert(0, os.environ["ROOT_DIR"])
+    from src.gateway_config import load_config
+    cfg = load_config()
     cur = cfg
     for part in key.split("."):
         cur = cur.get(part) if isinstance(cur, dict) else None
@@ -46,6 +47,8 @@ STOP_EXISTING="${GATEWAY_STOP_EXISTING:-1}"
 KILL_PORT_OWNER="${GATEWAY_KILL_PORT_OWNER:-1}"
 
 export GATEWAY_CONFIG_PATH="$CONFIG_PATH"
+export GATEWAY_RUNTIME_DIR="$LOG_DIR"
+export GATEWAY_PUBLIC_EXPOSURE="${GATEWAY_PUBLIC_EXPOSURE:-auto}"
 export GATEWAY_SQLITE_LOG_PATH="${GATEWAY_SQLITE_LOG_PATH:-$ROOT_DIR/gateway_log.sqlite3}"
 # Real/test upstream URLs must be supplied by env or the ignored local
 # .gateway_service.json; never bake a live address into the tracked script.
@@ -197,7 +200,9 @@ cfg['gateway']['text_tool_adapter_compact_token_limit'] = int(os.environ.get('GA
 cfg.setdefault('context', {})['max_input_tokens'] = int(os.environ.get('GATEWAY_CONTEXT_MAX_INPUT_TOKENS', '1048576'))
 cfg.setdefault('context', {})['fanout_chunk_tokens'] = int(os.environ.get('GATEWAY_CONTEXT_FANOUT_CHUNK_TOKENS', '120000'))
 cfg['gateway']['sqlite_log_path'] = os.environ.get('GATEWAY_SQLITE_LOG_PATH', str(root / 'gateway_log.sqlite3'))
-config_path.write_text(json.dumps(gateway._sync_active_upstream(cfg), ensure_ascii=False, indent=2), encoding='utf-8')
+# Use the canonical fail-closed encrypted/atomic writer. Direct write_text here
+# previously persisted upstream and downstream credentials in plaintext.
+gateway.save_config(gateway._sync_active_upstream(cfg))
 print(f'wrote gateway config: {config_path}', flush=True)
 PY
 }
@@ -217,13 +222,12 @@ write_launchd_plist() {
   </array>
   <key>EnvironmentVariables</key><dict>
     <key>GATEWAY_CONFIG_PATH</key><string>${GATEWAY_CONFIG_PATH}</string>
+    <key>GATEWAY_RUNTIME_DIR</key><string>${GATEWAY_RUNTIME_DIR}</string>
     <key>GATEWAY_SQLITE_LOG_PATH</key><string>${GATEWAY_SQLITE_LOG_PATH}</string>
     <key>UPSTREAM_BASE_URL</key><string>${UPSTREAM_BASE_URL}</string>
-    <key>UPSTREAM_API_KEY</key><string>${UPSTREAM_API_KEY}</string>
     <key>UPSTREAM_MODEL</key><string>${UPSTREAM_MODEL}</string>
     <key>UPSTREAM_MAX_INPUT_TOKENS</key><string>${UPSTREAM_MAX_INPUT_TOKENS}</string>
     <key>UPSTREAM_MAX_OUTPUT_TOKENS</key><string>${UPSTREAM_MAX_OUTPUT_TOKENS}</string>
-    <key>DOWNSTREAM_API_KEY</key><string>${DOWNSTREAM_API_KEY}</string>
     <key>GATEWAY_WORKSPACE_ROOT</key><string>${GATEWAY_WORKSPACE_ROOT}</string>
     <key>GATEWAY_TOOL_MODE</key><string>${GATEWAY_TOOL_MODE}</string>
     <key>GATEWAY_TOOLS_ENABLED</key><string>${GATEWAY_TOOLS_ENABLED}</string>
@@ -279,7 +283,7 @@ print_endpoints() {
   cat <<EOF
 Gateway:
   local:  http://127.0.0.1:${PORT}
-  public: http://0.0.0.0:${PORT}
+  bind:   http://${HOST}:${PORT}
   ui:     http://127.0.0.1:${PORT}/ui
   config: http://127.0.0.1:${PORT}/client-config
 Auth:
@@ -392,22 +396,7 @@ verify_all() {
   rm -rf "$test_dir"
   if ! curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1; then start_background >/dev/null; fi
   local effective_key
-  effective_key="$(CONFIG_PATH="$CONFIG_PATH" DOWNSTREAM_API_KEY="$DOWNSTREAM_API_KEY" python3 - <<'PY'
-import json, os, pathlib, sys
-path = pathlib.Path(os.environ.get('CONFIG_PATH') or '')
-def fallback():
-    print(os.environ.get('DOWNSTREAM_API_KEY') or 'local-gateway-key')
-try:
-    cfg = json.loads(path.read_text())
-    key = (cfg.get('gateway') or {}).get('client_snippet_api_key')
-    if key:
-        print(key)
-    else:
-        fallback()
-except Exception:
-    fallback()
-PY
-)"
+  effective_key="$(configured_value gateway.client_snippet_api_key "${DOWNSTREAM_API_KEY:-local-gateway-key}")"
   echo "== 2/5 CORE TOOL ACCEPTANCE =="
   "$ROOT_DIR/tests/integration/tool_acceptance.py" --base-url "http://127.0.0.1:${PORT}" --key "$effective_key"
   echo "== 3/5 security/auth guardrails =="

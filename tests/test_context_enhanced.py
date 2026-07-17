@@ -28,6 +28,8 @@ from src.gateway_context import (
     _trim_text_for_context,
     _should_fanout_context,
     _make_synthesis_prompt,
+    _make_quality_review_prompt,
+    _run_context_fanout,
 )
 
 
@@ -401,3 +403,105 @@ class TestFanoutContext:
         body = {"messages": []}
         cfg = {"context": {"fanout_enabled": True, "max_input_tokens": 24000}}
         assert _should_fanout_context("/v1/chat/completions", body, cfg) is False
+
+    def test_fanout_preserves_source_order_when_workers_finish_out_of_order(self):
+        class OutOfOrderUpstream:
+            synthesis_prompt = ""
+
+            def forward(self, path, body):
+                prompt = body["messages"][-1]["content"]
+                if prompt.startswith("片段 1/3"):
+                    time.sleep(0.04)
+                    return {"choices": [{"message": {"content": "result-one"}}]}
+                if prompt.startswith("片段 2/3"):
+                    time.sleep(0.02)
+                    return {"choices": [{"message": {"content": "result-two"}}]}
+                if prompt.startswith("片段 3/3"):
+                    return {"choices": [{"message": {"content": "result-three"}}]}
+                self.synthesis_prompt = prompt
+                return {"choices": [{"message": {"content": "final"}}]}
+
+        upstream = OutOfOrderUpstream()
+        result = _run_context_fanout(
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "abcdefghijkl"}]},
+            upstream,
+            {
+                "context": {
+                    "fanout_enabled": True,
+                    "max_input_tokens": 1,
+                    "fanout_chunk_tokens": 1,
+                    "fanout_max_chunks": 3,
+                    "fanout_max_workers": 3,
+                    "quality_review_enabled": False,
+                }
+            },
+        )
+
+        assert result["choices"][0]["message"]["content"] == "final"
+        assert upstream.synthesis_prompt.index("result-one") < upstream.synthesis_prompt.index("result-two")
+        assert upstream.synthesis_prompt.index("result-two") < upstream.synthesis_prompt.index("result-three")
+
+    def test_fanout_discloses_capped_source_truncation(self):
+        class Upstream:
+            def forward(self, path, body):
+                prompt = body["messages"][-1]["content"]
+                if "片段 " in prompt:
+                    return {"choices": [{"message": {"content": "partial"}}]}
+                return {"choices": [{"message": {"content": "final"}}]}
+
+        result = _run_context_fanout(
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "abcdefghijklmnopqrst"}]},
+            Upstream(),
+            {
+                "context": {
+                    "fanout_enabled": True,
+                    "max_input_tokens": 1,
+                    "fanout_chunk_tokens": 1,
+                    "fanout_max_chunks": 2,
+                    "fanout_max_workers": 2,
+                    "quality_review_enabled": False,
+                }
+            },
+        )
+
+        metadata = result["gateway_context"]
+        assert metadata["truncated"] is True
+        assert metadata["processed_source_chars"] == 8
+        assert metadata["omitted_source_chars"] == 12
+
+    def test_quality_review_requires_and_returns_user_ready_anthropic_answer(self):
+        class AnthropicUpstream:
+            review_prompt = ""
+
+            def forward(self, path, body):
+                prompt = body["messages"][-1]["content"]
+                if "片段 " in prompt:
+                    return {"content": [{"type": "text", "text": "partial"}]}
+                if "最终答案改写器" in prompt:
+                    self.review_prompt = prompt
+                    return {"content": [{"type": "text", "text": "revised final"}]}
+                return {"content": [{"type": "text", "text": "draft final"}]}
+
+        upstream = AnthropicUpstream()
+        result = _run_context_fanout(
+            "/v1/messages",
+            {"messages": [{"role": "user", "content": "abcdefgh"}]},
+            upstream,
+            {
+                "context": {
+                    "fanout_enabled": True,
+                    "max_input_tokens": 1,
+                    "fanout_chunk_tokens": 1,
+                    "fanout_max_chunks": 0,
+                    "fanout_max_workers": 2,
+                    "quality_review_enabled": True,
+                }
+            },
+        )
+
+        assert result["content"][0]["text"] == "revised final"
+        assert result["gateway_context"]["quality_reviewed"] is True
+        assert "只返回用户可以直接使用的最终答案" in upstream.review_prompt
+        assert "不要输出审查过程" in _make_quality_review_prompt("question", "draft")

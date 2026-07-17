@@ -181,6 +181,14 @@ class TestSemanticCache:
         # Note: Local embedding may not be semantic enough for this to always work
         # This tests the mechanism, not the embedding quality
 
+    def test_gateway_request_fingerprints_require_exact_match(self):
+        cache = SemanticCache(similarity_threshold=0.0, ttl_seconds=60)
+        first = "gateway-request-v1:" + "a" * 64
+        second = "gateway-request-v1:" + "b" * 64
+        cache.put(first, {"answer": "first"}, scope_key="scope")
+        assert cache.get(first, scope_key="scope") == {"answer": "first"}
+        assert cache.get(second, scope_key="scope") is None
+
     def test_scope_key_isolates_exact_and_semantic_matches(self):
         cache = SemanticCache(
             similarity_threshold=0.0,

@@ -13,7 +13,10 @@ import re
 import threading
 import uuid
 from collections import OrderedDict
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .gateway_proxy import NativeProxyClient
 
 Json = dict[str, Any]
 
@@ -1155,10 +1158,61 @@ def _make_synthesis_prompt(original_prompt: str, partials: list[str]) -> str:
 def _make_quality_review_prompt(original_prompt: str, draft_text: str) -> str:
     original_compact = _trim_text_for_context(original_prompt, 1000)
     return (
-        "质量审查器：请审查以下草稿的质量和完整性。\n\n"
+        "最终答案改写器：请检查以下草稿的准确性、完整性和可执行性，并直接输出修订后的完整最终答案。\n"
+        "不要输出审查过程、评分、问题清单或任何元评论；只返回用户可以直接使用的最终答案。\n\n"
         f"原始用户问题（压缩）:\n[gateway context compacted]\n{original_compact}\n\n"
         f"草稿:\n{draft_text[:5000]}"
     )
+
+
+def _fanout_response_text(result: Any) -> str:
+    """Extract assistant text from the supported upstream response shapes."""
+    if not isinstance(result, dict):
+        return ""
+    from .gateway_protocol import _text_from_content
+
+    choices = result.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        message = choices[0].get("message")
+        if isinstance(message, dict):
+            text = _text_from_content(message.get("content"))
+            if text:
+                return text
+    content = result.get("content")
+    if isinstance(content, (list, str)):
+        text = _text_from_content(content)
+        if text:
+            return text
+    return str(result.get("output_text") or result.get("text") or "")
+
+
+def _replace_fanout_response_text(result: Json, text: str) -> bool:
+    """Replace assistant text without changing the upstream protocol shape."""
+    choices = result.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        message = choices[0].get("message")
+        if isinstance(message, dict):
+            message["content"] = text
+            return True
+
+    content = result.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") in {"text", "output_text"}:
+                item["text"] = text
+                return True
+        result["content"] = [{"type": "text", "text": text}]
+        return True
+    if isinstance(content, str):
+        result["content"] = text
+        return True
+    if "output_text" in result:
+        result["output_text"] = text
+        return True
+    if "text" in result:
+        result["text"] = text
+        return True
+    return False
 
 
 def _should_fanout_context(path: str, body: Json, cfg: Json, *, force: bool = False) -> bool:
@@ -1192,9 +1246,10 @@ def _run_context_fanout(path: str, body: Json, upstream: Any, cfg: Json, *, forc
     upstream_fn = getattr(upstream, 'forward', None) or getattr(upstream, 'post', None)
     if upstream_fn is None:
         return None
-    partials = []
+    partials_by_index: dict[int, str] = {}
+    failed_chunk_indexes: list[int] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = []
+        futures: dict[Any, int] = {}
         for i, chunk in enumerate(chunks):
             partial_body = __import__("copy").deepcopy(body)
             messages = partial_body.get("messages") or []
@@ -1202,28 +1257,42 @@ def _run_context_fanout(path: str, body: Json, upstream: Any, cfg: Json, *, forc
                 last_msg = messages[-1]
                 if isinstance(last_msg, dict) and last_msg.get("role") == "user":
                     last_msg["content"] = _make_partial_prompt(source_text, chunk, i, len(chunks))
-            futures.append(executor.submit(upstream_fn, path, partial_body))
+            futures[executor.submit(upstream_fn, path, partial_body)] = i
         for future in concurrent.futures.as_completed(futures):
+            chunk_index = futures[future]
             try:
                 result = future.result()
-                from .gateway_protocol import _text_from_content
-                # Support both OpenAI and Anthropic response formats
-                text = None
-                choices = result.get("choices")
-                if choices:
-                    text = _text_from_content(choices[0].get("message", {}).get("content"))
-                if not text:
-                    content = result.get("content")
-                    if isinstance(content, list):
-                        text = _text_from_content(content)
-                if not text:
-                    text = result.get("output_text") or result.get("text")
+                text = _fanout_response_text(result)
                 if text:
-                    partials.append(text)
+                    partials_by_index[chunk_index] = text
+                else:
+                    failed_chunk_indexes.append(chunk_index + 1)
             except Exception:
-                continue
+                failed_chunk_indexes.append(chunk_index + 1)
+    partials = [
+        f"原始片段 {index + 1}/{len(chunks)}:\n{partials_by_index[index]}"
+        for index in sorted(partials_by_index)
+    ]
     if not partials:
         return None
+    processed_source_chars = sum(len(chunk) for chunk in chunks)
+    truncated = processed_source_chars < len(source_text)
+
+    def _fanout_metadata(*, quality_reviewed: bool) -> Json:
+        metadata: Json = {
+            "strategy": strategy,
+            "chunks": len(chunks),
+            "successful_chunks": len(partials),
+            "quality_reviewed": quality_reviewed,
+            "truncated": truncated,
+            "source_chars": len(source_text),
+            "processed_source_chars": processed_source_chars,
+            "omitted_source_chars": max(0, len(source_text) - processed_source_chars),
+        }
+        if failed_chunk_indexes:
+            metadata["failed_chunks"] = sorted(set(failed_chunk_indexes))
+        return metadata
+
     synthesis_body = __import__("copy").deepcopy(body)
     messages = synthesis_body.get("messages") or []
     if messages:
@@ -1233,17 +1302,7 @@ def _run_context_fanout(path: str, body: Json, upstream: Any, cfg: Json, *, forc
     synthesis_result = upstream_fn(path, synthesis_body)
     # Quality review step
     if quality_review and synthesis_result:
-        from .gateway_protocol import _text_from_content
-        synthesis_text = None
-        choices = synthesis_result.get("choices")
-        if choices:
-            synthesis_text = _text_from_content(choices[0].get("message", {}).get("content"))
-        if not synthesis_text:
-            content = synthesis_result.get("content")
-            if isinstance(content, list):
-                synthesis_text = _text_from_content(content)
-        if not synthesis_text:
-            synthesis_text = synthesis_result.get("output_text") or synthesis_result.get("text")
+        synthesis_text = _fanout_response_text(synthesis_result)
         if synthesis_text:
             review_body = __import__("copy").deepcopy(body)
             review_messages = review_body.get("messages") or []
@@ -1253,31 +1312,11 @@ def _run_context_fanout(path: str, body: Json, upstream: Any, cfg: Json, *, forc
                     last_msg["content"] = _make_quality_review_prompt(source_text, synthesis_text)
             review_result = upstream_fn(path, review_body)
             if review_result:
-                review_text = None
-                choices = review_result.get("choices")
-                if choices:
-                    review_text = _text_from_content(choices[0].get("message", {}).get("content"))
-                if not review_text:
-                    content = review_result.get("content")
-                    if isinstance(content, list):
-                        review_text = _text_from_content(content)
-                if not review_text:
-                    review_text = review_result.get("output_text") or review_result.get("text")
-                if review_text:
-                    # Use the reviewed text as the final result
-                    if choices:
-                        synthesis_result["choices"][0]["message"]["content"] = review_text
-                    synthesis_result["gateway_context"] = {
-                        "strategy": strategy,
-                        "chunks": len(chunks),
-                        "quality_reviewed": True,
-                    }
+                review_text = _fanout_response_text(review_result)
+                if review_text and _replace_fanout_response_text(synthesis_result, review_text):
+                    synthesis_result["gateway_context"] = _fanout_metadata(quality_reviewed=True)
                     return synthesis_result
-    synthesis_result["gateway_context"] = {
-        "strategy": strategy,
-        "chunks": len(chunks),
-        "quality_reviewed": False,
-    }
+    synthesis_result["gateway_context"] = _fanout_metadata(quality_reviewed=False)
     return synthesis_result
 
 

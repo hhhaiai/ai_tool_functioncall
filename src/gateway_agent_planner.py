@@ -23,6 +23,7 @@ import uuid
 
 from .gateway_builtin_tools import ToolCall, _workspace_root
 from .gateway_config import _config_env, _gateway_config
+from .gateway_sqlite import secure_sqlite_artifacts, secure_sqlite_connect, set_secure_sqlite_journal_mode
 from .gateway_protocol import (
     _decode_tool_result_content,
     _is_responses_tool_call_type,
@@ -529,19 +530,24 @@ class AgentPlannerStore:
     def __init__(self, path: pathlib.Path | None = None) -> None:
         runtime_dir = pathlib.Path(_config_env("GATEWAY_RUNTIME_DIR", ".gateway_runtime") or ".gateway_runtime")
         self.path = path or runtime_dir / "agent_planner.sqlite3"
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._private_parent = path is None
         self._lock = threading.RLock()
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        con = sqlite3.connect(self.path, timeout=30.0)
+        con = secure_sqlite_connect(
+            self.path,
+            private_parent=self._private_parent,
+            timeout=30.0,
+        )
         con.execute("PRAGMA busy_timeout=30000")
         return con
 
     def _init_db(self) -> None:
         with self._lock:
             with self._connect() as con:
-                con.execute("PRAGMA journal_mode=WAL")
+                con.execute("PRAGMA auto_vacuum=INCREMENTAL")
+                set_secure_sqlite_journal_mode(con, self.path, "WAL")
                 con.execute(
                     """
                     CREATE TABLE IF NOT EXISTS planner_sessions (
@@ -600,6 +606,82 @@ class AgentPlannerStore:
                     "ON runtime_events(event_type, workflow, step, ts DESC)"
                 )
                 self._backfill_index_fields(con)
+
+    def cleanup(
+        self,
+        *,
+        retention_days: int = 30,
+        max_sessions: int = 20_000,
+        max_events: int = 100_000,
+        batch_size: int = 1_000,
+        max_batches: int = 4,
+        incremental_vacuum_pages: int = 256,
+        dry_run: bool = False,
+        now: float | None = None,
+    ) -> Json:
+        """Prune planner state and audit events without long write locks."""
+        cutoff = float(now if now is not None else time.time()) - max(0, int(retention_days)) * 86400
+        batch_size = max(1, min(int(batch_size), 100_000))
+        max_batches = max(1, min(int(max_batches), 100))
+        policies = (
+            ("planner_sessions", "updated_at", max(0, int(max_sessions))),
+            ("runtime_events", "ts", max(0, int(max_events))),
+        )
+        result: Json = {"dry_run": bool(dry_run), "eligible": {}, "deleted": {}}
+        with self._lock:
+            with self._connect() as con:
+                for table, age_column, max_rows in policies:
+                    predicate = (
+                        f"{age_column} < ? OR rowid <= COALESCE("
+                        f"(SELECT rowid FROM {table} ORDER BY rowid DESC LIMIT 1 OFFSET ?), 0)"
+                    )
+                    eligible = int(
+                        con.execute(
+                            f"SELECT COUNT(*) FROM {table} WHERE {predicate}",
+                            (cutoff, max_rows),
+                        ).fetchone()[0]
+                    )
+                    result["eligible"][table] = eligible
+                    deleted = 0
+                    if not dry_run:
+                        for _ in range(max_batches):
+                            before = con.total_changes
+                            con.execute(
+                                f"DELETE FROM {table} WHERE rowid IN ("
+                                f"SELECT rowid FROM {table} WHERE {predicate} ORDER BY rowid LIMIT ?)",
+                                (cutoff, max_rows, batch_size),
+                            )
+                            changed = con.total_changes - before
+                            deleted += changed
+                            con.commit()
+                            if changed < batch_size:
+                                break
+                    result["deleted"][table] = deleted
+                if not dry_run:
+                    checkpoint = con.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+                    result["checkpoint"] = {
+                        "busy": int(checkpoint[0]),
+                        "log_frames": int(checkpoint[1]),
+                        "checkpointed_frames": int(checkpoint[2]),
+                    }
+                    pages = max(0, min(int(incremental_vacuum_pages), 100_000))
+                    if pages:
+                        con.execute(f"PRAGMA incremental_vacuum({pages})")
+                result["rows"] = {
+                    table: int(con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                    for table, _, _ in policies
+                }
+                result["auto_vacuum_mode"] = int(con.execute("PRAGMA auto_vacuum").fetchone()[0])
+        result["space_bytes"] = sum(
+            artifact.stat().st_size
+            for artifact in (
+                self.path,
+                pathlib.Path(f"{self.path}-wal"),
+                pathlib.Path(f"{self.path}-shm"),
+            )
+            if artifact.exists()
+        )
+        return result
 
     def _backfill_index_fields(self, con: sqlite3.Connection, *, limit: int = 5000) -> None:
         rows = con.execute(

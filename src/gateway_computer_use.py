@@ -21,6 +21,8 @@ import sys
 import time
 from typing import Any
 
+from .gateway_file_ops import atomic_write_bytes
+
 Json = dict[str, Any]
 
 # ---------------------------------------------------------------------------
@@ -383,7 +385,7 @@ def _tool_image_generation(args: Json) -> str:
                 data = json.loads(resp.read().decode())
             b64_data = data["data"][0]["b64_json"]
             img_bytes = base64.b64decode(b64_data)
-            out_path.write_bytes(img_bytes)
+            atomic_write_bytes(out_path, img_bytes)
             return json.dumps({
                 "ok": True, "provider": "openai", "path": str(out_path),
                 "size_bytes": len(img_bytes),
@@ -404,7 +406,7 @@ def _tool_image_generation(args: Json) -> str:
             img_bytes = resp.read()
         if len(img_bytes) < 1000:
             raise ValueError(f"Response too small ({len(img_bytes)} bytes), likely error")
-        out_path.write_bytes(img_bytes)
+        atomic_write_bytes(out_path, img_bytes)
         b64_str = base64.b64encode(img_bytes).decode("ascii")
         return json.dumps({
             "ok": True, "provider": "pollinations", "path": str(out_path),
@@ -429,7 +431,7 @@ def _tool_image_generation(args: Json) -> str:
             )
             with _open_image_provider_url(req, timeout=120) as resp:
                 img_bytes = resp.read()
-            out_path.write_bytes(img_bytes)
+            atomic_write_bytes(out_path, img_bytes)
             b64_str = base64.b64encode(img_bytes).decode("ascii")
             return json.dumps({
                 "ok": True, "provider": "huggingface", "path": str(out_path),

@@ -149,7 +149,7 @@ class PermissionManager:
         perm_config = config.get("permissions", {})
 
         self.enabled = perm_config.get("enabled", False)
-        self.default_allow = perm_config.get("default_allow", True)
+        self.default_allow = bool(perm_config.get("default_allow", False))
 
         # Global rules apply to all clients
         self.global_rules: list[PermissionRule] = []
@@ -180,6 +180,27 @@ class PermissionManager:
                 default_allow=client_config.get("default_allow", self.default_allow),
             )
 
+        # Accept legacy permission maps keyed by display name or key hash, but
+        # execute policy checks with the stable downstream key id returned by
+        # HTTP authentication.
+        for item in config.get("downstream_keys") or []:
+            if not isinstance(item, dict):
+                continue
+            stable_id = str(item.get("id") or "")
+            if not stable_id or stable_id in self.clients:
+                continue
+            for legacy_id in (str(item.get("name") or ""), str(item.get("key_hash") or "")):
+                if legacy_id and legacy_id in self.clients:
+                    legacy = self.clients[legacy_id]
+                    self.clients[stable_id] = ClientPermissions(
+                        client_id=stable_id,
+                        rules=list(legacy.rules),
+                        allow_categories=set(legacy.allow_categories),
+                        deny_categories=set(legacy.deny_categories),
+                        default_allow=legacy.default_allow,
+                    )
+                    break
+
     def check_permission(
         self,
         tool_name: str,
@@ -190,7 +211,7 @@ class PermissionManager:
 
         Args:
             tool_name: Name of the tool to execute
-            client_id: Client identifier (downstream key hash)
+            client_id: Stable downstream key id (`downstream_keys[].id`)
 
         Returns:
             (allowed: bool, reason: str)

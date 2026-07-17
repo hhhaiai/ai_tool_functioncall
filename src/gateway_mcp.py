@@ -8,14 +8,30 @@ from __future__ import annotations
 import copy
 import json
 import os
+import pathlib
 import re
 import select
 import subprocess
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .gateway_builtin_tools import GatewayTool
 
 from .gateway_errors import ToolExecutionError
+from .gateway_process_ops import (
+    BoundedProcessStream,
+    process_group_kwargs,
+    terminate_process_group,
+)
+from .gateway_sandbox import (
+    SANDBOX_WORKER_ERROR_PREFIX,
+    SANDBOX_WORKER_SETUP_EXIT,
+    sandbox_child_environment,
+    sandbox_worker_command,
+    workspace_job,
+)
 
 Json = dict[str, Any]
 
@@ -33,14 +49,30 @@ class McpSession:
         self.name = str(server.get("name") or "")
         self.timeout = float(server.get("timeout") or os.environ.get("GATEWAY_MCP_TIMEOUT", "20"))
         self.proc = _mcp_start(server)
+        self.stderr_capture = BoundedProcessStream(_mcp_stderr_limit(server))
+        self.stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self.stderr_thread.start()
         self.lock = threading.Lock()
         self.next_id = 1
         self.last_used_at = time.time()
         try:
             _mcp_initialize(self.proc, server, self.timeout, self._next_id_locked())
-        except Exception:
+        except Exception as exc:
             self.close()
-            raise
+            if isinstance(exc, ToolExecutionError):
+                raise
+            stderr = self.stderr_text().strip()
+            failure_type = (
+                "sandbox_setup_failed"
+                if self.proc.returncode == SANDBOX_WORKER_SETUP_EXIT
+                and stderr.lstrip().startswith(SANDBOX_WORKER_ERROR_PREFIX)
+                else "execution_failed"
+            )
+            detail = stderr if failure_type == "sandbox_setup_failed" else f"{exc.__class__.__name__}: {exc}"
+            raise ToolExecutionError(
+                f"MCP server {self.name or '<unnamed>'} initialization failed: {detail}",
+                failure_type=failure_type,
+            ) from exc
 
     def _next_id_locked(self) -> int:
         request_id = self.next_id
@@ -52,31 +84,95 @@ class McpSession:
             if self.proc.poll() is not None:
                 raise ToolExecutionError(f"MCP server {self.name} exited", failure_type="execution_failed")
             self.last_used_at = time.time()
-            return _mcp_request(
-                self.proc,
-                method,
-                params,
-                request_id=self._next_id_locked(),
-                timeout=self.timeout,
-            )
+            try:
+                return _mcp_request(
+                    self.proc,
+                    method,
+                    params,
+                    request_id=self._next_id_locked(),
+                    timeout=self.timeout,
+                )
+            except Exception as exc:
+                # A timeout/framing failure leaves stdio synchronization
+                # unknown. Never reuse that process for another request.
+                self.close()
+                if isinstance(exc, ToolExecutionError):
+                    raise
+                raise ToolExecutionError(
+                    f"MCP server {self.name or '<unnamed>'} request failed: {exc.__class__.__name__}: {exc}",
+                    failure_type="execution_failed",
+                ) from exc
+
+    def _drain_stderr(self) -> None:
+        pipe = self.proc.stderr
+        if pipe is None:
+            return
+        try:
+            while True:
+                chunk = pipe.read(65_536)
+                if not chunk:
+                    break
+                self.stderr_capture.feed(chunk)
+        finally:
+            try:
+                pipe.close()
+            except Exception:
+                pass
+
+    def stderr_text(self) -> str:
+        return self.stderr_capture.text()
 
     def close(self) -> None:
         proc = self.proc
         try:
-            if proc.poll() is None:
-                proc.terminate()
-                proc.wait(timeout=2)
+            terminate_process_group(proc, timeout=2)
         except Exception:
             try:
                 proc.kill()
             except Exception:
                 pass
+        if hasattr(self, "stderr_thread"):
+            self.stderr_thread.join(timeout=2)
         for pipe in (proc.stdin, proc.stdout, proc.stderr):
             try:
                 if pipe:
                     pipe.close()
             except Exception:
                 pass
+
+
+def _mcp_limits() -> Json:
+    try:
+        from .gateway_config import _gateway_config
+        cfg = _gateway_config().get("mcp") or {}
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+def _positive_limit(value: Any, default: int, *, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(value or default))
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _mcp_header_limit(server: Json | None = None) -> int:
+    cfg = _mcp_limits()
+    value = (server or {}).get("max_header_bytes", cfg.get("max_header_bytes"))
+    return _positive_limit(value, 64 * 1024, minimum=1024)
+
+
+def _mcp_message_limit(server: Json | None = None) -> int:
+    cfg = _mcp_limits()
+    value = (server or {}).get("max_message_bytes", cfg.get("max_message_bytes"))
+    return _positive_limit(value, 16 * 1024 * 1024, minimum=1024)
+
+
+def _mcp_stderr_limit(server: Json | None = None) -> int:
+    cfg = _mcp_limits()
+    value = (server or {}).get("max_stderr_bytes", cfg.get("max_stderr_bytes"))
+    return _positive_limit(value, 256 * 1024, minimum=1024)
 
 
 def _mcp_safe_component(value: str, *, default: str) -> str:
@@ -121,11 +217,8 @@ def _mcp_server_by_name(name: str) -> Json | None:
 
 
 def _mcp_env(server: Json) -> dict[str, str]:
-    env = dict(os.environ)
     server_env = server.get("env") or {}
-    if isinstance(server_env, dict):
-        env.update(server_env)
-    return env
+    return sandbox_child_environment(server_env if isinstance(server_env, dict) else None)
 
 
 def _mcp_command(server: Json) -> list[str]:
@@ -278,14 +371,21 @@ def _mcp_validate_service_file_arguments(server: Json, arguments: Json, *, tool_
 
 def _mcp_write_message(proc: subprocess.Popen, message: Json) -> None:
     data = json.dumps(message, ensure_ascii=False)
-    content = f"Content-Length: {len(data.encode())}\r\n\r\n{data}"
-    proc.stdin.write(content.encode())
+    encoded = data.encode()
+    max_message_bytes = _mcp_message_limit()
+    if len(encoded) > max_message_bytes:
+        raise ToolExecutionError(
+            f"MCP request exceeds message limit ({len(encoded)} > {max_message_bytes} bytes)",
+            failure_type="invalid_input",
+        )
+    content = f"Content-Length: {len(encoded)}\r\n\r\n".encode() + encoded
+    proc.stdin.write(content)
     proc.stdin.flush()
 
 
 def _mcp_read_exact(stream: Any, length: int, timeout: float) -> bytes:
     deadline = time.time() + timeout
-    buf = b""
+    buf = bytearray()
     fd = stream.fileno()
     while len(buf) < length:
         remaining = deadline - time.time()
@@ -296,13 +396,15 @@ def _mcp_read_exact(stream: Any, length: int, timeout: float) -> bytes:
             chunk = os.read(fd, length - len(buf))
             if not chunk:
                 raise EOFError("MCP stream closed")
-            buf += chunk
-    return buf
+            buf.extend(chunk)
+    return bytes(buf)
 
 
 def _mcp_read_message(proc: subprocess.Popen, timeout: float) -> Json:
     deadline = time.time() + timeout
     header = b""
+    max_header_bytes = _mcp_header_limit()
+    max_message_bytes = _mcp_message_limit()
     stdout_fd = proc.stdout.fileno()
     while b"\r\n\r\n" not in header:
         remaining = deadline - time.time()
@@ -314,6 +416,11 @@ def _mcp_read_message(proc: subprocess.Popen, timeout: float) -> Json:
             if not byte:
                 raise EOFError("MCP stream closed")
             header += byte
+            if len(header) > max_header_bytes:
+                raise ToolExecutionError(
+                    f"MCP response header exceeds limit ({max_header_bytes} bytes)",
+                    failure_type="execution_failed",
+                )
     header_str = header.decode("utf-8", errors="replace")
     content_length = 0
     for line in header_str.split("\r\n"):
@@ -321,6 +428,13 @@ def _mcp_read_message(proc: subprocess.Popen, timeout: float) -> Json:
             content_length = int(line.split(":", 1)[1].strip())
     if content_length == 0:
         raise ValueError("Missing Content-Length header")
+    if content_length < 0:
+        raise ValueError("Invalid negative Content-Length header")
+    if content_length > max_message_bytes:
+        raise ToolExecutionError(
+            f"MCP response exceeds message limit ({content_length} > {max_message_bytes} bytes)",
+            failure_type="execution_failed",
+        )
     body = _mcp_read_exact(proc.stdout, content_length, deadline - time.time())
     return json.loads(body.decode("utf-8"))
 
@@ -350,14 +464,26 @@ def _mcp_notify(proc: subprocess.Popen, method: str, params: Json | None = None)
 def _mcp_start(server: Json) -> subprocess.Popen:
     command = _mcp_command(server)
     env = _mcp_env(server)
-    cwd = server.get("cwd") or None
-    return subprocess.Popen(
+    cwd = pathlib.Path(str(server.get("cwd") or os.getcwd())).resolve()
+    job = workspace_job(
         command,
+        cwd,
+        shell=False,
+        timeout_seconds=float(server.get("timeout") or os.environ.get("GATEWAY_MCP_TIMEOUT", "20")),
+        max_output_bytes=_mcp_message_limit(server),
+        writable_paths=tuple(str(path) for path in (server.get("writable_paths") or (".",))),
+        long_lived=True,
+        network_policy=str(server.get("network_policy") or "inherited"),
+    )
+    return subprocess.Popen(
+        sandbox_worker_command(job),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=env,
-        cwd=str(cwd) if cwd else None,
+        cwd=str(cwd),
+        bufsize=0,
+        **process_group_kwargs(),
     )
 
 

@@ -214,8 +214,20 @@ curl http://127.0.0.1:8885/healthz
 | `gateway.client_snippet_api_key` | - | 客户端连接 Gateway 的 API Key；保存配置时会自动同步为可认证的 downstream key |
 | `gateway.client_context_window` | 1048576 | 下游 Claude Code/Codex 配置片段中的上下文窗口；Mimo 按 1M 配置 |
 | `gateway.max_tool_rounds` | 5 | orchestrate 模式最大工具调用轮数；运行时优先使用 `GATEWAY_MAX_TOOL_ROUNDS` 环境变量，其次使用 Admin/配置文件保存值 |
-| `gateway.max_concurrent_requests` | 32 | Gateway 下游 API 请求并发上限；HTTP 入口会先获取并发槽位，超过上限按 `concurrency_queue_timeout_seconds` 等待后返回 429 |
-| `gateway.concurrency_queue_timeout_seconds` | 5.0 | 并发槽位排队等待时间；超时返回 429 |
+| `gateway.max_concurrent_requests` | 32 | Gateway 下游 API 请求并发上限；默认由共享 SQLite lease 在多个 Gateway 进程之间统一执行 |
+| `gateway.concurrency_backend` | sqlite | `sqlite` 为跨进程共享 admission；`memory` 仅适合单进程/测试 |
+| `gateway.concurrency_db_path` | `.gateway_runtime/admission.sqlite3` | 共享 admission lease 数据库路径；多 worker 必须指向同一文件 |
+| `gateway.concurrency_fallback_backend` | none | SQLite 不可用时默认 503 失败关闭；显式设为 `memory` 会降级为进程内边界并在 capabilities/metrics 标记 degraded |
+| `gateway.concurrency_lease_ttl_seconds` | 120 | 请求 lease 失去 heartbeat 后的崩溃回收时间 |
+| `gateway.concurrency_heartbeat_seconds` | 30 | 长请求刷新 lease 的间隔，运行时会限制为小于 TTL 的一半 |
+| `gateway.concurrency_queue_timeout_seconds` | 5.0 | 并发槽位排队等待时间；超时返回 429，并带 backend、active、limit 和 retry-after 详情 |
+
+管理面可观测性：
+
+- `GET /admin/metrics`：Prometheus 格式，包含请求、工具、上游总耗时、流式首事件延迟、共享 admission 和维护容量指标。
+- `GET /admin/traces.json?limit=100`：最近的有界内存 span，只记录归一化路由/协议/工具类别、结果、失败类型和耗时。
+- 所有正常 HTTP 响应带 `x-request-id`；请求、工具和上游 span 使用同一个请求上下文 ID。
+- 不把 prompt、工具参数、原始 URL、tenant/user、API key 或任意 MCP 名称写入指标标签。
 | `gateway.tool_execution_timeout_seconds` | 60.0 | 单次工具执行超时 |
 | `gateway.max_request_body_bytes` | 67108864 | HTTP POST 请求体读取前上限；超限返回 413，避免大请求先占用内存 |
 | `gateway.max_log_payload_chars` | 200000 | 单个 request/response 日志 payload 与 tool failure 内容截断上限；先遮盖敏感字段再截断 |
@@ -239,6 +251,7 @@ curl http://127.0.0.1:8885/healthz
 | `GATEWAY_DOWNSTREAM_KEY` | downstream key + gateway.client_snippet_api_key | 下游 API Key；环境变量会同时用于认证和客户端片段 |
 | `GATEWAY_ADMIN_PASSWORD` | admin.password | 管理员密码 |
 | `GATEWAY_WORKSPACE_ROOT` | request workspace fallback | 显式设置时优先于保存配置 root，但仍低于请求体 root 和下游客户端项目目录；不设置时不会使用 Gateway 服务 cwd 作为用户项目目录 |
+| `GATEWAY_ADMIN_SKILLS_ROOT` | service-wide Admin Skill catalog | Admin 创建/安装的服务级 Skill 目录；宿主机默认为 `<Gateway cwd>/skills`，Compose 默认为持久卷 `/app/data/skills`；加载优先级低于当前项目 Skill |
 | `GATEWAY_SKILLS_DIRS` | Skill tool search path | 额外 skills 目录，使用 `:` 分隔；加载顺序在当前下游项目 skills、项目内插件 skills、用户全局 skills 之后 |
 | `GATEWAY_PORT` | - | 监听端口（默认 8885） |
 | `GATEWAY_HOST` | - | 监听地址（默认 0.0.0.0） |
@@ -373,11 +386,8 @@ curl -u admin:admin -X POST http://127.0.0.1:8885/api/cache/clear
 # 智力增强状态
 curl -u admin:admin http://127.0.0.1:8885/api/intelligence/status
 
-# Web2API 提取
-curl -H "Authorization: Bearer your-gateway-api-key" \
-  -H "Content-Type: application/json" \
-  -d '{"url":"https://example.com","mode":"auto"}' \
-  http://127.0.0.1:8885/api/web2api
+# 查看当前真实能力边界
+curl http://127.0.0.1:8885/capabilities
 
 # 更新配置
 curl -u admin:admin -X POST \
@@ -385,6 +395,8 @@ curl -u admin:admin -X POST \
   -d '{"cache":{"enabled":false}}' \
   http://127.0.0.1:8885/api/config/update
 ```
+
+`src/gateway_web2api.py` 当前是独立模块/测试能力，没有接入生产 HTTP Handler；`/api/web2api` 不是受支持路由。若未来决定接入，必须同时纳入下游认证、共享限流、请求准入、SSRF/重定向防护、响应大小限制和观测门禁。当前状态以 `/capabilities` 返回的 `web2api_module` 字段为准。
 
 ### 5.5 运行测试套件
 
@@ -611,6 +623,8 @@ Group=gateway
 WorkingDirectory=/opt/ai-tool-functioncall
 Environment=GATEWAY_PORT=8885
 Environment=GATEWAY_HOST=0.0.0.0
+Environment=GATEWAY_PUBLIC_EXPOSURE=external
+# Also provide a non-default GATEWAY_ADMIN_PASSWORD and GATEWAY_DOWNSTREAM_KEY.
 ExecStart=/usr/bin/python3 src/toolcall_gateway.py --host 0.0.0.0 --port 8885
 Restart=always
 RestartSec=5
@@ -641,6 +655,9 @@ RUN cp gateway.config.json .gateway_service.json
 EXPOSE 8885
 
 CMD ["python3", "src/toolcall_gateway.py", "--host", "0.0.0.0", "--port", "8885"]
+# Non-loopback container listeners require GATEWAY_PUBLIC_EXPOSURE=external
+# with a non-default Admin password and at least one downstream API key, unless
+# a loopback-only publication explicitly declares the private contract.
 ```
 
 ```bash

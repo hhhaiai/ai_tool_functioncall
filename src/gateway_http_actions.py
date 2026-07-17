@@ -133,7 +133,12 @@ def _action_bool(action: Json, name: str) -> bool:
     return False
 
 
-def _validate_action_url(url: str, action: Json | None = None) -> None:
+def _validate_action_url(
+    url: str,
+    action: Json | None = None,
+    *,
+    resolve_dns: bool = True,
+) -> None:
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ToolExecutionError("HTTP action url must be absolute http(s)", failure_type="invalid_input")
@@ -145,7 +150,8 @@ def _validate_action_url(url: str, action: Json | None = None) -> None:
     try:
         ip = ipaddress.ip_address(hostname)
     except ValueError:
-        _validate_action_dns_targets(hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
+        if resolve_dns:
+            _validate_action_dns_targets(hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
     else:
         _validate_action_ip_target(ip)
 
@@ -194,6 +200,11 @@ def _action_max_bytes(action: Json) -> int:
     return max(1, value)
 
 
+def _action_method_is_idempotent(action: Json) -> bool:
+    method = str(action.get("method") or "POST").upper()
+    return method in {"GET", "HEAD", "OPTIONS", "PUT", "DELETE"}
+
+
 def _read_limited_response(resp: Any, max_bytes: int) -> str:
     data = resp.read(max_bytes + 1)
     if len(data) > max_bytes:
@@ -230,9 +241,17 @@ def _call_http_action(action: Json, arguments: Json) -> str:
             raise
         except Exception:
             pass
-        raise ToolExecutionError(f"HTTP {e.code}: {detail}", failure_type="http_action_failed") from e
+        raise ToolExecutionError(
+            f"HTTP {e.code}: {detail}",
+            failure_type="http_action_failed",
+            retryable=_action_method_is_idempotent(action) and e.code in {429, 502, 503, 504},
+        ) from e
     except urllib.error.URLError as e:
-        raise ToolExecutionError(str(e.reason), failure_type="http_action_failed") from e
+        raise ToolExecutionError(
+            str(e.reason),
+            failure_type="http_action_failed",
+            retryable=_action_method_is_idempotent(action),
+        ) from e
     except ToolExecutionError:
         raise
     except Exception as e:

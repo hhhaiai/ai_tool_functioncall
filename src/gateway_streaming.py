@@ -502,18 +502,53 @@ def _run_streaming_orchestration_scoped(
     # model.  _convert_request_to_upstream strips gateway_context and other
     # Gateway-only routing fields from the actual upstream payload.
     response_context_body = request_body
+    tool_authority_requested = (
+        bool(memory_body.get("tools"))
+        or memory_body.get("tool_choice") not in (None, "", "none")
+    )
     upstream_path, request_body = _convert_request_to_upstream(path, request_body, upstream_protocol)
-    # The gateway is responsible for emitting downstream SSE in orchestrate
-    # mode. Keep the upstream request non-streaming unless passthrough is used.
+    # Keep a reusable non-streaming body for tool-result append helpers. The
+    # production NativeProxyClient.stream() copies it and sets stream=true for
+    # each upstream round; legacy/fake clients still use forward().
     request_body = dict(request_body)
     request_body["stream"] = False
 
     tools_stripped = False
     original_tools = list(request_body.get("tools") or [])
     for _round in range(max_rounds):
+        use_upstream_stream = hasattr(upstream, "stream") and bool(getattr(upstream, "supports_streaming", True))
+        round_allows_tools = (
+            tool_authority_requested
+            or bool(request_body.get("tools"))
+            or request_body.get("tool_choice") not in (None, "", "none")
+        )
+        immediate_stream = (
+            use_upstream_stream
+            and not round_allows_tools
+            and not _weak_upstream_text_tools_active(mode)
+            and not _chat_only_synthesis_active(response_context_body)
+        )
+        emitter = _DownstreamDeltaEmitter(handler, path, source_path=upstream_path) if immediate_stream else None
         try:
-            response = upstream.forward(upstream_path, request_body)
+            if use_upstream_stream:
+                from .gateway_stream_state import UpstreamResponseAccumulator
+                accumulator = UpstreamResponseAccumulator(upstream_path)
+                stream_iterator = upstream.stream(upstream_path, request_body)
+                try:
+                    for stream_event in stream_iterator:
+                        for delta in accumulator.feed(stream_event.event, stream_event.data):
+                            if emitter is not None:
+                                emitter.emit(delta, accumulator.metadata())
+                finally:
+                    close_stream = getattr(stream_iterator, "close", None)
+                    if callable(close_stream):
+                        close_stream()
+                response = accumulator.finalize()
+            else:
+                response = upstream.forward(upstream_path, request_body)
         except Exception as exc:
+            if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+                raise
             from .gateway_errors import UpstreamHTTPError
             if isinstance(exc, UpstreamHTTPError) and exc.upstream_status == 400 and not tools_stripped and request_body.get("tools"):
                 from .gateway_protocol import _inject_tools_as_text_prompt, _without_tools
@@ -541,19 +576,29 @@ def _run_streaming_orchestration_scoped(
             _remember_conversation_turn(path, body, downstream_response)
             return
         calls = _extract_tool_calls(path, downstream_response)
+        if calls and not round_allows_tools:
+            # Never grant tool authority merely because an upstream emitted an
+            # unsolicited tool object. If text was already sent it cannot be
+            # replaced safely, so terminate the stream explicitly.
+            if emitter is not None and emitter.emitted:
+                _write_sse(handler, {"error": "upstream emitted an unauthorized tool call after streaming text"}, event="error")
+                _write_sse(handler, "[DONE]", event="done")
+                return
+            calls = []
         text_fallback = False
-        if not calls:
+        if not calls and round_allows_tools:
             calls = _extract_text_tool_calls(path, downstream_response)
             text_fallback = bool(calls)
             if text_fallback:
                 calls = _adapt_text_calls_for_declared_downstream_tools(memory_body, calls)
-        if not calls and _round == 0:
+        if not calls and _round == 0 and round_allows_tools:
             calls = _detect_intent_tool_calls(path, downstream_response, body)
             text_fallback = bool(calls)
 
         if not calls:
             downstream_response = _attach_request_gateway_context(downstream_response, response_context_body)
-            _stream_final_response(handler, path, downstream_response)
+            if emitter is None or not emitter.finish(downstream_response):
+                _stream_final_response(handler, path, downstream_response)
             _remember_conversation_turn(path, body, downstream_response)
             return
 
@@ -751,19 +796,16 @@ def _merge_builtin_tools(path: str, body: dict) -> dict:
         or bool(gateway_context.get("had_tools"))
     )
 
-    if _should_use_text_tool_adapter(tools_enabled, native_capable) and not caller_requested_tools:
-        # Check if user message indicates tool usage intent (e.g., "analyze project", "read file")
-        # If so, inject tools even if downstream didn't explicitly request them
+    if not caller_requested_tools:
+        # Plain chat must stay plain for both native and adapter upstreams.
+        # Implicit Gateway tools require an explicit client capability plus a
+        # concrete tool intent; otherwise every request gains unnecessary tool
+        # authority and true safe token streaming is impossible.
         if not (_client_can_handle_implicit_tools(body) and _user_message_needs_tools(body)):
-            # Plain chat requests should stay plain.  The gateway only downgrades
-            # tool schemas into text adapter instructions when the downstream
-            # actually requested tools/tool_choice; otherwise every weak-upstream
-            # request gets polluted with a large tool manual and simple messages no
-            # longer reach upstream intact.
             body.pop("tools", None)
             body.pop("tool_choice", None)
             return body
-        _logger.debug("Tool-capable client message detected as needing tools; injecting adapter")
+        _logger.debug("Tool-capable client message detected as needing implicit Gateway tools")
 
     # Add builtin tools
     for tool in BUILTIN_TOOLS.values():
@@ -795,33 +837,41 @@ def _merge_builtin_tools(path: str, body: dict) -> dict:
 
 
 def _stream_upstream_passthrough(handler: Any, path: str, body: dict) -> None:
-    """Stream response directly from upstream."""
+    """Stream response directly from upstream through the bounded transport."""
     from .gateway_proxy import NativeProxyClient
     from .gateway_protocol import _convert_request_to_upstream
-    import urllib.request
-    import json
 
     client = NativeProxyClient()
     upstream_path, upstream_body = _convert_request_to_upstream(path, body, client.protocol)
-    url = client._url(upstream_path)
-    headers = client._headers()
-    data = json.dumps(upstream_body, ensure_ascii=False).encode("utf-8")
-
-    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    stream_iterator = client.stream(upstream_path, upstream_body)
     try:
-        with urllib.request.urlopen(req, timeout=client.timeout) as resp:
-            if "/messages" in path:
-                for block in _iter_normalized_anthropic_sse_blocks(resp):
-                    handler.wfile.write(block)
-                    handler.wfile.flush()
-            else:
-                for line in resp:
-                    handler.wfile.write(line)
-                    handler.wfile.flush()
+        for stream_event in stream_iterator:
+            if stream_event.data == "[DONE]":
+                continue
+            if "/messages" in path and client.protocol == "anthropic_messages":
+                try:
+                    payload = json.loads(stream_event.data)
+                except json.JSONDecodeError:
+                    payload = None
+                if isinstance(payload, dict):
+                    block = _format_sse_block(stream_event.event, payload)
+                    for normalized in _normalize_anthropic_sse_block(block):
+                        handler.wfile.write(normalized)
+                        handler.wfile.flush()
+                    continue
+            _write_sse(handler, stream_event.data, event=stream_event.event)
+    except (BrokenPipeError, ConnectionResetError):
+        raise
     except Exception as exc:
         _write_sse(handler, {"error": str(exc)}, event="error")
     finally:
-        _write_sse(handler, "[DONE]", event="done")
+        close_stream = getattr(stream_iterator, "close", None)
+        if callable(close_stream):
+            close_stream()
+        try:
+            _write_sse(handler, "[DONE]", event="done")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
 
 def _format_sse_block(event: str | None, payload: dict) -> bytes:
@@ -933,6 +983,246 @@ def _attach_stream_gateway_context(payload: dict, gateway_context: dict | None) 
     updated = dict(payload)
     updated["gateway_context"] = gateway_context
     return updated
+
+
+class _DownstreamDeltaEmitter:
+    """Encode safe canonical text/reasoning deltas into downstream SSE."""
+
+    def __init__(self, handler: Any, path: str, *, source_path: str | None = None) -> None:
+        self.handler = handler
+        self.path = path
+        self.source_path = source_path or path
+        self.emitted = False
+        self.started = False
+        self.response_id = ""
+        self.model = ""
+        self._chat_started: set[int] = set()
+        self._chat_text: dict[int, list[str]] = {}
+        self._chat_reasoning: dict[int, list[str]] = {}
+        self._anthropic_block_kind: str | None = None
+        self._anthropic_block_index = -1
+        self._anthropic_source_index: int | None = None
+        self._responses_item_ids: dict[int, str] = {}
+        self._responses_parts: dict[tuple[int, int], list[str]] = {}
+
+    def _update_metadata(self, metadata: dict) -> None:
+        self.response_id = str(metadata.get("id") or self.response_id)
+        self.model = str(metadata.get("model") or self.model)
+
+    def emit(self, delta: Any, metadata: dict) -> None:
+        text = str(getattr(delta, "text", "") or "")
+        kind = str(getattr(delta, "kind", "text") or "text")
+        if not text:
+            return
+        self._update_metadata(metadata)
+        raw_index = int(getattr(delta, "index", 0) or 0)
+        content_index = int(getattr(delta, "content_index", 0) or 0)
+        if "/chat/completions" in self.path:
+            choice_index = raw_index if "/chat/completions" in self.source_path else 0
+            self._emit_chat(kind, text, choice_index)
+        elif "/messages" in self.path:
+            source_index = raw_index if "/messages" in self.source_path else 0
+            self._emit_anthropic(kind, text, metadata, source_index)
+        elif "/responses" in self.path:
+            if kind == "text":
+                output_index = raw_index if "/responses" in self.source_path else 0
+                response_content_index = content_index if "/responses" in self.source_path else 0
+                self._emit_responses_text(text, metadata, output_index, response_content_index)
+
+    def _emit_chat(self, kind: str, text: str, choice_index: int) -> None:
+        response_id = self.response_id or f"chatcmpl_gateway_{uuid.uuid4().hex}"
+        self.response_id = response_id
+        if choice_index not in self._chat_started:
+            _write_sse(self.handler, {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "model": self.model,
+                "choices": [{"index": choice_index, "delta": {"role": "assistant"}, "finish_reason": None}],
+            })
+            self._chat_started.add(choice_index)
+            self.started = True
+        target = self._chat_reasoning if kind == "reasoning" else self._chat_text
+        target.setdefault(choice_index, []).append(text)
+        field = "reasoning" if kind == "reasoning" else "content"
+        _write_sse(self.handler, {
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "model": self.model,
+            "choices": [{"index": choice_index, "delta": {field: text}, "finish_reason": None}],
+        })
+        self.emitted = True
+
+    def _close_anthropic_block(self) -> None:
+        if self._anthropic_block_kind is None:
+            return
+        _write_sse(self.handler, {
+            "type": "content_block_stop",
+            "index": self._anthropic_block_index,
+        }, event="content_block_stop")
+        self._anthropic_block_kind = None
+        self._anthropic_source_index = None
+
+    def _emit_anthropic(self, kind: str, text: str, metadata: dict, source_index: int) -> None:
+        if not self.started:
+            usage = metadata.get("usage") if isinstance(metadata.get("usage"), dict) else {}
+            _write_sse(self.handler, {
+                "type": "message_start",
+                "message": {
+                    "id": self.response_id or f"msg_{uuid.uuid4().hex}",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": self.model,
+                    "content": [],
+                    "usage": {"input_tokens": int(usage.get("input_tokens") or 0), "output_tokens": 0},
+                },
+            }, event="message_start")
+            self.started = True
+        block_kind = "thinking" if kind == "reasoning" else "text"
+        if self._anthropic_block_kind != block_kind or self._anthropic_source_index != source_index:
+            self._close_anthropic_block()
+            self._anthropic_block_index += 1
+            content_block = {"type": "thinking", "thinking": ""} if block_kind == "thinking" else {"type": "text", "text": ""}
+            _write_sse(self.handler, {
+                "type": "content_block_start",
+                "index": self._anthropic_block_index,
+                "content_block": content_block,
+            }, event="content_block_start")
+            self._anthropic_block_kind = block_kind
+            self._anthropic_source_index = source_index
+        delta_payload = (
+            {"type": "thinking_delta", "thinking": text}
+            if block_kind == "thinking"
+            else {"type": "text_delta", "text": text}
+        )
+        _write_sse(self.handler, {
+            "type": "content_block_delta",
+            "index": self._anthropic_block_index,
+            "delta": delta_payload,
+        }, event="content_block_delta")
+        self.emitted = True
+
+    def _emit_responses_text(self, text: str, metadata: dict, output_index: int, content_index: int) -> None:
+        if not self.started:
+            response_id = self.response_id or f"resp_gateway_{uuid.uuid4().hex}"
+            self.response_id = response_id
+            response_base = {
+                "id": response_id,
+                "object": "response",
+                "created_at": int(metadata.get("created_at") or time.time()),
+                "status": "in_progress",
+                "model": self.model,
+                "output": [],
+            }
+            _write_sse(self.handler, {"type": "response.created", "response": response_base}, event="response.created")
+            _write_sse(self.handler, {"type": "response.in_progress", "response": response_base}, event="response.in_progress")
+            self.started = True
+        if output_index not in self._responses_item_ids:
+            self._responses_item_ids[output_index] = f"msg_{uuid.uuid4().hex}"
+            item_id = self._responses_item_ids[output_index]
+            _write_sse(self.handler, {
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {"id": item_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []},
+            }, event="response.output_item.added")
+        else:
+            item_id = self._responses_item_ids[output_index]
+        part_key = (output_index, content_index)
+        if part_key not in self._responses_parts:
+            self._responses_parts[part_key] = []
+            _write_sse(self.handler, {
+                "type": "response.content_part.added",
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": content_index,
+                "part": {"type": "output_text", "text": "", "annotations": []},
+            }, event="response.content_part.added")
+        self._responses_parts[part_key].append(text)
+        _write_sse(self.handler, {
+            "type": "response.output_text.delta",
+            "item_id": item_id,
+            "output_index": output_index,
+            "content_index": content_index,
+            "delta": text,
+        }, event="response.output_text.delta")
+        self.emitted = True
+
+    def finish(self, response: dict) -> bool:
+        if not self.emitted:
+            return False
+        gateway_context = _stream_gateway_context(response)
+        if "/chat/completions" in self.path:
+            final_choices = {
+                int(choice.get("index") or 0): str(choice.get("finish_reason") or "stop")
+                for choice in response.get("choices") or []
+                if isinstance(choice, dict)
+            }
+            for position, choice_index in enumerate(sorted(self._chat_started)):
+                terminal = {
+                    "id": self.response_id or response.get("id", ""),
+                    "object": "chat.completion.chunk",
+                    "model": self.model or response.get("model", ""),
+                    "choices": [{"index": choice_index, "delta": {}, "finish_reason": final_choices.get(choice_index, "stop")}],
+                }
+                _write_sse(
+                    self.handler,
+                    _attach_stream_gateway_context(terminal, gateway_context if position == len(self._chat_started) - 1 else None),
+                )
+        elif "/messages" in self.path:
+            self._close_anthropic_block()
+            usage = response.get("usage") if isinstance(response.get("usage"), dict) else {}
+            _write_sse(self.handler, _attach_stream_gateway_context({
+                "type": "message_delta",
+                "delta": {"stop_reason": response.get("stop_reason") or "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": int(usage.get("output_tokens") or 0)},
+            }, gateway_context), event="message_delta")
+            _write_sse(self.handler, {"type": "message_stop"}, event="message_stop")
+        elif "/responses" in self.path:
+            completed_output = []
+            for output_index, item_id in sorted(self._responses_item_ids.items()):
+                completed_content = []
+                for (part_output_index, content_index), pieces in sorted(self._responses_parts.items()):
+                    if part_output_index != output_index:
+                        continue
+                    text = "".join(pieces)
+                    completed_part = {"type": "output_text", "text": text, "annotations": []}
+                    _write_sse(self.handler, {
+                        "type": "response.output_text.done",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": content_index,
+                        "text": text,
+                    }, event="response.output_text.done")
+                    _write_sse(self.handler, {
+                        "type": "response.content_part.done",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": content_index,
+                        "part": completed_part,
+                    }, event="response.content_part.done")
+                    completed_content.append(completed_part)
+                completed_item = {
+                    "id": item_id,
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": completed_content,
+                }
+                _write_sse(self.handler, {
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": completed_item,
+                }, event="response.output_item.done")
+                completed_output.append(completed_item)
+            completed_response = dict(response)
+            completed_response["output"] = completed_output
+            if gateway_context:
+                completed_response["gateway_context"] = gateway_context
+            _write_sse(self.handler, {
+                "type": "response.completed",
+                "response": completed_response,
+            }, event="response.completed")
+        _write_sse(self.handler, "[DONE]", event="done")
+        return True
 
 
 def _stream_final_response(handler: Any, path: str, response: dict) -> None:
@@ -1271,10 +1561,13 @@ def _streaming_tool_event_for_path(
 
 def _send_sse_headers(handler: Any) -> None:
     """Send SSE response headers."""
+    from .gateway_http_security import send_cors_headers
+
     handler.send_response(200)
     handler.send_header("Content-Type", "text/event-stream")
     handler.send_header("Cache-Control", "no-cache")
     handler.send_header("X-Accel-Buffering", "no")
+    send_cors_headers(handler)
     handler.end_headers()
 
 

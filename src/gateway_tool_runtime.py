@@ -16,6 +16,7 @@ import re
 import shlex
 import subprocess
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler
@@ -84,6 +85,7 @@ from .gateway_protocol import (
     _without_tools,
 )
 from .gateway_proxy import NativeProxyClient
+from .gateway_request_admission import _acquire_request_slot, _request_slot_scope
 from .gateway_streaming import _merge_builtin_tools
 
 Json = dict[str, Any]
@@ -91,9 +93,6 @@ Json = dict[str, Any]
 DEFAULT_MAX_TOOL_ROUNDS = 5
 
 # Concurrency control globals
-_REQUEST_SEMAPHORE_LOCK = threading.Lock()
-_REQUEST_SEMAPHORE: threading.BoundedSemaphore | None = None
-_REQUEST_SEMAPHORE_SIZE: int = 0
 
 # Path-like regex for cleaning text tool paths
 _PATHISH_RE = re.compile(
@@ -266,48 +265,11 @@ def _fallback_response(path: str, text: str, *, status_note: str = "gateway_fall
     }
 
 
-def _acquire_request_slot() -> threading.BoundedSemaphore | None:
-    """Acquire a concurrency slot for request processing."""
-    global _REQUEST_SEMAPHORE, _REQUEST_SEMAPHORE_SIZE
-    gateway = _gateway_config()
-    try:
-        limit = int(gateway.get("max_concurrent_requests") or 0)
-    except (TypeError, ValueError):
-        limit = 0
-    if limit <= 0:
-        return None
-    with _REQUEST_SEMAPHORE_LOCK:
-        if _REQUEST_SEMAPHORE is None or _REQUEST_SEMAPHORE_SIZE != limit:
-            _REQUEST_SEMAPHORE = threading.BoundedSemaphore(limit)
-            _REQUEST_SEMAPHORE_SIZE = limit
-        sem = _REQUEST_SEMAPHORE
-    try:
-        timeout = float(gateway.get("concurrency_queue_timeout_seconds") or 0)
-    except (TypeError, ValueError):
-        timeout = 0.0
-    ok = sem.acquire(timeout=timeout) if timeout > 0 else sem.acquire(blocking=False)
-    if not ok:
-        from .gateway_errors import GatewayBusyError
-        raise GatewayBusyError(f"gateway concurrency limit reached ({limit})")
-    return sem
-
-
-@contextmanager
-def _request_slot_scope():
-    """Acquire and always release the configured HTTP request concurrency slot."""
-    sem = _acquire_request_slot()
-    try:
-        yield
-    finally:
-        if sem is not None:
-            sem.release()
-
-
 def _get_marketplace():
     """Lazy import for marketplace to avoid circular imports."""
     if not hasattr(_get_marketplace, '_cache'):
         try:
-            from marketplace import list_mcp_marketplace
+            from .marketplace import list_mcp_marketplace
             _get_marketplace._cache = list_mcp_marketplace
         except Exception:
             _get_marketplace._cache = lambda: []
@@ -539,8 +501,13 @@ def _create_anonymous_workspace(body: Json) -> pathlib.Path:
         # opaque namespace component; never resolve it against the Gateway cwd.
         workspace_id = f"{workspace_id}-{workspace_hint_part}"
 
-    # Create isolated workspace under .gateway_runtime/anonymous_spaces/
-    base_dir = pathlib.Path.home() / ".gateway_runtime" / "anonymous_spaces"
+    # Keep anonymous remote-client namespaces under the configured runtime
+    # directory. Container deployments point this at their persistent data
+    # volume; local installs retain the historical ~/.gateway_runtime default.
+    runtime_dir = pathlib.Path(
+        _config_env("GATEWAY_RUNTIME_DIR", str(pathlib.Path.home() / ".gateway_runtime"))
+    )
+    base_dir = runtime_dir / "anonymous_spaces"
     base_dir.mkdir(parents=True, exist_ok=True)
 
     workspace_dir = base_dir / workspace_id
@@ -3688,7 +3655,50 @@ def _apply_local_planner_context(path: str, body: Json) -> Json:
 
 
 
-def _execute_tool_call(call: ToolCall, provider: str | None = None, client_id: str | None = None) -> ToolResult:
+_WORKSPACE_MUTATING_TOOL_RISKS = frozenset({"write_local", "execute_code"})
+
+
+def _tool_may_mutate_workspace(tool: Any) -> bool:
+    return bool(tool and str(getattr(tool, "risk", "")) in _WORKSPACE_MUTATING_TOOL_RISKS)
+
+
+def _invalidate_tool_cache_scope(
+    tool_cache: Any,
+    workspace_cache_key: str,
+    runtime_cache_key: str,
+) -> None:
+    if not tool_cache or not workspace_cache_key or not runtime_cache_key:
+        return
+    try:
+        tool_cache.invalidate_scope(workspace_cache_key, runtime_cache_key)
+    except Exception as exc:
+        _logger.warning("Failed to invalidate tool cache scope after mutation: %s", exc)
+
+
+def _record_failed_tool_result(
+    call: ToolCall,
+    result: ToolResult,
+    *,
+    started_at: float,
+    retry_count: int,
+    provider: str,
+) -> ToolResult:
+    failure_type = str(result.failure_type or "execution_failed")
+    _record_tool_failure(
+        tool_name=call.name,
+        call_id=call.call_id,
+        failure_type=failure_type,
+        arguments_keys=sorted(call.arguments.keys()),
+        content=result.content if result.content else "",
+        execution_ms=time.time() - started_at,
+        retry_count=max(0, int(retry_count)),
+        provider=provider,
+    )
+    _record_tool_stat(call.name, False, failure_type)
+    return result
+
+
+def _execute_tool_call_impl(call: ToolCall, provider: str | None = None, client_id: str | None = None) -> ToolResult:
     import time as _time
     _start = _time.time()
     original_name = call.name
@@ -3722,7 +3732,11 @@ def _execute_tool_call(call: ToolCall, provider: str | None = None, client_id: s
     mcp_target = None if tool else _mcp_parse_public_name(call.name)
     http_action = None if tool or mcp_target else (_http_action_by_name(call.name) or _http_action_by_name(original_name))
     cfg = _gateway_config() if callable(_gateway_config) else _gateway_config
-    max_retries = cfg.get("tool_max_retries", 1) if isinstance(cfg, dict) else 1
+    raw_max_retries = cfg.get("tool_max_retries", 1) if isinstance(cfg, dict) else 1
+    try:
+        max_retries = max(0, int(raw_max_retries))
+    except (TypeError, ValueError):
+        max_retries = 1
     if http_action:
         try:
             max_retries = int(http_action.get("max_retries", 0) or 0)
@@ -3737,10 +3751,13 @@ def _execute_tool_call(call: ToolCall, provider: str | None = None, client_id: s
     # are different operations for different remote tenants/sessions/workspaces.
     _tool_cache = None
     _tool_cache_arguments = call.arguments
+    workspace_cache_key = ""
+    runtime_cache_key = ""
+    tool_cache_allowed = True
     try:
         from .gateway_cache import get_tool_result_cache
         _tool_cache = get_tool_result_cache()
-        if tool and _tool_cache.is_cacheable(call.name):
+        if tool:
             try:
                 workspace_cache_key = str(_workspace_root())
             except Exception:
@@ -3748,8 +3765,10 @@ def _execute_tool_call(call: ToolCall, provider: str | None = None, client_id: s
             try:
                 from . import gateway_builtin_tools as _bt
                 runtime_cache_key = _bt._runtime_scope_key()
+                tool_cache_allowed = not _bt._scope_has_active_exec_sessions()
             except Exception:
                 runtime_cache_key = "runtime:unavailable"
+        if tool and tool_cache_allowed and _tool_cache.is_cacheable(call.name):
             _tool_cache_arguments = dict(call.arguments)
             _tool_cache_arguments["__gateway_workspace_cache_key"] = workspace_cache_key
             _tool_cache_arguments["__gateway_runtime_cache_key"] = runtime_cache_key
@@ -3761,6 +3780,7 @@ def _execute_tool_call(call: ToolCall, provider: str | None = None, client_id: s
 
     last_exc: Exception | None = None
     last_result: ToolResult | None = None
+    mutates_workspace = _tool_may_mutate_workspace(tool)
     for attempt in range(max_retries + 1):
         try:
             if mcp_target:
@@ -3772,18 +3792,13 @@ def _execute_tool_call(call: ToolCall, provider: str | None = None, client_id: s
                         content=f"connector_required: MCP server {server_name} is not configured or enabled",
                         success=False, failure_type="connector_required",
                     )
-                    _record_tool_failure(
-                        tool_name=call.name,
-                        call_id=call.call_id,
-                        failure_type="connector_required",
-                        arguments_keys=sorted(call.arguments.keys()),
-                        content=result.content if result.content else "",
-                        execution_ms=_time.time()-_start,
+                    return _record_failed_tool_result(
+                        call,
+                        result,
+                        started_at=_start,
                         retry_count=attempt,
                         provider=provider,
                     )
-                    _record_tool_stat(call.name, False, "connector_required")
-                    return result
                 content = _mcp_call_tool(server, mcp_tool_name, call.arguments)
                 _record_tool_stat(call.name, True)
                 return ToolResult(call_id=call.call_id, name=call.name, content=content, success=True)
@@ -3797,33 +3812,37 @@ def _execute_tool_call(call: ToolCall, provider: str | None = None, client_id: s
                     content=f"ToolNotFound: {call.name} is not implemented or installed in Gateway runtime",
                     success=False, failure_type="tool_not_found",
                 )
-                _record_tool_failure(
-                    tool_name=call.name,
-                    call_id=call.call_id,
-                    failure_type="tool_not_found",
-                    arguments_keys=sorted(call.arguments.keys()),
-                    content=result.content if result.content else "",
-                    execution_ms=_time.time()-_start,
+                return _record_failed_tool_result(
+                    call,
+                    result,
+                    started_at=_start,
                     retry_count=attempt,
                     provider=provider,
                 )
-                _record_tool_stat(call.name, False, "tool_not_found")
-                return result
             content = tool.handler(call.arguments)
+            if mutates_workspace:
+                _invalidate_tool_cache_scope(_tool_cache, workspace_cache_key, runtime_cache_key)
             _record_tool_stat(call.name, True)
             # Store in tool result cache for cacheable tools
             try:
-                if _tool_cache and _tool_cache.is_cacheable(call.name):
+                if _tool_cache and tool_cache_allowed and _tool_cache.is_cacheable(call.name):
                     _tool_cache.put(call.name, _tool_cache_arguments, content)
             except Exception:
                 pass
             return ToolResult(call_id=call.call_id, name=call.name, content=content, success=True)
         except (ToolExecutionError, subprocess.TimeoutExpired) as exc:
             last_exc = exc
+            if mutates_workspace:
+                _invalidate_tool_cache_scope(_tool_cache, workspace_cache_key, runtime_cache_key)
             if isinstance(exc, subprocess.TimeoutExpired):
+                timeout_parts = [f"timeout: tool execution exceeded {exc.timeout}s"]
+                if exc.output:
+                    timeout_parts.append(f"stdout:\n{exc.output}")
+                if exc.stderr:
+                    timeout_parts.append(f"stderr:\n{exc.stderr}")
                 last_result = ToolResult(
                     call_id=call.call_id, name=call.name,
-                    content=f"timeout: tool execution exceeded {exc.timeout}s",
+                    content="\n".join(timeout_parts),
                     success=False, failure_type="timeout",
                 )
             elif isinstance(exc, ToolExecutionError):
@@ -3832,29 +3851,86 @@ def _execute_tool_call(call: ToolCall, provider: str | None = None, client_id: s
                     content=f"{exc.failure_type}: {exc}",
                     success=False, failure_type=exc.failure_type,
                 )
+            retryable = bool(isinstance(exc, ToolExecutionError) and getattr(exc, "retryable", False))
+            if not retryable or attempt >= max_retries:
+                return _record_failed_tool_result(
+                    call,
+                    last_result,
+                    started_at=_start,
+                    retry_count=attempt,
+                    provider=provider,
+                )
         except Exception as exc:
             # Non-transient error — do not retry
             _logger.warning("Tool %s failed with non-transient error: %s", call.name, exc)
-            return ToolResult(
+            if mutates_workspace:
+                _invalidate_tool_cache_scope(_tool_cache, workspace_cache_key, runtime_cache_key)
+            result = ToolResult(
                 call_id=call.call_id, name=call.name,
                 content=f"execution_failed: {exc}",
                 success=False, failure_type="execution_failed",
             )
-            # transient failure — retry if attempts remain
+            return _record_failed_tool_result(
+                call,
+                result,
+                started_at=_start,
+                retry_count=attempt,
+                provider=provider,
+            )
     # All attempts exhausted
-    failure_type = getattr(last_exc, "failure_type", "execution_failed") if last_exc and isinstance(last_exc, ToolExecutionError) else getattr(last_result, "failure_type", "execution_failed") if last_result else "execution_failed"
-    _record_tool_failure(
-        tool_name=call.name,
-        call_id=call.call_id,
-        failure_type=failure_type,
-        arguments_keys=sorted(call.arguments.keys()),
-        content=last_result.content if last_result and last_result.content else "",
-        execution_ms=_time.time()-_start,
+    if last_result is None:
+        last_result = ToolResult(
+            call_id=call.call_id,
+            name=call.name,
+            content=f"execution_failed: {last_exc or 'tool execution failed'}",
+            success=False,
+            failure_type="execution_failed",
+        )
+    return _record_failed_tool_result(
+        call,
+        last_result,
+        started_at=_start,
         retry_count=max_retries,
         provider=provider,
     )
-    _record_tool_stat(call.name, False, failure_type)
-    return last_result
+
+
+def _execute_tool_call(call: ToolCall, provider: str | None = None, client_id: str | None = None) -> ToolResult:
+    """Execute one tool call and emit bounded-cardinality duration telemetry."""
+    from .gateway_observability import observe_tool
+    started = time.monotonic()
+    tool = BUILTIN_TOOLS.get(call.name)
+    if tool is not None:
+        tool_class = "builtin"
+        metric_name = tool.name
+    elif _mcp_parse_public_name(call.name):
+        tool_class = "mcp"
+        metric_name = "mcp"
+    elif _http_action_by_name(call.name):
+        tool_class = "http_action"
+        metric_name = "http_action"
+    else:
+        tool_class = "unknown"
+        metric_name = "unknown"
+    try:
+        result = _execute_tool_call_impl(call, provider=provider, client_id=client_id)
+    except Exception as exc:
+        observe_tool(
+            metric_name,
+            tool_class=tool_class,
+            success=False,
+            failure_type=exc.__class__.__name__,
+            duration_seconds=time.monotonic() - started,
+        )
+        raise
+    observe_tool(
+        metric_name,
+        tool_class=tool_class,
+        success=bool(result.success),
+        failure_type=result.failure_type or "none",
+        duration_seconds=time.monotonic() - started,
+    )
+    return result
 
 
 def _direct_tool_result_payload(result: ToolResult) -> Json:

@@ -12,7 +12,10 @@ compatibility.
 from __future__ import annotations
 
 import argparse
+import os
+import signal
 import sys
+import threading
 import types
 from http.server import ThreadingHTTPServer
 
@@ -28,12 +31,16 @@ from .gateway_errors import (
     NativeToolVerificationError,
     DownstreamAuthError,
     GatewayBusyError,
+    GatewayUnavailableError,
     ConfigError,
+    ConfigConflictError,
     ToolExecutionError,
 )
 from .gateway_config import (
     CONFIG_PATH,
     load_config,
+    load_config_with_revision,
+    config_file_revision,
     save_config,
     _default_config,
     _deep_update,
@@ -54,6 +61,11 @@ from .gateway_config import (
     _use_openai_chat_upstream,
     _force_upstream_stream_aggregate,
     _hash_secret,
+    _secret_fingerprint,
+    _hash_password,
+    _verify_password,
+    _password_hash_needs_upgrade,
+    _downstream_key_id,
     _env_bool,
     _env_int,
     _env_float,
@@ -207,12 +219,17 @@ from .gateway_http_handler import (
     _safe_json_response,
     _text_response,
     _read_json,
+    _semantic_cache_request_fingerprint,
     _parse_basic_auth,
     _check_admin,
     _check_downstream_key,
     _read_form,
     _error_payload,
     _redirect,
+    _set_gateway_ready,
+    _gateway_is_ready,
+    _enforce_request_rate_limit,
+    _capability_contract,
 )
 from .gateway_admin import (
     _client_snippet_context,
@@ -407,12 +424,14 @@ sys.modules[__name__].__class__ = _GatewayAppModule
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run a native tools/function-call runtime gateway")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8885)
+    parser.add_argument("--host", default=os.environ.get("GATEWAY_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("GATEWAY_PORT") or 8885))
     args = parser.parse_args()
 
     # Load configuration
     config = load_config()
+    from .gateway_http_security import validate_bind_security
+    exposure_mode = validate_bind_security(args.host, config)
 
     # Initialize persistence layer
     try:
@@ -433,14 +452,59 @@ def main() -> None:
         gpm.init_permissions(config)
         perm_config = config.get("permissions", {})
         if perm_config.get("enabled", False):
-            print(f"Tool permissions enabled (default_allow={perm_config.get('default_allow', True)})", flush=True)
+            print(f"Tool permissions enabled (default_allow={perm_config.get('default_allow', False)})", flush=True)
         else:
             print("Tool permissions disabled", flush=True)
     except Exception as exc:
-        print(f"Warning: Failed to initialize permissions: {exc}", flush=True)
+        if (config.get("permissions") or {}).get("enabled", False):
+            raise RuntimeError("permissions are enabled but failed to initialize") from exc
+        print(f"Warning: Failed to initialize disabled permission subsystem: {exc}", flush=True)
+
+    maintenance_stop = threading.Event()
+
+    def maintenance_loop() -> None:
+        maintenance_config = config.get("maintenance") or {}
+        interval = max(
+            30.0,
+            float(maintenance_config.get("interval_seconds") or os.environ.get("GATEWAY_MAINTENANCE_INTERVAL_SECONDS") or "300"),
+        )
+        while not maintenance_stop.wait(interval):
+            from .gateway_maintenance import record_maintenance_crash, run_gateway_maintenance
+            try:
+                snapshot = run_gateway_maintenance(config)
+            except Exception as exc:
+                snapshot = record_maintenance_crash(exc)
+            if not snapshot.get("last_success"):
+                print(
+                    f"Warning: Gateway maintenance failed: {snapshot.get('last_error') or 'unknown error'}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+    maintenance_thread = None
+    if bool((config.get("maintenance") or {}).get("enabled", True)):
+        maintenance_thread = threading.Thread(target=maintenance_loop, name="gateway-maintenance", daemon=True)
+        maintenance_thread.start()
 
     httpd = ThreadingHTTPServer((args.host, args.port), GatewayHandler)
+    httpd.daemon_threads = True
+    shutdown_started = threading.Event()
+
+    def request_shutdown(signum=None, frame=None) -> None:
+        if shutdown_started.is_set():
+            return
+        shutdown_started.set()
+        _set_gateway_ready(False)
+        print(f"Shutdown requested{f' by signal {signum}' if signum else ''}", flush=True)
+        # BaseServer.shutdown() must run outside the serve_forever thread.
+        threading.Thread(target=httpd.shutdown, name="gateway-shutdown", daemon=True).start()
+
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, request_shutdown)
+        signal.signal(signal.SIGINT, request_shutdown)
+    _set_gateway_ready(True)
     print(f"native tool runtime gateway listening on http://{args.host}:{args.port}", flush=True)
+    print(f"public exposure contract: {exposure_mode}", flush=True)
     print("fake prompt tools: disabled", flush=True)
 
     try:
@@ -448,6 +512,19 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nShutting down...", flush=True)
     finally:
+        _set_gateway_ready(False)
+        maintenance_stop.set()
+        httpd.server_close()
+        try:
+            from .gateway_mcp import _mcp_close_sessions
+            _mcp_close_sessions()
+        except Exception:
+            pass
+        try:
+            from .gateway_builtin_tools import _cleanup_runtime_sessions
+            _cleanup_runtime_sessions()
+        except Exception:
+            pass
         # Clean shutdown
         try:
             from . import gateway_persistence as gp

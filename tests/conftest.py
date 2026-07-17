@@ -25,10 +25,38 @@ def _reset_caches():
         reset_caches()
     except Exception:
         pass
+    try:
+        from src.gateway_observability import OBSERVABILITY
+        OBSERVABILITY.clear()
+    except Exception:
+        pass
     yield
     try:
         from src.gateway_cache import reset_caches
         reset_caches()
+    except Exception:
+        pass
+    try:
+        from src.gateway_observability import OBSERVABILITY
+        OBSERVABILITY.clear()
+    except Exception:
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _isolate_rate_limit_database(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):
+    """Keep the default shared limiter from writing runtime files into the checkout."""
+    monkeypatch.setenv("GATEWAY_RATE_LIMIT_DB_PATH", str(tmp_path / "rate_limits.sqlite3"))
+    monkeypatch.setenv("GATEWAY_CONCURRENCY_DB_PATH", str(tmp_path / "admission.sqlite3"))
+    try:
+        from src.gateway_admission import ADMISSION_SERVICE
+        ADMISSION_SERVICE.clear()
+    except Exception:
+        pass
+    yield
+    try:
+        from src.gateway_admission import ADMISSION_SERVICE
+        ADMISSION_SERVICE.clear()
     except Exception:
         pass
 

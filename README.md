@@ -58,10 +58,14 @@
 | 智力提升（问题分析、反思、质量评估） | ✅ 已实现 | `src/gateway_intelligence.py` |
 | Q&A 统计（请求/工具/缓存/质量） | ✅ 已实现 | `src/gateway_stats.py` |
 | Web 配置 UI（9 Tab） | ✅ 已实现 | `src/gateway_web_config.py` |
-| Web2API（网页转结构化 API） | ✅ 已实现 | `src/gateway_web2api.py` |
-| 并发优化（连接池、负载均衡） | ✅ 已实现 | `src/gateway_concurrency.py` |
+| Assistants / Threads | ⚠️ 仅 create 兼容对象，不含持久化、messages、runs 或生命周期 | `src/gateway_assistants.py` |
+| Web2API（网页转结构化 API） | 🧩 模块和测试存在，但未接入当前 HTTP 请求路径 | `src/gateway_web2api.py` |
+| 单上游连接复用、重试、限界 | ✅ 已接入 | `src/gateway_proxy.py` |
+| 多上游负载均衡 | 🧩 独立模块存在，但未接入当前 HTTP 请求路径 | `src/gateway_concurrency.py` |
 | Claude Code 兼容层 | ✅ 已实现 | `src/gateway_claude_compat.py` |
 | Admin UI / client config / 上游模型自动获取 | ✅ 已实现 | `src/gateway_admin.py` |
+
+运行时能力以 `GET /capabilities` 为准。模块文件存在或单元测试通过，不代表该模块已经接入生产 HTTP 请求路径。
 
 当前回归测试（以实际门禁输出为准）：
 
@@ -73,7 +77,7 @@
 ./scripts/agent_planner_acceptance.sh --full
 ```
 
-最近一次发布收口验证（2026-07-07）：`./scripts/agent_planner_acceptance.sh --full` PASS，全量 pytest `1053 passed, 2 skipped, 21 warnings in 49.58s`；启动 8885 后 scoped live audit `12/12 proven/current_scope`。生产/公网部署前仍必须更换默认 Admin 密码。
+最近一次本地完整 CI 验证（2026-07-17）：Ruff、Mypy、Bandit、`pip check`、`pip-audit`、Compose、Docker build 和全量 pytest 均通过；pytest 为 `1418 passed, 2 skipped`。隔离 fake/local upstream 的 real-tool acceptance 同时通过直接真实工具执行和原生 tool-call 两轮编排。生产/公网部署前仍必须配置非默认 Admin 凭证，并以部署环境自己的门禁输出为准。
 
 本轮真实测试上游 / Mimo 兼容结论（2026-05-25，地址只保存在本地 ignored 配置或环境变量中）：
 
@@ -170,6 +174,9 @@ GATEWAY_START_METHOD=nohup ./scripts/mimo_gateway.sh start
 ```bash
 # 改端口 / 监听地址
 GATEWAY_PORT=9000 GATEWAY_HOST=127.0.0.1 ./scripts/mimo_gateway.sh start
+
+# 可选：指定 Admin 管理的服务级 Skill catalog
+GATEWAY_ADMIN_SKILLS_ROOT=/srv/ai-gateway/skills ./scripts/mimo_gateway.sh start
 
 # 使用临时配置做 smoke，不影响默认 .gateway_service.json
 TMPDIR=$(mktemp -d)

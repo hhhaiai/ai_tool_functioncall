@@ -534,26 +534,7 @@ def _render_admin_ui() -> str:
         for form_key, cap_key, label, desc in capability_specs
     )
 
-    return _render_admin_html(
-        esc=esc, badge=badge, checked=checked,
-        upstream=upstream, upstream_profiles=upstream_profiles,
-        active_upstream_id=active_upstream_id,
-        downstream_keys=downstream_keys, gateway_cfg=gateway_cfg,
-        context_cfg=context_cfg, caps=caps, paths=paths,
-        profile_rows=profile_rows, key_rows=key_rows,
-        mcp_rows=mcp_rows, tool_rows=tool_rows,
-        tool_name_count=tool_name_count, unique_tool_count=unique_tool_count,
-        request_rows=request_rows, failure_rows=failure_rows,
-        memory_rows=memory_rows, skill_rows=skill_rows,
-        action_rows=action_rows, capability_inputs=capability_inputs,
-        capability_specs=capability_specs,
-        total_requests=total_requests, failure_count=failure_count,
-        active_model=active_model, public_base=public_base,
-        snippet_ctx=snippet_ctx, claude_function_pretty=claude_function_pretty,
-        config_pretty=config_pretty, stats_pretty=stats_pretty,
-        skill_items=skill_items, mcp_servers=mcp_servers,
-        skill_count=len(skill_items),
-    )
+    raise RuntimeError("legacy Admin renderer is disabled; the redesigned renderer below is authoritative")
 
 
 # ============================================================================
@@ -696,6 +677,8 @@ def _render_html(**kw):
     B = _badge
     C = _checked
     S = _sel
+    raw_cors_origins = gateway_cfg.get("cors_allowed_origins") or []
+    cors_origins_value = raw_cors_origins if isinstance(raw_cors_origins, str) else ",".join(str(item) for item in raw_cors_origins)
 
     cap_specs = [("supports_tools","Tools"),("supports_function_calls","Function Calls"),("supports_parallel_tool_calls","Parallel Tools"),("supports_vision","Vision"),("supports_streaming","Streaming"),("supports_json_schema","JSON Schema"),("supports_network","Network"),("supports_web_search","Web Search")]
     cap_badges = " ".join(B(lab, caps.get(key)) for key, lab in cap_specs)
@@ -922,7 +905,9 @@ def _render_html(**kw):
 <label class="check-card"><input type="checkbox" name="allow_shell_tools"{" checked" if gateway_cfg.get("allow_shell_tools") else ""}><span><b>Shell</b></span></label>
 <label class="check-card"><input type="checkbox" name="request_logging"{" checked" if gateway_cfg.get("request_logging",True) else ""}><span><b>日志</b></span></label>
 <label class="check-card"><input type="checkbox" name="text_tool_call_fallback_enabled"{" checked" if gateway_cfg.get("text_tool_call_fallback_enabled",True) else ""}><span><b>文本工具回退</b></span></label>
+<label class="check-card"><input type="checkbox" name="cors_enabled"{" checked" if gateway_cfg.get("cors_enabled",False) else ""}><span><b>浏览器 CORS</b><small>仅允许下方精确 Origin</small></span></label>
 </div>
+<label class="field full"><span>CORS Origin 白名单</span><input name="cors_allowed_origins" value="{E(cors_origins_value)}" placeholder="https://console.example.com,https://ops.example.com"></label>
 <div class="field full"><button type="submit">保存网关设置</button></div>
 </form></div></div>
 </div>

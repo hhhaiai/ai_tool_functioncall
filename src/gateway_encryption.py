@@ -20,6 +20,11 @@ import os
 from pathlib import Path
 from typing import Any
 
+try:
+    from .gateway_file_ops import atomic_copy_file, atomic_create_bytes, atomic_write_text
+except ImportError:  # Script-mode compatibility
+    from gateway_file_ops import atomic_copy_file, atomic_create_bytes, atomic_write_text
+
 _logger = logging.getLogger(__name__)
 
 Json = dict[str, Any]
@@ -39,7 +44,11 @@ except ImportError:
 
 def _get_key_path() -> Path:
     """Get the path to the encryption key file."""
-    return Path(".gateway_runtime/encryption.key")
+    explicit = os.environ.get("GATEWAY_ENCRYPTION_KEY_PATH")
+    if explicit:
+        return Path(explicit)
+    runtime_dir = Path(os.environ.get("GATEWAY_RUNTIME_DIR", ".gateway_runtime"))
+    return runtime_dir / "encryption.key"
 
 
 def _generate_key() -> bytes:
@@ -53,32 +62,31 @@ def _load_or_create_key() -> bytes:
     """Load existing key or create a new one."""
     key_path = _get_key_path()
 
-    if key_path.exists():
-        # Load existing key
+    def load_existing() -> bytes:
         try:
             with open(key_path, "rb") as f:
                 key = f.read()
+            Fernet(key)
             _logger.info("Loaded encryption key from disk")
             return key
         except Exception as exc:
             _logger.error(f"Failed to load encryption key: {exc}")
             raise
 
-    # Create new key
+    if key_path.exists():
+        return load_existing()
+
     key = _generate_key()
     key_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        with open(key_path, "wb") as f:
-            f.write(key)
-        # Secure permissions (owner read/write only)
-        os.chmod(key_path, 0o600)
-        _logger.info(f"Generated new encryption key: {key_path}")
+        if atomic_create_bytes(key_path, key, new_file_mode=0o600):
+            _logger.info(f"Generated new encryption key: {key_path}")
+            return key
+        return load_existing()
     except Exception as exc:
         _logger.error(f"Failed to save encryption key: {exc}")
         raise
-
-    return key
 
 
 _encryption_key: bytes | None = None
@@ -113,10 +121,9 @@ def encrypt_value(value: str) -> str:
         Encrypted value as base64 string with "encrypted:" prefix
     """
     if not _CRYPTO_AVAILABLE:
-        _logger.warning("Encryption not available, storing plain text")
-        return value
+        raise RuntimeError("cryptography library not available")
 
-    if not value:
+    if not value or is_encrypted(value):
         return value
 
     try:
@@ -126,7 +133,7 @@ def encrypt_value(value: str) -> str:
         return f"encrypted:{encrypted_b64}"
     except Exception as exc:
         _logger.error(f"Failed to encrypt value: {exc}")
-        return value
+        raise RuntimeError("failed to encrypt configuration value") from exc
 
 
 def decrypt_value(value: str) -> str:
@@ -139,6 +146,8 @@ def decrypt_value(value: str) -> str:
         Decrypted plain text string
     """
     if not _CRYPTO_AVAILABLE:
+        if is_encrypted(value):
+            raise RuntimeError("cryptography library not available")
         return value
 
     if not value or not value.startswith("encrypted:"):
@@ -153,8 +162,7 @@ def decrypt_value(value: str) -> str:
         return decrypted_bytes.decode()
     except Exception as exc:
         _logger.error(f"Failed to decrypt value: {exc}")
-        # Return as-is if decryption fails (maybe wrong key)
-        return value
+        raise RuntimeError("failed to decrypt configuration value") from exc
 
 
 def is_encrypted(value: str) -> bool:
@@ -230,7 +238,7 @@ def encrypt_config(config: Json, in_place: bool = False) -> Json:
         Config with encrypted sensitive fields
     """
     if not _CRYPTO_AVAILABLE:
-        return config
+        raise RuntimeError("cryptography library not available")
 
     if not in_place:
         import copy
@@ -265,6 +273,8 @@ def decrypt_config(config: Json, in_place: bool = False) -> Json:
         Config with decrypted fields
     """
     if not _CRYPTO_AVAILABLE:
+        if _check_if_encrypted(config):
+            raise RuntimeError("cryptography library not available")
         return config
 
     if not in_place:
@@ -320,13 +330,11 @@ def migrate_config_to_encrypted(config_path: str) -> bool:
 
         # Backup original
         backup_path = f"{config_path}.backup"
-        import shutil
-        shutil.copy(config_path, backup_path)
+        atomic_copy_file(config_path, backup_path, overwrite=True)
         _logger.info(f"Created backup: {backup_path}")
 
         # Save encrypted config
-        with open(config_path, "w") as f:
-            json.dump(encrypted_config, f, indent=2)
+        atomic_write_text(config_path, json.dumps(encrypted_config, indent=2))
 
         _logger.info(f"Migrated config to encrypted format: {config_path}")
         return True

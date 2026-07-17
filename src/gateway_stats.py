@@ -6,11 +6,18 @@ and quality metrics for monitoring and optimization.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Optional
+
+try:
+    from .gateway_sqlite import secure_sqlite_artifacts, secure_sqlite_connect, set_secure_sqlite_journal_mode
+except ImportError:  # pragma: no cover - legacy top-level import mode
+    from gateway_sqlite import secure_sqlite_artifacts, secure_sqlite_connect, set_secure_sqlite_journal_mode
 
 Json = dict[str, Any]
 
@@ -54,6 +61,14 @@ _db_lock = threading.RLock()
 _db_conn: sqlite3.Connection | None = None
 
 
+def _stats_db_path() -> Path:
+    explicit = os.environ.get("GATEWAY_STATS_DB_PATH")
+    if explicit:
+        return Path(explicit)
+    runtime_dir = Path(os.environ.get("GATEWAY_RUNTIME_DIR", ".gateway_runtime"))
+    return runtime_dir / "stats.db"
+
+
 def _get_db() -> sqlite3.Connection:
     """Get or create database connection."""
     global _db_conn
@@ -61,18 +76,19 @@ def _get_db() -> sqlite3.Connection:
         with _db_lock:
             if _db_conn is None:
                 # Use persistent database file instead of :memory:
-                from pathlib import Path
-                db_path = Path(".gateway_runtime/stats.db")
-                db_path.parent.mkdir(parents=True, exist_ok=True)
+                db_path = _stats_db_path()
+                explicit_path = bool(os.environ.get("GATEWAY_STATS_DB_PATH"))
 
-                _db_conn = sqlite3.connect(
-                    str(db_path),
+                _db_conn = secure_sqlite_connect(
+                    db_path,
+                    private_parent=not explicit_path,
                     check_same_thread=False,
                 )
                 _db_conn.row_factory = sqlite3.Row
 
                 # Configure for performance
-                _db_conn.execute("PRAGMA journal_mode = WAL")
+                _db_conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
+                set_secure_sqlite_journal_mode(_db_conn, db_path, "WAL")
                 _db_conn.execute("PRAGMA synchronous = NORMAL")
 
                 _init_tables(_db_conn)
@@ -806,17 +822,37 @@ def export_stats_csv(stat_type: str = "requests") -> str:
 # Cleanup
 # ---------------------------------------------------------------------------
 
-def cleanup_old_stats(retention_days: int = 30):
+def cleanup_old_stats(
+    retention_days: int = 30,
+    *,
+    batch_size: int = 1_000,
+    max_batches: int = 4,
+) -> int:
     """Remove statistics older than retention period."""
     with _db_lock:
         db = _get_db()
         cutoff = time.time() - (retention_days * 86400)
+        batch_size = max(1, min(int(batch_size), 100_000))
+        max_batches = max(1, min(int(max_batches), 100))
 
         tables = ["request_stats", "tool_stats", "cache_stats", "quality_stats", "upstream_stats"]
+        deleted = 0
         for table in tables:
-            db.execute(f"DELETE FROM {table} WHERE timestamp < ?", (cutoff,))
+            for _ in range(max_batches):
+                result = db.execute(
+                    f"DELETE FROM {table} WHERE id IN ("
+                    f"SELECT id FROM {table} WHERE timestamp < ? ORDER BY id LIMIT ?)",
+                    (cutoff, batch_size),
+                )
+                changed = max(0, int(result.rowcount))
+                deleted += changed
+                db.commit()
+                if changed < batch_size:
+                    break
 
-        db.commit()
+        db.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+        secure_sqlite_artifacts(_stats_db_path())
+        return deleted
 
 
 def reset_stats():

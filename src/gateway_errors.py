@@ -18,9 +18,10 @@ class GatewayError(Exception):
 class UpstreamHTTPError(GatewayError):
     status = 502
 
-    def __init__(self, upstream_status: int, detail: Any) -> None:
+    def __init__(self, upstream_status: int, detail: Any, *, headers: dict[str, str] | None = None) -> None:
         super().__init__(f"upstream HTTP {upstream_status}", detail=detail)
         self.upstream_status = upstream_status
+        self.headers = dict(headers or {})
 
 
 class UpstreamTimeoutError(GatewayError):
@@ -39,6 +40,10 @@ class GatewayBusyError(GatewayError):
     status = 429
 
 
+class GatewayUnavailableError(GatewayError):
+    status = 503
+
+
 class RequestBodyTooLargeError(GatewayError):
     status = 413
 
@@ -51,10 +56,21 @@ class ConfigError(GatewayError):
     status = 500
 
 
+class ConfigConflictError(GatewayError):
+    status = 409
+
+
 class ToolExecutionError(Exception):
-    def __init__(self, message: str, *, failure_type: str = "execution_failed") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_type: str = "execution_failed",
+        retryable: bool = False,
+    ) -> None:
         super().__init__(message)
         self.failure_type = failure_type
+        self.retryable = bool(retryable)
 
 
 @dataclass

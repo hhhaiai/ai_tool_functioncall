@@ -15,6 +15,11 @@ import threading
 import uuid
 from typing import Any
 
+try:
+    from .gateway_sqlite import path_is_within, secure_sqlite_artifacts, secure_sqlite_connect, set_secure_sqlite_journal_mode
+except ImportError:  # pragma: no cover - legacy top-level import mode
+    from gateway_sqlite import path_is_within, secure_sqlite_artifacts, secure_sqlite_connect, set_secure_sqlite_journal_mode
+
 Json = dict[str, Any]
 
 REQUEST_LOG_PATH = pathlib.Path(os.environ.get("GATEWAY_REQUEST_LOG") or ".gateway_requests.jsonl")
@@ -29,11 +34,22 @@ def _sqlite_path() -> pathlib.Path:
 
 
 def _sqlite_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(_sqlite_path()), timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    return conn
+    database = _sqlite_path()
+    runtime_dir = pathlib.Path(os.environ.get("GATEWAY_RUNTIME_DIR") or ".gateway_runtime")
+    conn = secure_sqlite_connect(
+        database,
+        private_parent=path_is_within(database, runtime_dir),
+        timeout=30,
+    )
+    try:
+        conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+        set_secure_sqlite_journal_mode(conn, database, "WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+    except Exception:
+        conn.close()
+        raise
 
 
 def _sqlite_init() -> None:
@@ -446,6 +462,89 @@ def _sqlite_tail_failures(limit: int = 50) -> list[Json]:
         conn.close()
 
 
+def cleanup_primary_sqlite(
+    *,
+    request_retention_days: int = 30,
+    request_max_rows: int = 100_000,
+    failure_retention_days: int = 90,
+    failure_max_rows: int = 50_000,
+    memory_retention_days: int = 90,
+    memory_max_rows: int = 50_000,
+    batch_size: int = 1_000,
+    max_batches: int = 4,
+    incremental_vacuum_pages: int = 256,
+    dry_run: bool = False,
+    now: _dt.datetime | None = None,
+) -> Json:
+    """Prune primary Gateway records in bounded batches and report space state."""
+    _sqlite_init()
+    database = _sqlite_path()
+    current = now or _dt.datetime.now(_dt.timezone.utc)
+    batch_size = max(1, min(int(batch_size), 100_000))
+    max_batches = max(1, min(int(max_batches), 100))
+    policies = (
+        ("request_logs", "ts", request_retention_days, request_max_rows),
+        ("tool_failures", "ts", failure_retention_days, failure_max_rows),
+        ("conversation_memories", "COALESCE(last_used_at, ts)", memory_retention_days, memory_max_rows),
+    )
+    result: Json = {"dry_run": bool(dry_run), "deleted": {}, "eligible": {}}
+    conn = _sqlite_connect()
+    try:
+        for table, age_column, retention_days, max_rows in policies:
+            cutoff = (current - _dt.timedelta(days=max(0, int(retention_days)))).isoformat()
+            overflow_offset = max(0, int(max_rows))
+            predicate = (
+                f"{age_column} < ? OR id <= COALESCE("
+                f"(SELECT id FROM {table} ORDER BY id DESC LIMIT 1 OFFSET ?), 0)"
+            )
+            eligible = int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE {predicate}",
+                    (cutoff, overflow_offset),
+                ).fetchone()[0]
+            )
+            result["eligible"][table] = eligible
+            deleted = 0
+            if not dry_run:
+                for _ in range(max_batches):
+                    before = conn.total_changes
+                    conn.execute(
+                        f"DELETE FROM {table} WHERE id IN ("
+                        f"SELECT id FROM {table} WHERE {predicate} ORDER BY id LIMIT ?)",
+                        (cutoff, overflow_offset, batch_size),
+                    )
+                    changed = conn.total_changes - before
+                    deleted += changed
+                    conn.commit()
+                    if changed < batch_size:
+                        break
+            result["deleted"][table] = deleted
+
+        if not dry_run:
+            checkpoint = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+            result["checkpoint"] = {
+                "busy": int(checkpoint[0]),
+                "log_frames": int(checkpoint[1]),
+                "checkpointed_frames": int(checkpoint[2]),
+            }
+            pages = max(0, min(int(incremental_vacuum_pages), 100_000))
+            if pages:
+                conn.execute(f"PRAGMA incremental_vacuum({pages})")
+        result["rows"] = {
+            table: int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            for table, _, _, _ in policies
+        }
+        result["auto_vacuum_mode"] = int(conn.execute("PRAGMA auto_vacuum").fetchone()[0])
+    finally:
+        conn.close()
+    result["space_bytes"] = sum(
+        artifact.stat().st_size
+        for artifact in (database, pathlib.Path(f"{database}-wal"), pathlib.Path(f"{database}-shm"))
+        if artifact.exists()
+    )
+    return result
+
+
 def _record_tool_failure(
     tool_name: str,
     call_id: str,
@@ -485,44 +584,62 @@ def _read_json_file(path: pathlib.Path, default: Any) -> Any:
 
 
 def _write_json_file(path: pathlib.Path, payload: Any) -> None:
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    from .gateway_file_ops import atomic_write_text
+    atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def _write_jsonl_file(path: pathlib.Path, event: Json) -> None:
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    from .gateway_file_ops import path_write_lock
+    with path_write_lock(path) as target:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
 
 
 def _record_tool_stat(name: str, success: bool, failure_type: str | None = None) -> None:
     if _logging_backend() == "sqlite":
         _sqlite_record_tool_stat(name, success, failure_type)
     else:
-        stats = _read_json_file(STATS_PATH, {"tools": {}})
-        tools = stats.setdefault("tools", {})
-        tool = tools.setdefault(name, {"calls": 0, "success": 0, "failure": 0, "failures": {}})
-        tool["calls"] = tool.get("calls", 0) + 1
-        if success:
-            tool["success"] = tool.get("success", 0) + 1
-        else:
-            tool["failure"] = tool.get("failure", 0) + 1
-            if failure_type:
-                failures = tool.setdefault("failures", {})
-                failures[failure_type] = failures.get(failure_type, 0) + 1
-        tool["last_called_at"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
-        _write_json_file(STATS_PATH, stats)
+        from .gateway_file_ops import atomic_update_json
+
+        def update(stats: Any) -> tuple[Any, None]:
+            if not isinstance(stats, dict):
+                stats = {"tools": {}}
+            tools = stats.setdefault("tools", {})
+            tool = tools.setdefault(name, {"calls": 0, "success": 0, "failure": 0, "failures": {}})
+            tool["calls"] = tool.get("calls", 0) + 1
+            if success:
+                tool["success"] = tool.get("success", 0) + 1
+            else:
+                tool["failure"] = tool.get("failure", 0) + 1
+                if failure_type:
+                    failures = tool.setdefault("failures", {})
+                    failures[failure_type] = failures.get(failure_type, 0) + 1
+            tool["last_called_at"] = _dt.datetime.now(_dt.timezone.utc).isoformat()
+            return stats, None
+
+        atomic_update_json(STATS_PATH, update, default={"tools": {}})
 
 
 def _record_request_stat(path: str, status: int) -> None:
     if _logging_backend() == "sqlite":
         _sqlite_record_request_stat(path, status)
     else:
-        stats = _read_json_file(STATS_PATH, {"requests": {}})
-        requests = stats.setdefault("requests", {})
-        requests["total"] = requests.get("total", 0) + 1
-        requests[path] = requests.get(path, 0) + 1
-        status_key = f"{status // 100}xx"
-        requests[status_key] = requests.get(status_key, 0) + 1
-        _write_json_file(STATS_PATH, stats)
+        from .gateway_file_ops import atomic_update_json
+
+        def update(stats: Any) -> tuple[Any, None]:
+            if not isinstance(stats, dict):
+                stats = {"requests": {}}
+            requests = stats.setdefault("requests", {})
+            requests["total"] = requests.get("total", 0) + 1
+            requests[path] = requests.get(path, 0) + 1
+            status_key = f"{status // 100}xx"
+            requests[status_key] = requests.get(status_key, 0) + 1
+            return stats, None
+
+        atomic_update_json(STATS_PATH, update, default={"requests": {}})
 
 
 def _redact_payload(value: Any) -> Any:
@@ -613,9 +730,14 @@ def _write_request_log(path: str, body: Json, status: int, response: Json | None
     max_payload_chars = _max_log_payload_chars(cfg)
     redacted_request = _redact_payload(body)
     redacted_response = _redact_payload(response) if response else None
+    try:
+        from .gateway_observability import current_request_id
+        request_id = current_request_id() or f"req_{uuid.uuid4().hex}"
+    except Exception:
+        request_id = f"req_{uuid.uuid4().hex}"
     event = {
         "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-        "request_id": f"req_{uuid.uuid4().hex}",
+        "request_id": request_id,
         "path": path,
         "status": status,
         "downstream_key": downstream_key,

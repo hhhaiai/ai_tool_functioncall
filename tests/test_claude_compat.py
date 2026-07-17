@@ -19,6 +19,7 @@ from src.gateway_claude_compat import (
     extract_tool_uses_from_response,
     build_tool_result_message,
 )
+from src.gateway_errors import ToolResult
 
 
 class TestClaudeCodeToolDefinitions:
@@ -97,8 +98,8 @@ class TestExecuteRead:
         )
 
         assert result["success"] is True
-        assert "1\tline1" in result["content"]
-        assert "2\tline2" in result["content"]
+        assert "1: line1" in result["content"]
+        assert "2: line2" in result["content"]
 
     def test_read_with_offset_and_limit(self, tmp_path):
         test_file = tmp_path / "test.txt"
@@ -111,8 +112,19 @@ class TestExecuteRead:
         )
 
         assert result["success"] is True
-        assert "2\tline2" in result["content"]
-        assert "3\tline3" in result["content"]
+        assert "2: line2" in result["content"]
+        assert "3: line3" in result["content"]
+
+    def test_write_is_denied_when_canonical_gateway_policy_disables_it(self, tmp_path):
+        with patch("src.gateway_config._gateway_config", return_value={"allow_write_tools": False}):
+            result = execute_claude_code_tool(
+                "Write",
+                {"file_path": str(tmp_path / "denied.txt"), "content": "no"},
+                str(tmp_path),
+            )
+        assert result["success"] is False
+        assert result["failure_type"] == "permission_denied"
+        assert not (tmp_path / "denied.txt").exists()
 
     def test_read_nonexistent_file(self, tmp_path):
         result = execute_claude_code_tool(
@@ -138,9 +150,35 @@ class TestExecuteRead:
         assert result["success"] is True
         assert "content" in result["content"]
 
+    def test_compatibility_execution_delegates_to_canonical_runtime(self, tmp_path):
+        canonical_result = ToolResult(
+            call_id="canonical",
+            name="Read",
+            content="canonical content",
+            success=True,
+        )
+        with patch("src.gateway_tool_runtime._execute_tool_call", return_value=canonical_result) as execute:
+            result = execute_claude_code_tool(
+                "Read",
+                {"file_path": "README.md"},
+                str(tmp_path),
+                client_id="client_stable",
+            )
+
+        assert result == {"success": True, "content": "canonical content"}
+        call = execute.call_args.args[0]
+        assert call.name == "Read"
+        assert call.arguments == {"file_path": "README.md"}
+        assert execute.call_args.kwargs == {"provider": "claude_compat", "client_id": "client_stable"}
+
 
 class TestExecuteWrite:
     """Tests for Write tool execution."""
+
+    @pytest.fixture(autouse=True)
+    def _enable_write_tools(self):
+        with patch("src.gateway_config._gateway_config", return_value={"allow_write_tools": True}):
+            yield
 
     def test_write_new_file(self, tmp_path):
         test_file = tmp_path / "new.txt"
@@ -182,6 +220,11 @@ class TestExecuteWrite:
 
 class TestExecuteEdit:
     """Tests for Edit tool execution."""
+
+    @pytest.fixture(autouse=True)
+    def _enable_write_tools(self):
+        with patch("src.gateway_config._gateway_config", return_value={"allow_write_tools": True}):
+            yield
 
     def test_edit_single_replacement(self, tmp_path):
         test_file = tmp_path / "test.txt"
@@ -237,6 +280,11 @@ class TestExecuteEdit:
 
 class TestExecuteBash:
     """Tests for Bash tool execution."""
+
+    @pytest.fixture(autouse=True)
+    def _enable_shell_tools(self):
+        with patch("src.gateway_config._gateway_config", return_value={"allow_shell_tools": True}):
+            yield
 
     def test_bash_echo(self, tmp_path):
         with patch("src.gateway_config.load_config", return_value={"tools": {"shell_enabled": True}}):

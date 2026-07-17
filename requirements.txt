@@ -1,6 +1,8 @@
-# Optional Python dependencies for enhanced gateway features.
-# Core gateway runtime is stdlib-only; install these when you want richer
-# local image inspection/screenshot support.
+# Runtime dependency used to encrypt API keys and other sensitive values in
+# persisted server configuration.
+cryptography>=42.0.0
+
+# Optional image support used by richer local inspection/screenshot tools.
 
 # Image metadata / screenshot saving for view_image and computer_use.
 Pillow>=10.0.0

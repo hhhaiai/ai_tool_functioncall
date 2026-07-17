@@ -1,6 +1,46 @@
 # Gateway 实现状态文档
 
-> 最后更新: 2026-07-07
+> 最后更新: 2026-07-17
+
+## 2026-07-17 当前能力校准
+
+- OpenAI Chat、OpenAI Responses、Anthropic Messages 是当前完整编排路径。
+- Assistants / Threads 仅支持 Gateway-owned create 兼容响应，不包含持久化、查询、messages、runs、取消、分页或生命周期语义。
+- `gateway_web2api.py` 与 `gateway_concurrency.py` 的独立实现和测试仍保留，但当前没有接入生产 HTTP 请求路径；不得把模块存在表述为 `/api/web2api` 或多上游负载均衡已经上线。
+- 单上游连接复用、重试和资源限制由 `gateway_proxy.py` 提供；共享请求准入由 `gateway_admission.py` 提供，它们与历史 `gateway_concurrency.py` 多上游模块不是同一能力。
+- 权威机器可读状态是 `GET /capabilities`；下方较早日期的历史记录用于追溯，不覆盖当前能力声明。
+- 最新本地完整 CI：Ruff、Mypy、Bandit、依赖一致性/漏洞审计、全量 pytest（`1418 passed, 2 skipped`）、Compose 和生产 Docker build 均通过；隔离 fake/local upstream real-tool acceptance 通过。
+
+## 2026-07-14 服务器外挂 Function Call 验证
+
+当前服务器部署边界已按“弱上游 + 独立 Gateway + Codex/Claude Code
+下游”重新验证并加固：
+
+- Docker 镜像从当前源码成功构建，chat-only mock 上游明确配置为
+  `tools_enabled=adapter`、`supports_tools=false`、
+  `supports_function_calls=false`。
+- 容器外部请求已证明 OpenAI Chat 返回 `tool_calls`、OpenAI Responses
+  返回 `function_call`、`/anthropic/v1/messages` 返回 `tool_use`。
+- 客户端自定义函数和 Read/Bash/Skill 等用户机器工具仍归下游客户端；
+  direct `Read` 返回 `direct_user_side_tool_requires_downstream_client`。
+- calculator、Memory、MCP/HTTP Actions 等 Gateway-owned 工具可在服务端执行。
+- 生产 Compose 的 raw 8885 端口只绑定服务器 `127.0.0.1`；远程客户端
+  通过 Nginx 80/443 访问，不能绕过 TLS、限流和 SSE 代理设置。
+- Nginx 为 `/v1/` 与 `/anthropic/` 都关闭 buffering，并经外部 smoke
+  验证 Claude Code 路由可返回协议级 tool_use。
+- Docker 运行目录统一为 `/app/data/runtime`；主 persistence、Agent
+  Planner、匿名 workspace、stats 和 encryption key 均使用持久 volume。
+- 镜像安装 `cryptography`，持久配置不再降级为明文敏感值。
+- 容器 restart 和 Compose down/up 后，Gateway Memory 仍可召回。
+
+可重复的服务器外部验收入口：
+
+```bash
+python3 tests/integration/server_gateway_external_smoke.py \
+  --base-url https://gateway.example.com \
+  --key "$GATEWAY_DOWNSTREAM_KEY" \
+  --model "$UPSTREAM_MODEL"
+```
 
 
 ## 2026-07-07 发布收口状态
@@ -95,7 +135,8 @@ Gateway Handler (gateway_http_handler.py)
     ├─ 工具编排 (gateway_tool_runtime.py)  ← gateway-owned 执行 / 用户侧工具下发
     ├─ 流式处理 (gateway_streaming.py)     ← SSE 流式响应
     ├─ 上下文管理 (gateway_context.py)     ← 无限上下文/记忆/扇出
-    └─ 并发优化 (gateway_concurrency.py)   ← 连接池/负载均衡
+    ├─ 请求准入 (gateway_admission.py)     ← 当前共享 SQLite lease 路径
+    └─ 多上游实验模块 (gateway_concurrency.py) ← 当前未接入 HTTP 请求路径
     ↓ HTTP
 上游 API (OpenAI/Anthropic/自定义)
 ```
@@ -197,10 +238,10 @@ Gateway 本地执行策略（仅 gateway-owned/显式 opt-in 本地工具）:
 
 ---
 
-### 4. Web2API ✅
+### 4. Web2API 🧩（独立模块，当前未接入 HTTP）
 
 **实现模块**: `src/gateway_web2api.py`
-**集成位置**: HTTP Handler `/api/web2api` 路由
+**集成状态**: 模块和单元测试存在，但当前 HTTP Handler 没有 `/api/web2api` 路由。
 
 功能:
 - `Web2ApiEngine` - Web 页面转 API 引擎
@@ -211,15 +252,7 @@ Gateway 本地执行策略（仅 gateway-owned/显式 opt-in 本地工具）:
 - 自动提取模式
 - SSRF 防护 (拒绝私有/回环地址)
 
-API:
-```
-POST /api/web2api
-{
-  "url": "https://example.com",
-  "selectors": {"title": "h1", "content": "article p"},
-  "mode": "css|regex|auto"
-}
-```
+不得把模块 API 当作已发布 HTTP API。若产品决定接入，需先完成认证、共享限流/准入、SSRF 与重定向校验、响应限界、审计和部署门禁。
 
 ---
 
@@ -332,7 +365,7 @@ GET /api/cache/clear       → 清除缓存
 
 ---
 
-### 10. 并发优化 (Concurrency Optimization) ✅
+### 10. 并发与多上游模块
 
 **实现模块**: `src/gateway_concurrency.py` + `src/gateway_proxy.py`
 
@@ -341,7 +374,7 @@ GET /api/cache/clear       → 清除缓存
 - 自动重试 502/503/504 错误（30秒间隔，最长20分钟）
 - 可配置超时时间
 
-独立功能（按需启用）:
+独立功能（当前未接入生产 HTTP 请求路径）:
 - `ConnectionPool` - HTTP 连接池
 - `LoadBalancer` - 负载均衡（round_robin/least_connections/random）
 - `MultiUpstreamManager` - 多上游管理 + 健康检查

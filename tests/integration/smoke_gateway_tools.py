@@ -25,6 +25,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+
 class LocalNetworkHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:  # noqa: N802
         pass
@@ -70,8 +73,10 @@ def get_json(base_url: str, path: str, timeout: float = 10) -> dict[str, Any]:
 
 def call_tool(base_url: str, key: str, tool: str, arguments: dict[str, Any], timeout: float = 20, workspace_root: str | None = None) -> dict[str, Any]:
     payload: dict[str, Any] = {"tool": tool, "arguments": arguments}
-    if workspace_root:
-        payload["workspace_root"] = workspace_root
+    # Direct user-machine tools intentionally do not fall back to the Gateway
+    # service checkout. This acceptance script is an explicit trusted local
+    # proxy test, so always send the workspace under test in the request.
+    payload["workspace_root"] = workspace_root or str(ROOT)
     result = post_json(base_url, key, "/v1/tools/call", payload, timeout=timeout)
     if not result.get("success", False):
         raise AssertionError(f"{tool} failed: {json.dumps(result, ensure_ascii=False)[:2000]}")
@@ -107,8 +112,10 @@ def main() -> int:
             raise AssertionError(f"healthz not ok: {health}")
         checks.append("healthz")
 
-        tree = call_tool(args.base_url, args.key, "Tree", {"path": ".", "max_depth": 2, "max_entries": 200})
-        assert_contains("Tree", tree["content"], "src/")
+        # Scope the tree to src so large runtime/cache directories in a mature
+        # checkout cannot consume the bounded result before product code is seen.
+        tree = call_tool(args.base_url, args.key, "Tree", {"path": "src", "max_depth": 2, "max_entries": 500})
+        assert_contains("Tree", tree["content"], "gateway_http_handler.py")
         checks.append("project_tree")
 
         globbed = call_tool(args.base_url, args.key, "Glob", {"pattern": "src/*.py"})
@@ -191,8 +198,10 @@ def main() -> int:
             assert_contains("arbitrary PythonSymbols", project_symbols["content"], "calc")
             first_test = call_tool(args.base_url, args.key, "Bash", {"command": "python3 -m unittest -v", "timeout": 15}, workspace_root=str(arbitrary))
             assert_contains("arbitrary unittest", first_test["content"], "exit_code=0")
-            call_tool(args.base_url, args.key, "Edit", {"file_path": "app.py", "old_string": "return a + b", "new_string": "return a * b"}, workspace_root=str(arbitrary))
-            call_tool(args.base_url, args.key, "Edit", {"file_path": "test_app.py", "old_string": "5)", "new_string": "6)"}, workspace_root=str(arbitrary))
+            # Change file size as well as content so Python's timestamp/size
+            # bytecode cache cannot reuse the first run's .pyc within one second.
+            call_tool(args.base_url, args.key, "Edit", {"file_path": "app.py", "old_string": "return a + b", "new_string": "return (a * b)"}, workspace_root=str(arbitrary))
+            call_tool(args.base_url, args.key, "Edit", {"file_path": "test_app.py", "old_string": "5)", "new_string": "6 + 0)"}, workspace_root=str(arbitrary))
             second_test = call_tool(args.base_url, args.key, "Bash", {"command": "python3 -m unittest -v", "timeout": 15}, workspace_root=str(arbitrary))
             assert_contains("arbitrary modified unittest", second_test["content"], "exit_code=0")
         finally:

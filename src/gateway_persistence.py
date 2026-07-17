@@ -23,6 +23,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+try:
+    from .gateway_sqlite import path_is_within, secure_sqlite_artifacts, secure_sqlite_connect, set_secure_sqlite_journal_mode
+except ImportError:  # pragma: no cover - legacy top-level import mode
+    from gateway_sqlite import path_is_within, secure_sqlite_artifacts, secure_sqlite_connect, set_secure_sqlite_journal_mode
+
 _logger = logging.getLogger(__name__)
 
 Json = dict[str, Any]
@@ -96,26 +101,36 @@ def _get_db(config: PersistenceConfig | None = None) -> sqlite3.Connection:
             _db_conn.close()
             _db_conn = None
 
-        # Create database directory if needed
-        if target_path != ":memory:":
-            Path(target_path).parent.mkdir(parents=True, exist_ok=True)
-
         # Create connection
-        _db_conn = sqlite3.connect(
-            target_path,
-            check_same_thread=False,
-            timeout=30.0,
-        )
+        if target_path == ":memory:":
+            _db_conn = sqlite3.connect(
+                target_path,
+                check_same_thread=False,
+                timeout=30.0,
+            )
+        else:
+            runtime_dir = Path(os.environ.get("GATEWAY_RUNTIME_DIR") or ".gateway_runtime")
+            _db_conn = secure_sqlite_connect(
+                target_path,
+                private_parent=path_is_within(target_path, runtime_dir),
+                check_same_thread=False,
+                timeout=30.0,
+            )
         _db_conn.row_factory = sqlite3.Row
         _db_path = target_path
 
         # Configure connection
         cursor = _db_conn.cursor()
-        cursor.execute(f"PRAGMA journal_mode = {config.journal_mode}")
-        cursor.execute(f"PRAGMA synchronous = {config.synchronous}")
-        cursor.execute(f"PRAGMA cache_size = -{config.cache_size_kb}")
         if config.auto_vacuum:
             cursor.execute("PRAGMA auto_vacuum = INCREMENTAL")
+        if target_path == ":memory:":
+            _db_conn.execute("PRAGMA journal_mode=MEMORY")
+        else:
+            set_secure_sqlite_journal_mode(_db_conn, target_path, config.journal_mode)
+        if target_path != ":memory:":
+            secure_sqlite_artifacts(target_path)
+        cursor.execute(f"PRAGMA synchronous = {config.synchronous}")
+        cursor.execute(f"PRAGMA cache_size = -{config.cache_size_kb}")
         cursor.close()
 
         # Initialize schema
@@ -174,6 +189,7 @@ def _init_schema(conn: sqlite3.Connection):
         _migration_v2_tool_cache,
         _migration_v3_memories,
         _migration_v4_semantic_cache_scope,
+        _migration_v5_tool_cache_scope,
     ]
 
     for version, migration in enumerate(migrations, start=1):
@@ -231,6 +247,29 @@ def _migration_v2_tool_cache(cursor: sqlite3.Cursor):
             ON tool_cache(tool_name);
         CREATE INDEX IF NOT EXISTS idx_tool_cache_created
             ON tool_cache(created_at);
+    """)
+
+
+def _migration_v5_tool_cache_scope(cursor: sqlite3.Cursor):
+    """Add queryable tenant/workspace scope to persistent tool cache.
+
+    Existing rows were keyed with scope data only inside an opaque hash, so
+    they cannot be invalidated safely after a workspace mutation.  Drop those
+    short-lived legacy rows during migration rather than allowing stale values
+    to survive an upgrade.
+    """
+    columns = {
+        str(row[1])
+        for row in cursor.execute("PRAGMA table_info(tool_cache)").fetchall()
+    }
+    if "workspace_key" not in columns:
+        cursor.execute("ALTER TABLE tool_cache ADD COLUMN workspace_key TEXT NOT NULL DEFAULT ''")
+    if "runtime_key" not in columns:
+        cursor.execute("ALTER TABLE tool_cache ADD COLUMN runtime_key TEXT NOT NULL DEFAULT ''")
+    cursor.executescript("""
+        CREATE INDEX IF NOT EXISTS idx_tool_cache_scope
+            ON tool_cache(workspace_key, runtime_key);
+        DELETE FROM tool_cache;
     """)
 
 
@@ -412,7 +451,13 @@ def delete_semantic_cache_entry(cache_key: str) -> bool:
         return False
 
 
-def cleanup_expired_semantic_cache(ttl_buffer: float = 0.0) -> int:
+def cleanup_expired_semantic_cache(
+    ttl_buffer: float = 0.0,
+    *,
+    batch_size: int = 1_000,
+    max_batches: int = 4,
+    strict: bool = False,
+) -> int:
     """Delete expired semantic cache entries.
 
     Args:
@@ -425,14 +470,21 @@ def cleanup_expired_semantic_cache(ttl_buffer: float = 0.0) -> int:
         conn = _get_db()
         now = time.time()
 
-        # Find and delete expired entries
-        result = conn.execute("""
-            DELETE FROM semantic_cache
-            WHERE (created_at + ttl_seconds + ?) < ?
-        """, (ttl_buffer, now))
-
-        deleted = result.rowcount
-        conn.commit()
+        deleted = 0
+        batch_size = max(1, min(int(batch_size), 100_000))
+        for _ in range(max(1, min(int(max_batches), 100))):
+            result = conn.execute("""
+                DELETE FROM semantic_cache WHERE cache_key IN (
+                    SELECT cache_key FROM semantic_cache
+                    WHERE (created_at + ttl_seconds + ?) < ?
+                    ORDER BY created_at LIMIT ?
+                )
+            """, (ttl_buffer, now, batch_size))
+            changed = max(0, int(result.rowcount))
+            deleted += changed
+            conn.commit()
+            if changed < batch_size:
+                break
 
         if deleted > 0:
             _logger.info(f"Cleaned up {deleted} expired semantic cache entries")
@@ -441,6 +493,8 @@ def cleanup_expired_semantic_cache(ttl_buffer: float = 0.0) -> int:
 
     except Exception as exc:
         _logger.error(f"Failed to cleanup semantic cache: {exc}")
+        if strict:
+            raise
         return 0
 
 
@@ -454,6 +508,8 @@ def save_tool_cache_entry(
     result: str,
     success: bool,
     ttl_seconds: int,
+    workspace_key: str = "",
+    runtime_key: str = "",
 ) -> bool:
     """Save a tool result cache entry to database.
 
@@ -474,9 +530,21 @@ def save_tool_cache_entry(
 
         conn.execute("""
             INSERT OR REPLACE INTO tool_cache
-                (cache_key, tool_name, arguments_hash, result, success, created_at, last_accessed, access_count, ttl_seconds)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
-        """, (cache_key, tool_name, arguments_hash, result, success, now, now, ttl_seconds))
+                (cache_key, tool_name, arguments_hash, result, success, created_at, last_accessed,
+                 access_count, ttl_seconds, workspace_key, runtime_key)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+        """, (
+            cache_key,
+            tool_name,
+            arguments_hash,
+            result,
+            success,
+            now,
+            now,
+            ttl_seconds,
+            str(workspace_key or ""),
+            str(runtime_key or ""),
+        ))
 
         conn.commit()
         return True
@@ -556,7 +624,12 @@ def load_tool_cache_entry(tool_name: str, arguments_hash: str) -> dict | None:
         return None
 
 
-def cleanup_expired_tool_cache() -> int:
+def cleanup_expired_tool_cache(
+    *,
+    batch_size: int = 1_000,
+    max_batches: int = 4,
+    strict: bool = False,
+) -> int:
     """Delete expired tool cache entries.
 
     Returns:
@@ -566,13 +639,21 @@ def cleanup_expired_tool_cache() -> int:
         conn = _get_db()
         now = time.time()
 
-        result = conn.execute("""
-            DELETE FROM tool_cache
-            WHERE (created_at + ttl_seconds) < ?
-        """, (now,))
-
-        deleted = result.rowcount
-        conn.commit()
+        deleted = 0
+        batch_size = max(1, min(int(batch_size), 100_000))
+        for _ in range(max(1, min(int(max_batches), 100))):
+            result = conn.execute("""
+                DELETE FROM tool_cache WHERE cache_key IN (
+                    SELECT cache_key FROM tool_cache
+                    WHERE (created_at + ttl_seconds) < ?
+                    ORDER BY created_at LIMIT ?
+                )
+            """, (now, batch_size))
+            changed = max(0, int(result.rowcount))
+            deleted += changed
+            conn.commit()
+            if changed < batch_size:
+                break
 
         if deleted > 0:
             _logger.info(f"Cleaned up {deleted} expired tool cache entries")
@@ -581,6 +662,31 @@ def cleanup_expired_tool_cache() -> int:
 
     except Exception as exc:
         _logger.error(f"Failed to cleanup tool cache: {exc}")
+        if strict:
+            raise
+        return 0
+
+
+def delete_tool_cache_scope(workspace_key: str, runtime_key: str) -> int:
+    """Delete persistent tool-cache rows for one exact runtime scope."""
+    if not workspace_key or not runtime_key:
+        return 0
+    try:
+        conn = _get_db()
+        result = conn.execute(
+            "DELETE FROM tool_cache WHERE workspace_key = ? AND runtime_key = ?",
+            (str(workspace_key), str(runtime_key)),
+        )
+        deleted = max(0, int(result.rowcount or 0))
+        conn.commit()
+        return deleted
+    except RuntimeError as exc:
+        if "Database not initialized" in str(exc):
+            return 0
+        _logger.error(f"Failed to invalidate tool cache scope: {exc}")
+        return 0
+    except Exception as exc:
+        _logger.error(f"Failed to invalidate tool cache scope: {exc}")
         return 0
 
 
@@ -764,6 +870,30 @@ def vacuum_database():
         _logger.error(f"Failed to vacuum database: {exc}")
 
 
+def maintain_database(*, incremental_vacuum_pages: int = 256) -> dict:
+    """Checkpoint WAL and incrementally reclaim free pages with observable errors."""
+    conn = _get_db()
+    checkpoint = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+    pages = max(0, min(int(incremental_vacuum_pages), 100_000))
+    if pages:
+        conn.execute(f"PRAGMA incremental_vacuum({pages})")
+    if _db_path and _db_path != ":memory:":
+        secure_sqlite_artifacts(_db_path)
+    return {
+        "auto_vacuum_mode": int(conn.execute("PRAGMA auto_vacuum").fetchone()[0]),
+        "checkpoint": {
+            "busy": int(checkpoint[0]),
+            "log_frames": int(checkpoint[1]),
+            "checkpointed_frames": int(checkpoint[2]),
+        },
+        "space_bytes": sum(
+            os.path.getsize(candidate)
+            for candidate in (_db_path, f"{_db_path}-wal", f"{_db_path}-shm")
+            if _db_path and _db_path != ":memory:" and os.path.exists(candidate)
+        ),
+    }
+
+
 def get_database_stats() -> dict:
     """Get database statistics.
 
@@ -822,11 +952,13 @@ __all__ = [
     "cleanup_expired_semantic_cache",
     "save_tool_cache_entry",
     "load_tool_cache_entry",
+    "delete_tool_cache_scope",
     "cleanup_expired_tool_cache",
     "save_memory",
     "load_memories",
     "search_memories",
     "delete_memory",
     "vacuum_database",
+    "maintain_database",
     "get_database_stats",
 ]

@@ -6,19 +6,25 @@ Handles loading, saving, and merging configuration from files and environment va
 from __future__ import annotations
 
 import copy
+import base64
 import hashlib
+import hmac
 import json
 import os
 import pathlib
 import re
+import tempfile
+import threading
 import uuid
+from functools import lru_cache
 from typing import Any
 
-from .gateway_errors import ConfigError
+from .gateway_errors import ConfigConflictError, ConfigError
 
 Json = dict[str, Any]
 
 CONFIG_PATH = pathlib.Path(os.environ.get("GATEWAY_CONFIG_PATH") or ".gateway_service.json")
+CONFIG_LOCK = threading.RLock()
 
 # Canonical set of API path constants (shared by gateway_tool_runtime and gateway_http_handler)
 SUPPORTED_PATHS = {
@@ -52,6 +58,66 @@ def _supported_public_paths() -> set[str]:
 
 def _hash_secret(secret: str) -> str:
     return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+def _secret_fingerprint(secret: str) -> str:
+    """Return a non-reversible display identifier for a credential."""
+    return _hash_secret(secret)[:8]
+
+
+_PASSWORD_SCHEME = "pbkdf2_sha256"
+_PASSWORD_ITERATIONS = 600_000
+_PASSWORD_MAX_VERIFY_ITERATIONS = 2_000_000
+
+
+def _hash_password(password: str, *, iterations: int = _PASSWORD_ITERATIONS, salt: bytes | None = None) -> str:
+    if iterations < 1 or iterations > _PASSWORD_MAX_VERIFY_ITERATIONS:
+        raise ValueError("password hash iteration count is outside the supported range")
+    salt = salt or os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return "$".join((
+        _PASSWORD_SCHEME,
+        str(iterations),
+        base64.urlsafe_b64encode(salt).decode("ascii"),
+        base64.urlsafe_b64encode(digest).decode("ascii"),
+    ))
+
+
+def _verify_password(password: str, encoded: Any) -> bool:
+    value = str(encoded or "")
+    if value.startswith(f"{_PASSWORD_SCHEME}$"):
+        try:
+            _scheme, raw_iterations, raw_salt, raw_digest = value.split("$", 3)
+            iterations = int(raw_iterations)
+            if iterations < 1 or iterations > _PASSWORD_MAX_VERIFY_ITERATIONS:
+                return False
+            salt = base64.urlsafe_b64decode(raw_salt.encode("ascii"))
+            expected = base64.urlsafe_b64decode(raw_digest.encode("ascii"))
+            if not salt or len(expected) != hashlib.sha256().digest_size:
+                return False
+            actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+            return hmac.compare_digest(actual, expected)
+        except (TypeError, ValueError, UnicodeError):
+            return False
+    return hmac.compare_digest(_hash_secret(password), value)
+
+
+def _password_hash_needs_upgrade(encoded: Any) -> bool:
+    value = str(encoded or "")
+    if not value.startswith(f"{_PASSWORD_SCHEME}$"):
+        return True
+    try:
+        return int(value.split("$", 3)[1]) < _PASSWORD_ITERATIONS
+    except (IndexError, ValueError):
+        return True
+
+
+@lru_cache(maxsize=8)
+def _configured_admin_password_hash(configured_hash: str, configured_password: str) -> str:
+    """Derive the environment/default Admin verifier once per process."""
+    if configured_hash:
+        return configured_hash
+    return _hash_password(configured_password or "admin")
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -128,13 +194,12 @@ def _default_config() -> Json:
     from .gateway_logging import _sqlite_path
 
     # Admin password: use env var if set, otherwise use known default for dev/testing
-    admin_password_hash = os.environ.get("GATEWAY_ADMIN_PASSWORD_HASH", "")
-    if not admin_password_hash:
-        admin_password = os.environ.get("GATEWAY_ADMIN_PASSWORD", "")
-        if admin_password:
-            admin_password_hash = _hash_secret(admin_password)
-        else:
-            admin_password_hash = _hash_secret("admin")
+    configured_admin_hash = os.environ.get("GATEWAY_ADMIN_PASSWORD_HASH", "")
+    configured_admin_password = os.environ.get("GATEWAY_ADMIN_PASSWORD", "")
+    admin_password_hash = _configured_admin_password_hash(
+        configured_admin_hash,
+        configured_admin_password,
+    )
     admin_must_change = not os.environ.get("GATEWAY_ADMIN_PASSWORD") and not os.environ.get("GATEWAY_ADMIN_PASSWORD_HASH")
 
     # Downstream keys
@@ -144,7 +209,7 @@ def _default_config() -> Json:
         downstream_keys.append({
             "name": "default",
             "key_hash": _hash_secret(downstream_key_env),
-            "prefix": downstream_key_env[:8],
+            "prefix": _secret_fingerprint(downstream_key_env),
             "enabled": True,
             "protocols": ["models", "chat_completions", "responses", "messages", "direct_tools"],
             "created_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
@@ -165,8 +230,16 @@ def _default_config() -> Json:
             "native_tools_verified": False,
             "use_for_coding": True,
             "timeout_seconds": _env_float("UPSTREAM_TIMEOUT", 60.0),
-            "max_input_tokens": _env_int("UPSTREAM_MAX_INPUT_TOKENS", 128000),
-            "max_output_tokens": _env_int("UPSTREAM_MAX_OUTPUT_TOKENS", 8192),
+            "retry_max_attempts": _env_int("UPSTREAM_RETRY_MAX_ATTEMPTS", 3),
+            "retry_initial_delay_seconds": _env_float("UPSTREAM_RETRY_INITIAL_DELAY", 0.5),
+            "retry_max_delay_seconds": _env_float("UPSTREAM_RETRY_MAX_DELAY", 4.0),
+            "retry_max_elapsed_seconds": _env_float("UPSTREAM_RETRY_MAX_ELAPSED", 90.0),
+            "max_input_tokens": _env_int("UPSTREAM_MAX_INPUT_TOKENS", 1048576),
+            "max_output_tokens": _env_int("UPSTREAM_MAX_OUTPUT_TOKENS", 131072),
+            "max_response_bytes": _env_int("UPSTREAM_MAX_RESPONSE_BYTES", 32 * 1024 * 1024),
+            "max_stderr_bytes": _env_int("UPSTREAM_MAX_STDERR_BYTES", 256 * 1024),
+            "max_stream_event_bytes": _env_int("UPSTREAM_MAX_STREAM_EVENT_BYTES", 1024 * 1024),
+            "max_stream_events": _env_int("UPSTREAM_MAX_STREAM_EVENTS", 100000),
             "max_concurrency": _env_int("UPSTREAM_MAX_CONCURRENCY", 32),
             "paths": {
                 "models": os.environ.get("UPSTREAM_MODELS_PATH", "/v1/models"),
@@ -187,7 +260,7 @@ def _default_config() -> Json:
         },
         "gateway": {
             "tool_mode": os.environ.get("GATEWAY_TOOL_MODE", "orchestrate"),
-            "max_tool_rounds": int(os.environ.get("GATEWAY_MAX_TOOL_ROUNDS") or 5),
+            "max_tool_rounds": int(os.environ.get("GATEWAY_MAX_TOOL_ROUNDS") or 10),
             # Runtime workspace is request-scoped.  Keep the default empty so
             # missing client workspace metadata never falls back to the Gateway
             # service checkout.  An explicit env/config root is still accepted
@@ -195,13 +268,39 @@ def _default_config() -> Json:
             "workspace_root": os.environ.get("GATEWAY_WORKSPACE_ROOT", ""),
             "allow_write_tools": os.environ.get("GATEWAY_ALLOW_WRITE_TOOLS", "0") in {"1", "true", "yes"},
             "allow_shell_tools": os.environ.get("GATEWAY_ALLOW_SHELL_TOOLS", "0") in {"1", "true", "yes"},
+            "tool_cache_persist_local_results": _env_bool("GATEWAY_TOOL_CACHE_PERSIST_LOCAL_RESULTS", False),
             "request_logging": True,
             "logging_backend": os.environ.get("GATEWAY_LOGGING_BACKEND", "sqlite"),
             "max_log_payload_chars": _env_int("GATEWAY_MAX_LOG_PAYLOAD_CHARS", 200000),
             "sqlite_log_path": str(_sqlite_path()),
             "max_concurrent_requests": _env_int("GATEWAY_MAX_CONCURRENT_REQUESTS", 32),
+            "concurrency_backend": os.environ.get("GATEWAY_CONCURRENCY_BACKEND", "sqlite"),
+            "concurrency_db_path": os.environ.get(
+                "GATEWAY_CONCURRENCY_DB_PATH",
+                str(pathlib.Path(os.environ.get("GATEWAY_RUNTIME_DIR", ".gateway_runtime")) / "admission.sqlite3"),
+            ),
+            "concurrency_fallback_backend": os.environ.get("GATEWAY_CONCURRENCY_FALLBACK_BACKEND", "none"),
+            "concurrency_busy_timeout_ms": _env_int("GATEWAY_CONCURRENCY_BUSY_TIMEOUT_MS", 1000),
+            "concurrency_lease_ttl_seconds": _env_float("GATEWAY_CONCURRENCY_LEASE_TTL_SECONDS", 120.0),
+            "concurrency_heartbeat_seconds": _env_float("GATEWAY_CONCURRENCY_HEARTBEAT_SECONDS", 30.0),
             "max_request_body_bytes": _env_int("GATEWAY_MAX_REQUEST_BODY_BYTES", 64 * 1024 * 1024),
+            "cors_enabled": _env_bool("GATEWAY_CORS_ENABLED", False),
+            "cors_allowed_origins": [
+                item.strip()
+                for item in os.environ.get("GATEWAY_CORS_ALLOWED_ORIGINS", "").split(",")
+                if item.strip()
+            ],
             "concurrency_queue_timeout_seconds": _env_float("GATEWAY_CONCURRENCY_QUEUE_TIMEOUT", 5.0),
+            "rate_limit_enabled": _env_bool("GATEWAY_RATE_LIMIT_ENABLED", True),
+            "rate_limit_rpm": _env_int("GATEWAY_RATE_LIMIT_RPM", 120),
+            "rate_limit_backend": os.environ.get("GATEWAY_RATE_LIMIT_BACKEND", "sqlite"),
+            "rate_limit_db_path": os.environ.get(
+                "GATEWAY_RATE_LIMIT_DB_PATH",
+                str(pathlib.Path(os.environ.get("GATEWAY_RUNTIME_DIR", ".gateway_runtime")) / "rate_limits.sqlite3"),
+            ),
+            "rate_limit_fallback_backend": os.environ.get("GATEWAY_RATE_LIMIT_FALLBACK_BACKEND", "memory"),
+            "rate_limit_busy_timeout_ms": _env_int("GATEWAY_RATE_LIMIT_BUSY_TIMEOUT_MS", 1000),
+            "rate_limit_state_ttl_seconds": _env_int("GATEWAY_RATE_LIMIT_STATE_TTL_SECONDS", 3600),
             "tool_execution_timeout_seconds": _env_float("GATEWAY_TOOL_EXECUTION_TIMEOUT", 60.0),
             "record_unsupported_tools": _env_bool("GATEWAY_RECORD_UNSUPPORTED_TOOLS", True),
             "text_tool_call_fallback_enabled": _env_bool("GATEWAY_TEXT_TOOL_CALL_FALLBACK", True),
@@ -219,15 +318,15 @@ def _default_config() -> Json:
             "client_context_window": _env_int("GATEWAY_CLIENT_CONTEXT_WINDOW", 1048576),
             "client_auto_compact_token_limit": _env_int("GATEWAY_CLIENT_AUTO_COMPACT_TOKEN_LIMIT", 943718),
             "client_output_token_limit": _env_int("GATEWAY_CLIENT_OUTPUT_TOKEN_LIMIT", 131072),
-            "agent_planner_strict_every_turn": _env_bool("GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN", False),
+            "agent_planner_strict_every_turn": _env_bool("GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN", True),
         },
         "context": {
             "enabled": os.environ.get("GATEWAY_CONTEXT_ENABLED", "1").lower() in {"1", "true", "yes"},
-            "max_input_tokens": int(os.environ.get("GATEWAY_CONTEXT_MAX_INPUT_TOKENS") or "24000"),
+            "max_input_tokens": int(os.environ.get("GATEWAY_CONTEXT_MAX_INPUT_TOKENS") or "1048576"),
             "keep_recent_messages": int(os.environ.get("GATEWAY_CONTEXT_KEEP_RECENT_MESSAGES") or "12"),
             "summary_max_chars": int(os.environ.get("GATEWAY_CONTEXT_SUMMARY_MAX_CHARS") or "6000"),
             "fanout_enabled": os.environ.get("GATEWAY_CONTEXT_FANOUT_ENABLED", "1").lower() in {"1", "true", "yes"},
-            "fanout_chunk_tokens": int(os.environ.get("GATEWAY_CONTEXT_FANOUT_CHUNK_TOKENS") or "12000"),
+            "fanout_chunk_tokens": int(os.environ.get("GATEWAY_CONTEXT_FANOUT_CHUNK_TOKENS") or "120000"),
             "fanout_max_chunks": int(os.environ.get("GATEWAY_CONTEXT_FANOUT_MAX_CHUNKS") or "0"),
             "fanout_max_workers": int(os.environ.get("GATEWAY_CONTEXT_FANOUT_MAX_WORKERS") or "4"),
             "quality_review_enabled": _env_bool("GATEWAY_CONTEXT_QUALITY_REVIEW", True),
@@ -246,10 +345,20 @@ def _default_config() -> Json:
                 "protocol": os.environ.get("GATEWAY_LONG_CONTEXT_PROTOCOL", ""),
             },
         },
+        "persistence": {
+            "enabled": _env_bool("GATEWAY_PERSISTENCE_ENABLED", True),
+            "db_path": os.environ.get(
+                "GATEWAY_PERSISTENCE_DB_PATH",
+                str(pathlib.Path(os.environ.get("GATEWAY_RUNTIME_DIR", ".gateway_runtime")) / "gateway.db"),
+            ),
+        },
         "downstream_keys": downstream_keys,
         "mcp": {
             "servers": [],
             "marketplace_enabled": True,
+            "max_header_bytes": _env_int("GATEWAY_MCP_MAX_HEADER_BYTES", 64 * 1024),
+            "max_message_bytes": _env_int("GATEWAY_MCP_MAX_MESSAGE_BYTES", 16 * 1024 * 1024),
+            "max_stderr_bytes": _env_int("GATEWAY_MCP_MAX_STDERR_BYTES", 256 * 1024),
         },
         "http_actions": {
             "enabled": True,
@@ -289,6 +398,28 @@ def _default_config() -> Json:
             "track_quality": True,
             "retention_days": _env_int("GATEWAY_STATS_RETENTION_DAYS", 30),
         },
+        "maintenance": {
+            "enabled": _env_bool("GATEWAY_MAINTENANCE_ENABLED", True),
+            "interval_seconds": _env_int("GATEWAY_MAINTENANCE_INTERVAL_SECONDS", 300),
+            "dry_run": _env_bool("GATEWAY_MAINTENANCE_DRY_RUN", False),
+            "batch_size": _env_int("GATEWAY_MAINTENANCE_BATCH_SIZE", 1000),
+            "max_batches_per_run": _env_int("GATEWAY_MAINTENANCE_MAX_BATCHES", 4),
+            "incremental_vacuum_pages": _env_int("GATEWAY_MAINTENANCE_VACUUM_PAGES", 256),
+            "request_log_retention_days": _env_int("GATEWAY_REQUEST_LOG_RETENTION_DAYS", 30),
+            "request_log_max_rows": _env_int("GATEWAY_REQUEST_LOG_MAX_ROWS", 100000),
+            "tool_failure_retention_days": _env_int("GATEWAY_TOOL_FAILURE_RETENTION_DAYS", 90),
+            "tool_failure_max_rows": _env_int("GATEWAY_TOOL_FAILURE_MAX_ROWS", 50000),
+            "memory_retention_days": _env_int("GATEWAY_MEMORY_RETENTION_DAYS", 90),
+            "memory_max_rows": _env_int("GATEWAY_MEMORY_MAX_ROWS", 50000),
+            "planner_session_retention_days": _env_int("GATEWAY_PLANNER_RETENTION_DAYS", 30),
+            "planner_session_max_rows": _env_int("GATEWAY_PLANNER_MAX_ROWS", 20000),
+            "planner_event_max_rows": _env_int("GATEWAY_PLANNER_EVENT_MAX_ROWS", 100000),
+            "runtime_cleanup_enabled": _env_bool("GATEWAY_RUNTIME_CLEANUP_ENABLED", False),
+            "runtime_cleanup_dry_run": _env_bool("GATEWAY_RUNTIME_CLEANUP_DRY_RUN", True),
+            "runtime_retention_days": _env_int("GATEWAY_RUNTIME_RETENTION_DAYS", 7),
+            "runtime_max_entries_per_run": _env_int("GATEWAY_RUNTIME_MAX_ENTRIES_PER_RUN", 20),
+            "runtime_max_entry_bytes": _env_int("GATEWAY_RUNTIME_MAX_ENTRY_BYTES", 268435456),
+        },
         "web2api": {
             "enabled": _env_bool("GATEWAY_WEB2API_ENABLED", True),
             "max_concurrent": _env_int("GATEWAY_WEB2API_MAX_CONCURRENT", 5),
@@ -300,12 +431,26 @@ def _default_config() -> Json:
     return cfg
 
 
-def load_config() -> Json:
+def _config_file_revision_unlocked() -> str:
+    if not CONFIG_PATH.exists():
+        return "missing"
+    try:
+        return hashlib.sha256(CONFIG_PATH.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise ConfigError(f"unable to read gateway config revision: {CONFIG_PATH}", detail=str(exc)) from exc
+
+
+def config_file_revision() -> str:
+    with CONFIG_LOCK:
+        return _config_file_revision_unlocked()
+
+
+def _load_config_unlocked() -> Json:
     if not CONFIG_PATH.exists():
         cfg = _default_config()
         _ensure_client_snippet_downstream_key(cfg)
         cfg = _sync_active_upstream(cfg)
-        save_config(cfg)
+        _save_config_unlocked(cfg, expected_revision="missing")
         return cfg
     try:
         loaded = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -317,27 +462,75 @@ def load_config() -> Json:
             detail=f"{exc.__class__.__name__}: {exc}",
         ) from exc
 
-    # Decrypt sensitive fields if encrypted
     try:
         from . import gateway_encryption as ge
         loaded = ge.decrypt_config(loaded, in_place=True)
-    except Exception:
-        pass  # Encryption module not available or decryption failed
+    except Exception as exc:
+        raise ConfigError(
+            f"unable to decrypt gateway config: {CONFIG_PATH}",
+            detail=f"{exc.__class__.__name__}: {exc}",
+        ) from exc
 
     cfg = _default_config()
     _normalize_admin_credentials(loaded)
     _deep_update(cfg, loaded)
+    _apply_security_environment_overrides(cfg)
     _ensure_client_snippet_downstream_key(cfg)
     return _sync_active_upstream(cfg)
 
 
-def save_config(config: Json) -> None:
+def load_config() -> Json:
+    with CONFIG_LOCK:
+        return _load_config_unlocked()
+
+
+def load_config_with_revision() -> tuple[Json, str]:
+    with CONFIG_LOCK:
+        cfg = _load_config_unlocked()
+        return cfg, _config_file_revision_unlocked()
+
+
+def _atomic_write_config(payload: str) -> None:
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{CONFIG_PATH.name}.", suffix=".tmp", dir=str(CONFIG_PATH.parent))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, CONFIG_PATH)
+        try:
+            directory_fd = os.open(str(CONFIG_PATH.parent), os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _save_config_unlocked(config: Json, *, expected_revision: str | None = None) -> str:
+    current_revision = _config_file_revision_unlocked()
+    if expected_revision is not None and current_revision != expected_revision:
+        raise ConfigConflictError(
+            "gateway config changed while it was being edited",
+            detail={"expected_revision": expected_revision, "current_revision": current_revision},
+        )
+
     normalized = copy.deepcopy(config)
     _normalize_admin_credentials(normalized)
     _ensure_client_snippet_downstream_key(normalized)
-    # Remove implicit runtime-only roots that would point at the Gateway service
-    # checkout.  Explicit non-empty workspace_root values are preserved as an
-    # admin/testing fallback, but the default empty value is not persisted.
     if "gateway" in normalized and isinstance(normalized["gateway"], dict):
         root = str(normalized["gateway"].get("workspace_root") or "").strip()
         if not root:
@@ -349,14 +542,24 @@ def save_config(config: Json) -> None:
             except Exception:
                 pass
 
-    # Encrypt sensitive fields before saving
     try:
         from . import gateway_encryption as ge
         normalized = ge.encrypt_config(normalized, in_place=True)
-    except Exception:
-        pass  # Encryption module not available
+    except Exception as exc:
+        if os.environ.get("GATEWAY_ALLOW_PLAINTEXT_CONFIG", "").lower() not in {"1", "true", "yes", "on"}:
+            raise ConfigError(
+                "refusing to save gateway config because encryption failed",
+                detail=f"{exc.__class__.__name__}: {exc}",
+            ) from exc
 
-    CONFIG_PATH.write_text(json.dumps(_sync_active_upstream(normalized), ensure_ascii=False, indent=2), encoding="utf-8")
+    payload = json.dumps(_sync_active_upstream(normalized), ensure_ascii=False, indent=2)
+    _atomic_write_config(payload)
+    return _config_file_revision_unlocked()
+
+
+def save_config(config: Json, *, expected_revision: str | None = None) -> str:
+    with CONFIG_LOCK:
+        return _save_config_unlocked(config, expected_revision=expected_revision)
 
 
 def _deep_update(base: Json, updates: Json) -> Json:
@@ -382,8 +585,75 @@ def _normalize_admin_credentials(config: Json) -> Json:
     plain_password = admin.pop("password", None)
     if plain_password and not admin.get("password_hash"):
         password = str(plain_password)
-        admin["password_hash"] = _hash_secret(password)
+        admin["password_hash"] = _hash_password(password)
         admin.setdefault("must_change_password", password == "admin")
+    return config
+
+
+def _downstream_key_id(item: Json) -> str:
+    existing = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(item.get("id") or "")).strip("-._")
+    if existing:
+        return existing
+    seed = str(item.get("key_hash") or item.get("name") or item.get("prefix") or uuid.uuid4().hex)
+    return f"client_{hashlib.sha256(seed.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _normalize_downstream_key_ids(config: Json) -> Json:
+    downstream_keys = config.get("downstream_keys")
+    if not isinstance(downstream_keys, list):
+        return config
+    seen: set[str] = set()
+    for index, item in enumerate(downstream_keys):
+        if not isinstance(item, dict):
+            continue
+        client_id = _downstream_key_id(item)
+        if client_id in seen:
+            client_id = f"{client_id}_{index}"
+        item["id"] = client_id
+        seen.add(client_id)
+    return config
+
+
+def _apply_security_environment_overrides(config: Json) -> Json:
+    """Make explicitly supplied runtime credentials authoritative over disk state.
+
+    Production deployments commonly retain an older encrypted configuration
+    volume while rotating credentials through the process environment. An
+    empty/default persisted credential must not silently override a required
+    runtime secret or make an otherwise secure external deployment fail to
+    authenticate.
+    """
+    configured_hash = os.environ.get("GATEWAY_ADMIN_PASSWORD_HASH", "")
+    configured_password = os.environ.get("GATEWAY_ADMIN_PASSWORD", "")
+    if configured_hash or configured_password:
+        admin = config.setdefault("admin", {})
+        admin["password_hash"] = _configured_admin_password_hash(configured_hash, configured_password)
+        admin["must_change_password"] = False
+
+    downstream_key = os.environ.get("GATEWAY_DOWNSTREAM_KEY") or os.environ.get("DOWNSTREAM_API_KEY", "")
+    if downstream_key:
+        gateway = config.setdefault("gateway", {})
+        gateway["client_snippet_api_key"] = downstream_key
+        downstream_keys = config.get("downstream_keys")
+        if not isinstance(downstream_keys, list):
+            downstream_keys = []
+            config["downstream_keys"] = downstream_keys
+        key_hash = _hash_secret(downstream_key)
+        for item in downstream_keys:
+            if isinstance(item, dict) and item.get("key_hash") == key_hash:
+                item["enabled"] = True
+                item.setdefault("protocols", ["models", "chat_completions", "responses", "messages", "direct_tools"])
+                break
+        else:
+            downstream_keys.append({
+                "name": "environment",
+                "key_hash": key_hash,
+                "prefix": _secret_fingerprint(downstream_key),
+                "enabled": True,
+                "protocols": ["models", "chat_completions", "responses", "messages", "direct_tools"],
+                "created_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+            })
+        _normalize_downstream_key_ids(config)
     return config
 
 
@@ -435,6 +705,7 @@ def _redact_sensitive_values(value: Any) -> Any:
 
 def _ensure_client_snippet_downstream_key(config: Json) -> Json:
     """Make copied client snippets authenticate without extra manual key setup."""
+    _normalize_downstream_key_ids(config)
     gateway_cfg = config.get("gateway")
     if not isinstance(gateway_cfg, dict):
         return config
@@ -451,27 +722,31 @@ def _ensure_client_snippet_downstream_key(config: Json) -> Json:
         if not isinstance(item, dict):
             continue
         if item.get("key_hash") == key_hash:
-            item["prefix"] = item.get("prefix") or snippet_key[:8]
+            item["id"] = _downstream_key_id(item)
+            item["prefix"] = _secret_fingerprint(snippet_key)
             item["enabled"] = True
             item["protocols"] = protocols
             return config
         if item.get("name") == "client-snippet":
             item.update({
                 "key_hash": key_hash,
-                "prefix": snippet_key[:8],
+                "prefix": _secret_fingerprint(snippet_key),
                 "enabled": True,
                 "protocols": protocols,
             })
             item["updated_at"] = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat()
+            item["id"] = _downstream_key_id(item)
             return config
-    downstream_keys.append({
+    new_item = {
         "name": "client-snippet",
         "key_hash": key_hash,
-        "prefix": snippet_key[:8],
+        "prefix": _secret_fingerprint(snippet_key),
         "enabled": True,
         "protocols": protocols,
         "created_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
-    })
+    }
+    new_item["id"] = _downstream_key_id(new_item)
+    downstream_keys.append(new_item)
     return config
 
 
@@ -638,9 +913,9 @@ def _configured_max_tool_rounds(gateway_cfg: Json | None = None) -> int:
     if gateway_cfg is None:
         gateway_cfg = _gateway_config()
     try:
-        return int(os.environ.get("GATEWAY_MAX_TOOL_ROUNDS") or gateway_cfg.get("max_tool_rounds") or 5)
+        return int(os.environ.get("GATEWAY_MAX_TOOL_ROUNDS") or gateway_cfg.get("max_tool_rounds") or 10)
     except (TypeError, ValueError):
-        return 5
+        return 10
 
 
 _TEXT_TOOL_ADAPTER_COMPACT_FLOOR = 8000

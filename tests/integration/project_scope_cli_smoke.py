@@ -466,31 +466,15 @@ def main() -> int:
         summary["health_ok"] = health.get("ok") is True
         summary["builtin_tool_count"] = health.get("builtin_tool_count")
 
-        list_skills = tool(base_url, key, "Skill", {}, project_root, run_dir / "direct_list_skills.json")
-        read_skill = tool(base_url, key, "Skill", {"name": "live-skill"}, project_root, run_dir / "direct_read_skill.json")
-        read_plugin = tool(base_url, key, "Skill", {"name": "plugin-live-skill"}, project_root, run_dir / "direct_read_plugin_skill.json")
-        read_trace = tool(base_url, key, "Read", {"file_path": ".traces/2026-05-25/trace.txt"}, project_root, run_dir / "direct_read_trace.json")
-        read_trace_abs = tool(base_url, key, "Read", {"file_path": str(project_root / ".traces/2026-05-25/trace.txt")}, project_root, run_dir / "direct_read_trace_absolute.json")
-        function_call_result = post_json(
+        calculator = tool(
             base_url,
             key,
-            "/v1/functions/call",
-            {
-                "workspace_root": str(project_root),
-                "function": {"name": "Read", "arguments": json.dumps({"file_path": ".traces/2026-05-25/trace.txt"})},
-                "call_id": "project_scope_function_call",
-            },
+            "calculator",
+            {"expression": "20+22"},
+            project_root,
+            run_dir / "direct_calculator.json",
         )
-        (run_dir / "direct_function_call_trace.json").write_text(json.dumps(function_call_result, ensure_ascii=False, indent=2), encoding="utf-8")
-
-        list_content = content(list_skills)
-        summary["direct_skills_ok"] = "LIVE-SKILL-OK" in content(read_skill) and "SERVICE-SKILL-WRONG" not in content(read_skill)
-        summary["direct_plugin_skill_ok"] = "PLUGIN-LIVE-SKILL-OK" in content(read_plugin)
-        summary["direct_trace_ok"] = "LIVE-TRACE-OK" in content(read_trace) and "SERVICE-TRACE-WRONG" not in content(read_trace)
-        summary["direct_trace_absolute_ok"] = "LIVE-TRACE-OK" in content(read_trace_abs) and "SERVICE-TRACE-WRONG" not in content(read_trace_abs)
-        summary["direct_function_call_trace_ok"] = bool(function_call_result.get("success")) and "LIVE-TRACE-OK" in content(function_call_result) and "SERVICE-TRACE-WRONG" not in content(function_call_result)
-        summary["direct_list_has_project_skills"] = all(name in list_content for name in ("live-skill", "codex-live-skill", "plugin-live-skill")) and str(project_root) in list_content
-        summary["direct_list_leaks_service_skills"] = "SERVICE-SKILL-WRONG" in list_content or str(service_root / ".claude/skills/live-skill") in list_content or str(service_root / ".codex/skills/codex-live-skill") in list_content
+        summary["gateway_owned_calculator_ok"] = content(calculator) == "42"
 
         tool(base_url, key, "SaveMemory", {"action": "write", "summary": "SERVICE-MEMORY-WRONG", "keywords": ["service-memory-wrong"], "session_key": "service-scope"}, service_root, run_dir / "direct_service_save_memory.json")
         tool(base_url, key, "SaveMemory", {"action": "write", "summary": "LIVE-MEMORY-OK project scoped", "keywords": ["live-memory-ok"], "session_key": "project-scope"}, project_root, run_dir / "direct_project_save_memory.json")
@@ -528,11 +512,13 @@ def main() -> int:
             run_dir / "responses_skill.sse",
         )
         summary["anthropic_stream_skill_ok"] = (
-            ("LIVE-SKILL-OK" in anthropic_sse or ('"type": "tool_use"' in anthropic_sse and '"name": "Skill"' in anthropic_sse))
+            '"type": "tool_use"' in anthropic_sse
+            and '"name": "Skill"' in anthropic_sse
             and "SERVICE-SKILL-WRONG" not in anthropic_sse
         )
         summary["responses_stream_skill_ok"] = (
-            ("CODEX-LIVE-SKILL-OK" in responses_sse or '"type": "function_call"' in responses_sse)
+            '"type": "function_call"' in responses_sse
+            and '"name": "Skill"' in responses_sse
             and "SERVICE-SKILL-WRONG" not in responses_sse
         )
         summary["responses_stream_order_ok"] = "response.created" in responses_sse and "response.completed" in responses_sse and responses_sse.find("response.created") < responses_sse.find("response.completed")
@@ -552,12 +538,7 @@ def main() -> int:
 
         required = [
             "health_ok",
-            "direct_skills_ok",
-            "direct_plugin_skill_ok",
-            "direct_trace_ok",
-            "direct_trace_absolute_ok",
-            "direct_function_call_trace_ok",
-            "direct_list_has_project_skills",
+            "gateway_owned_calculator_ok",
             "memory_project_root_ok",
             "anthropic_stream_skill_ok",
             "responses_stream_skill_ok",
@@ -565,7 +546,7 @@ def main() -> int:
             "claude_skill_ok",
             "codex_skill_ok",
         ]
-        summary["pass"] = all(bool(summary.get(key_name)) for key_name in required) and not summary.get("direct_list_leaks_service_skills") and not summary.get("memory_service_root_leak")
+        summary["pass"] = all(bool(summary.get(key_name)) for key_name in required) and not summary.get("memory_service_root_leak")
         return 0 if summary["pass"] else 1
     finally:
         proc.terminate()

@@ -8,13 +8,17 @@ import sys
 import tempfile
 import threading
 import uuid
+import io
 import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
+from typing import Any
 
 import src.toolcall_gateway as gateway
+
+Json = dict[str, Any]
 from src.toolcall_gateway import (
     BUILTIN_TOOLS,
     NativeToolVerificationError,
@@ -53,6 +57,69 @@ class FakeClient:
 
 
 class NativeGatewayTests(unittest.TestCase):
+    def test_python_request_rate_limit_is_per_authenticated_client(self):
+        from src.gateway_rate_limit import RATE_LIMIT_SERVICE
+
+        class Handler:
+            client_address = ("127.0.0.1", 12345)
+
+        RATE_LIMIT_SERVICE.memory.clear()
+        with patch("src.gateway_config._gateway_config", return_value={"rate_limit_enabled": True, "rate_limit_rpm": 2}):
+            gateway._enforce_request_rate_limit(Handler(), "client-a")
+            gateway._enforce_request_rate_limit(Handler(), "client-a")
+            with self.assertRaises(gateway.GatewayBusyError):
+                gateway._enforce_request_rate_limit(Handler(), "client-a")
+            gateway._enforce_request_rate_limit(Handler(), "client-b")
+
+    def test_capability_contract_is_truthful_about_compatibility_and_dormant_modules(self):
+        contract = gateway._capability_contract()
+        self.assertEqual(contract["api"]["assistants"], "minimal_create_compatibility_only")
+        self.assertEqual(contract["api"]["threads"], "minimal_create_compatibility_only")
+        self.assertTrue(contract["request_path"]["authenticated_client_rate_limit"])
+        self.assertEqual(contract["request_path"]["rate_limit_backend"]["configured"], "sqlite")
+        self.assertIn(contract["request_path"]["rate_limit_backend"]["active"], {"sqlite", "memory_fallback"})
+        self.assertIn("not_integrated", contract["request_path"]["gateway_concurrency_module"])
+        self.assertIn("not_integrated", contract["request_path"]["web2api_module"])
+        self.assertEqual(contract["streaming"]["orchestrated_safe_text"], "end_to_end_incremental")
+        self.assertTrue(contract["streaming"]["client_disconnect_cancels_upstream"])
+
+    def test_json_reader_rejects_malformed_and_non_object_bodies_as_bad_request(self):
+        from src.gateway_errors import BadRequestError
+
+        class Handler:
+            def __init__(self, raw: bytes):
+                self.headers = {"Content-Length": str(len(raw))}
+                self.rfile = io.BytesIO(raw)
+
+        with patch("src.gateway_http_handler._request_body_limit", return_value=1024):
+            with self.assertRaises(BadRequestError):
+                gateway._read_json(Handler(b'{"broken":'))
+            with self.assertRaises(BadRequestError):
+                gateway._read_json(Handler(b'[1, 2, 3]'))
+
+    def test_semantic_cache_fingerprint_binds_full_request_contract(self):
+        base = {
+            "model": "model-a",
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": "answer tersely"},
+                {"role": "user", "content": "same question"},
+            ],
+            "temperature": 0.2,
+        }
+        first = gateway._semantic_cache_request_fingerprint("/v1/chat/completions", base)
+        same = gateway._semantic_cache_request_fingerprint("/v1/chat/completions", {**base, "stream": True})
+        different_model = gateway._semantic_cache_request_fingerprint("/v1/chat/completions", {**base, "model": "model-b"})
+        different_system = gateway._semantic_cache_request_fingerprint(
+            "/v1/chat/completions",
+            {**base, "messages": [{"role": "system", "content": "answer expansively"}, base["messages"][1]]},
+        )
+        different_path = gateway._semantic_cache_request_fingerprint("/v1/messages", base)
+        self.assertEqual(first, same)
+        self.assertNotEqual(first, different_model)
+        self.assertNotEqual(first, different_system)
+        self.assertNotEqual(first, different_path)
+
     def test_detects_chat_tool_calls(self):
         response = {
             "choices": [
@@ -548,12 +615,12 @@ class NativeGatewayTests(unittest.TestCase):
             cfg = gateway._default_config()
             self.assertEqual(cfg["gateway"]["client_snippet_api_key"], "env-downstream-key")
             self.assertEqual(len(cfg["downstream_keys"]), 1)
-            self.assertEqual(cfg["downstream_keys"][0]["prefix"], "env-down")
+            self.assertEqual(cfg["downstream_keys"][0]["prefix"], gateway._secret_fingerprint("env-downstream-key"))
 
             os.environ["GATEWAY_DOWNSTREAM_KEY"] = "gateway-key"
             cfg = gateway._default_config()
             self.assertEqual(cfg["gateway"]["client_snippet_api_key"], "env-downstream-key")
-            self.assertEqual(cfg["downstream_keys"][0]["prefix"], "gateway-")
+            self.assertEqual(cfg["downstream_keys"][0]["prefix"], gateway._secret_fingerprint("gateway-key"))
         finally:
             if old_downstream is None:
                 os.environ.pop("DOWNSTREAM_API_KEY", None)
@@ -580,12 +647,14 @@ class NativeGatewayTests(unittest.TestCase):
                 )
 
                 cfg = gateway.load_config()
-                self.assertEqual(cfg["admin"]["password_hash"], gateway._hash_secret("configured-admin-pass"))
+                self.assertTrue(cfg["admin"]["password_hash"].startswith("pbkdf2_sha256$"))
+                self.assertTrue(gateway._verify_password("configured-admin-pass", cfg["admin"]["password_hash"]))
                 self.assertNotIn("password", cfg["admin"])
 
                 gateway.save_config(cfg)
                 saved = json.loads(gateway.CONFIG_PATH.read_text(encoding="utf-8"))
-                self.assertEqual(saved["admin"]["password_hash"], gateway._hash_secret("configured-admin-pass"))
+                self.assertTrue(saved["admin"]["password_hash"].startswith("pbkdf2_sha256$"))
+                self.assertTrue(gateway._verify_password("configured-admin-pass", saved["admin"]["password_hash"]))
                 self.assertNotIn("password", saved["admin"])
                 self.assertNotIn("configured-admin-pass", gateway.CONFIG_PATH.read_text(encoding="utf-8"))
             finally:
@@ -714,7 +783,7 @@ class NativeGatewayTests(unittest.TestCase):
                 )
                 repaired = gateway.load_config()["downstream_keys"][0]
                 self.assertTrue(repaired["enabled"])
-                self.assertEqual(repaired["prefix"], "disabled")
+                self.assertEqual(repaired["prefix"], gateway._secret_fingerprint("disabled-existing-key"))
                 self.assertEqual(repaired["protocols"], ["models", "chat_completions", "responses", "messages", "direct_tools"])
             finally:
                 gateway.CONFIG_PATH = old_config
@@ -727,6 +796,8 @@ class NativeGatewayTests(unittest.TestCase):
         self.assertFalse(template["gateway"]["allow_shell_tools"])
         self.assertEqual(template["gateway"].get("max_request_body_bytes"), 64 * 1024 * 1024)
         self.assertEqual(template["gateway"].get("max_log_payload_chars"), 200000)
+        self.assertFalse(template["gateway"].get("cors_enabled"))
+        self.assertEqual(template["gateway"].get("cors_allowed_origins"), [])
 
         yaml_text = (repo_root / "gateway.config.yaml").read_text(encoding="utf-8")
         self.assertIn("# workspace_root: /absolute/client/workspace", yaml_text)
@@ -734,6 +805,7 @@ class NativeGatewayTests(unittest.TestCase):
         self.assertIn("allow_shell_tools: false", yaml_text)
         self.assertIn("max_request_body_bytes: 67108864", yaml_text)
         self.assertIn("max_log_payload_chars: 200000", yaml_text)
+        self.assertIn("cors_enabled: false", yaml_text)
 
         env_example = (repo_root / ".env.example").read_text(encoding="utf-8")
         dockerfile = (repo_root / "Dockerfile").read_text(encoding="utf-8")
@@ -742,6 +814,7 @@ class NativeGatewayTests(unittest.TestCase):
         self.assertNotIn("GATEWAY_ADMIN_PASSWORD=admin", dockerfile)
         self.assertIn("GATEWAY_MAX_REQUEST_BODY_BYTES=67108864", env_example)
         self.assertIn("GATEWAY_MAX_LOG_PAYLOAD_CHARS=200000", env_example)
+        self.assertIn("GATEWAY_CORS_ENABLED=0", env_example)
         self.assertIn("GATEWAY_MAX_REQUEST_BODY_BYTES=${GATEWAY_MAX_REQUEST_BODY_BYTES:-67108864}", compose)
         self.assertIn("GATEWAY_MAX_LOG_PAYLOAD_CHARS=${GATEWAY_MAX_LOG_PAYLOAD_CHARS:-200000}", compose)
         self.assertIn("GATEWAY_MAX_REQUEST_BODY_BYTES=${GATEWAY_MAX_REQUEST_BODY_BYTES:-67108864}", prod_compose)
@@ -2379,9 +2452,10 @@ class NativeGatewayTests(unittest.TestCase):
                     post("/v1/tools/call", {"tool": "calculator", "arguments": {"expression": "1+1"}})
                     post("/v1/assistants", {"model": "m"})
 
-                self.assertEqual(captured["token"], [("/v1/messages/count_tokens", "public-client")])
-                self.assertEqual(captured["direct"], [("/v1/tools/call", "public-client")])
-                self.assertEqual(captured["public"], [("/v1/assistants", "public-client", "assistants")])
+                client_id = gateway.load_config()["downstream_keys"][0]["id"]
+                self.assertEqual(captured["token"], [("/v1/messages/count_tokens", client_id)])
+                self.assertEqual(captured["direct"], [("/v1/tools/call", client_id)])
+                self.assertEqual(captured["public"], [("/v1/assistants", client_id, "assistants")])
             finally:
                 httpd.shutdown()
                 httpd.server_close()
@@ -3020,6 +3094,7 @@ class NativeGatewayTests(unittest.TestCase):
             try:
                 os.environ.pop("GATEWAY_MAX_TOOL_ROUNDS", None)
                 cfg = gateway._default_config()
+                cfg["gateway"]["agent_planner_strict_every_turn"] = False
                 cfg["gateway"]["max_tool_rounds"] = 1
                 gateway.save_config(cfg)
                 client = FakeClient(
@@ -3078,19 +3153,19 @@ class NativeGatewayTests(unittest.TestCase):
             self.assertEqual(_configured_max_tool_rounds({"max_tool_rounds": 7}), 7)
 
             # default 5 when neither env nor config (explicit empty dict)
-            self.assertEqual(_configured_max_tool_rounds({}), 5)
+            self.assertEqual(_configured_max_tool_rounds({}), 10)
 
-            # default 5 when None passed and config has no max_tool_rounds
+            # canonical default 10 when config has no max_tool_rounds
             with patch("src.gateway_config._gateway_config", return_value={}):
-                self.assertEqual(_configured_max_tool_rounds(None), 5)
+                self.assertEqual(_configured_max_tool_rounds(None), 10)
 
             # invalid env var falls back to default
             os.environ["GATEWAY_MAX_TOOL_ROUNDS"] = "not-a-number"
-            self.assertEqual(_configured_max_tool_rounds({}), 5)
+            self.assertEqual(_configured_max_tool_rounds({}), 10)
 
             # invalid config value falls back to default
             os.environ.pop("GATEWAY_MAX_TOOL_ROUNDS", None)
-            self.assertEqual(_configured_max_tool_rounds({"max_tool_rounds": "bad"}), 5)
+            self.assertEqual(_configured_max_tool_rounds({"max_tool_rounds": "bad"}), 10)
         finally:
             if old_env is None:
                 os.environ.pop("GATEWAY_MAX_TOOL_ROUNDS", None)
@@ -3229,6 +3304,7 @@ class NativeGatewayTests(unittest.TestCase):
             os.environ["GATEWAY_UPSTREAM_STREAM_AGGREGATE"] = "0"
             try:
                 cfg = gateway._default_config()
+                cfg["gateway"]["agent_planner_strict_every_turn"] = False
                 cfg["gateway"]["text_tool_call_fallback_enabled"] = True
                 cfg["gateway"]["delegate_tools_to_downstream"] = False
                 cfg["gateway"]["execute_user_side_tools_in_gateway"] = True
@@ -3276,6 +3352,7 @@ class NativeGatewayTests(unittest.TestCase):
             os.environ["GATEWAY_WORKSPACE_ROOT"] = td
             try:
                 cfg = gateway._default_config()
+                cfg["gateway"]["agent_planner_strict_every_turn"] = False
                 cfg["upstream"]["tools_enabled"] = "auto"
                 cfg["upstream"]["capabilities"]["supports_tools"] = False
                 cfg["upstream"]["capabilities"]["supports_function_calls"] = False
@@ -3323,6 +3400,7 @@ class NativeGatewayTests(unittest.TestCase):
             os.environ.pop("GATEWAY_EXECUTE_USER_SIDE_TOOLS", None)
             try:
                 cfg = gateway._default_config()
+                cfg["gateway"]["agent_planner_strict_every_turn"] = False
                 cfg["upstream"]["tools_enabled"] = "adapter"
                 cfg["upstream"]["capabilities"]["supports_tools"] = False
                 cfg["upstream"]["capabilities"]["supports_function_calls"] = False
@@ -3376,6 +3454,7 @@ class NativeGatewayTests(unittest.TestCase):
             gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
             try:
                 cfg = gateway._default_config()
+                cfg["gateway"]["agent_planner_strict_every_turn"] = False
                 cfg["upstream"]["protocol"] = "openai_chat"
                 cfg["upstream"]["tools_enabled"] = "auto"
                 cfg["upstream"]["capabilities"]["supports_tools"] = False
@@ -3450,6 +3529,7 @@ class NativeGatewayTests(unittest.TestCase):
             gateway.CONFIG_PATH = pathlib.Path(td) / "config.json"
             try:
                 cfg = gateway._default_config()
+                cfg["gateway"]["agent_planner_strict_every_turn"] = False
                 cfg["context"]["enabled"] = True
                 cfg["context"]["max_input_tokens"] = 100
                 cfg["context"]["summary_max_chars"] = 2000
@@ -3526,6 +3606,7 @@ class NativeGatewayTests(unittest.TestCase):
             os.environ.pop("GATEWAY_WORKSPACE_ROOT", None)
             try:
                 cfg = gateway._default_config()
+                cfg["gateway"]["agent_planner_strict_every_turn"] = False
                 cfg["upstream"]["tools_enabled"] = "adapter"
                 cfg["upstream"]["capabilities"]["supports_tools"] = False
                 cfg["upstream"]["capabilities"]["supports_function_calls"] = False
@@ -3832,7 +3913,8 @@ class NativeGatewayTests(unittest.TestCase):
                 self.assertIn("片段 1/2", client.requests[0][1]["messages"][-1]["content"])
                 self.assertIn("片段 2/2", client.requests[1][1]["messages"][-1]["content"])
                 self.assertIn("子分析 1", client.requests[2][1]["messages"][-1]["content"])
-                self.assertIn("质量审查器", client.requests[3][1]["messages"][-1]["content"])
+                self.assertIn("最终答案改写器", client.requests[3][1]["messages"][-1]["content"])
+                self.assertIn("只返回用户可以直接使用的最终答案", client.requests[3][1]["messages"][-1]["content"])
                 self.assertNotIn("tools", client.requests[0][1])
             finally:
                 gateway.CONFIG_PATH = old_config
@@ -4606,8 +4688,10 @@ class NativeGatewayTests(unittest.TestCase):
                     },
                 ]
                 gateway.save_config(cfg)
-                self.assertEqual(gateway._check_downstream_key(DummyHandler("/v1/models", "chat-only-key")), "chat-only")
-                self.assertEqual(gateway._check_downstream_key(DummyHandler("/v1/tools/call", "tools-only-key")), "tools-only")
+                saved = gateway.load_config()
+                client_ids = {item["name"]: item["id"] for item in saved["downstream_keys"]}
+                self.assertEqual(gateway._check_downstream_key(DummyHandler("/v1/models", "chat-only-key")), client_ids["chat-only"])
+                self.assertEqual(gateway._check_downstream_key(DummyHandler("/v1/tools/call", "tools-only-key")), client_ids["tools-only"])
                 with self.assertRaises(gateway.DownstreamAuthError):
                     gateway._check_downstream_key(DummyHandler("/v1/responses", "chat-only-key"))
                 with self.assertRaises(gateway.DownstreamAuthError):
@@ -4857,7 +4941,7 @@ class NativeGatewayTests(unittest.TestCase):
                 thread.join(timeout=2)
                 gateway.CONFIG_PATH = old_config
 
-    def test_streaming_post_passes_downstream_key_name_as_client_id(self):
+    def test_streaming_post_passes_stable_downstream_key_id_as_client_id(self):
         captured = {}
 
         def fake_stream(handler, path, body, client_id=None):
@@ -4904,7 +4988,8 @@ class NativeGatewayTests(unittest.TestCase):
                     urllib.request.urlopen(req, timeout=5).read()
                 self.assertEqual(captured["path"], "/v1/chat/completions")
                 self.assertTrue(captured["stream"])
-                self.assertEqual(captured["client_id"], "stream-client")
+                client_id = gateway.load_config()["downstream_keys"][0]["id"]
+                self.assertEqual(captured["client_id"], client_id)
             finally:
                 httpd.shutdown()
                 httpd.server_close()
@@ -4921,6 +5006,71 @@ class NativeGatewayTests(unittest.TestCase):
         self.assertIn("原始用户问题（压缩）", prompt)
         self.assertIn("[gateway context compacted]", prompt)
         self.assertNotIn("Sorry, the text you sent is too long", prompt)
+
+    def test_fanout_preserves_source_order_and_reports_truncation(self):
+        import time
+
+        class OutOfOrderClient:
+            def __init__(self):
+                self.synthesis_prompt = ""
+
+            def forward(self, path, body):
+                prompt = body["messages"][-1]["content"]
+                if prompt.startswith("片段 1/2"):
+                    time.sleep(0.05)
+                    return {"choices": [{"message": {"content": "first partial"}}]}
+                if prompt.startswith("片段 2/2"):
+                    return {"choices": [{"message": {"content": "second partial"}}]}
+                self.synthesis_prompt = prompt
+                return {"choices": [{"message": {"content": "final"}}]}
+
+        client = OutOfOrderClient()
+        result = gateway._run_context_fanout(
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "x" * 300}]},
+            client,
+            {"context": {
+                "fanout_enabled": True,
+                "max_input_tokens": 1,
+                "fanout_chunk_tokens": 10,
+                "fanout_max_chunks": 2,
+                "fanout_max_workers": 2,
+                "quality_review_enabled": False,
+            }},
+        )
+        self.assertLess(client.synthesis_prompt.index("first partial"), client.synthesis_prompt.index("second partial"))
+        self.assertTrue(result["gateway_context"]["truncated"])
+        self.assertGreater(result["gateway_context"]["omitted_source_chars"], 0)
+        self.assertEqual(result["gateway_context"]["successful_chunks"], 2)
+
+    def test_fanout_reports_failed_chunk_and_review_prompt_demands_final_answer(self):
+        class PartialFailureClient:
+            def forward(self, path, body):
+                prompt = body["messages"][-1]["content"]
+                if prompt.startswith("片段 1/2"):
+                    return {"choices": [{"message": {"content": "surviving partial"}}]}
+                if prompt.startswith("片段 2/2"):
+                    raise RuntimeError("chunk failed")
+                return {"choices": [{"message": {"content": "final from partial"}}]}
+
+        result = gateway._run_context_fanout(
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "x" * 100}]},
+            PartialFailureClient(),
+            {"context": {
+                "fanout_enabled": True,
+                "max_input_tokens": 1,
+                "fanout_chunk_tokens": 10,
+                "fanout_max_chunks": 2,
+                "fanout_max_workers": 2,
+                "quality_review_enabled": False,
+            }},
+        )
+        self.assertEqual(result["gateway_context"]["failed_chunks"], [2])
+        self.assertEqual(result["gateway_context"]["successful_chunks"], 1)
+        review = gateway._make_quality_review_prompt("question", "draft")
+        self.assertIn("只返回用户可以直接使用的最终答案", review)
+        self.assertIn("不要输出审查过程", review)
 
     def test_upstream_too_long_response_triggers_forced_fanout(self):
         with tempfile.TemporaryDirectory() as td:
@@ -5430,7 +5580,13 @@ while True:
                 # Legacy format mcp_server_tool is ambiguous; only mcp__server__tool is parsed
                 self.assertIsNone(_mcp_parse_public_name(legacy_name))
                 self.assertEqual(_mcp_parse_public_name(public_name), ("test", "echo_mcp"))
-                merged = _merge_builtin_tools("/v1/chat/completions", {"messages": []})
+                merged = _merge_builtin_tools(
+                    "/v1/chat/completions",
+                    {
+                        "gateway_context": {"client_can_handle_implicit_tools": True},
+                        "messages": [{"role": "user", "content": "inspect the project files"}],
+                    },
+                )
                 names = [
                     t.get("function", {}).get("name")
                     for t in merged.get("tools", [])
@@ -6994,7 +7150,13 @@ while True:
                         },
                     }
                 )
-                merged = _merge_builtin_tools("/v1/chat/completions", {"messages": []})
+                merged = _merge_builtin_tools(
+                    "/v1/chat/completions",
+                    {
+                        "gateway_context": {"client_can_handle_implicit_tools": True},
+                        "messages": [{"role": "user", "content": "inspect the project files"}],
+                    },
+                )
                 names = [
                     t.get("function", {}).get("name")
                     for t in merged["tools"]
@@ -7302,7 +7464,7 @@ while True:
         self.assertEqual(result.failure_type, "invalid_input")
         self.assertIn("allow_private_network", result.content)
 
-    def test_streaming_chat_request_returns_sse_without_upstream_stream_in_orchestrate_mode(self):
+    def test_streaming_chat_request_requests_upstream_stream_in_orchestrate_mode(self):
         class UpstreamHandler(BaseHTTPRequestHandler):
             seen_bodies = []
 
@@ -7358,7 +7520,7 @@ while True:
                     text = resp.read().decode("utf-8")
                 self.assertIn("stream ok", text)
                 self.assertIn("data: [DONE]", text)
-                self.assertFalse(UpstreamHandler.seen_bodies[0]["stream"])
+                self.assertTrue(UpstreamHandler.seen_bodies[0]["stream"])
                 self.assertEqual(_response_text("/v1/chat/completions", {"choices": [{"message": {"content": "x"}}]}), "x")
             finally:
                 upstream.shutdown()
@@ -7605,6 +7767,7 @@ while True:
             os.environ["GATEWAY_UPSTREAM_STREAM_AGGREGATE"] = "0"
             try:
                 cfg = gateway._default_config()
+                cfg["gateway"]["agent_planner_strict_every_turn"] = False
                 cfg["upstream"]["base_url"] = f"http://127.0.0.1:{upstream.server_address[1]}"
                 cfg["upstream"]["model"] = "m-chat-only"
                 cfg["upstream"]["protocol"] = "openai_chat"
@@ -8328,6 +8491,7 @@ class AnthropicSSEFormatTests(unittest.TestCase):
                 workspace.mkdir()
                 os.environ.pop("GATEWAY_TOOL_MODE", None)
                 cfg = gateway._default_config()
+                cfg["gateway"]["agent_planner_strict_every_turn"] = False
                 cfg["gateway"]["tool_mode"] = "orchestrate"
                 gateway.save_config(cfg)
 
@@ -8468,6 +8632,7 @@ class AnthropicSSEFormatTests(unittest.TestCase):
             try:
                 os.environ.pop("GATEWAY_TOOL_MODE", None)
                 cfg = gateway._default_config()
+                cfg["gateway"]["agent_planner_strict_every_turn"] = False
                 cfg["gateway"]["tool_mode"] = "orchestrate"
                 cfg["upstream"]["protocol"] = "openai_chat"
                 cfg["upstream"]["tools_enabled"] = "adapter"

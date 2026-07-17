@@ -28,23 +28,31 @@ COPY gateway.config.json gateway.config.yaml ./
 COPY mcp_defaults.yaml ./
 
 # Create directories for runtime data
-RUN mkdir -p /app/data /app/workspace
+RUN groupadd --system gateway && useradd --system --gid gateway --home-dir /app --shell /usr/sbin/nologin gateway \
+    && mkdir -p /app/data /app/workspace \
+    && chown -R gateway:gateway /app
 
 # Environment variables with sensible defaults
 ENV GATEWAY_PORT=8885 \
     GATEWAY_HOST=0.0.0.0 \
+    GATEWAY_PUBLIC_EXPOSURE=auto \
     GATEWAY_SQLITE_LOG_PATH=/app/data/gateway_log.sqlite3 \
     GATEWAY_CONFIG_PATH=/app/data/.gateway_service.json \
     GATEWAY_STATS_PATH=/app/data/.gateway_stats.json \
     GATEWAY_REQUEST_LOG=/app/data/.gateway_requests.jsonl \
+    GATEWAY_RUNTIME_DIR=/app/data/runtime \
+    GATEWAY_ADMIN_SKILLS_ROOT=/app/data/skills \
     GATEWAY_WORKSPACE_ROOT=/app/workspace \
+    PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
+
+USER gateway:gateway
 
 EXPOSE 8885
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:8885/healthz || exit 1
+    CMD curl -f http://localhost:8885/readyz || exit 1
 
 # Run the gateway
 CMD ["python3", "src/toolcall_gateway.py", "--host", "0.0.0.0", "--port", "8885"]

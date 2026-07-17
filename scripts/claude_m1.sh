@@ -11,13 +11,14 @@ CONFIG_PATH="${GATEWAY_CONFIG_PATH:-$ROOT_DIR/.gateway_service.json}"
 
 config_value() {
   local key="$1" fallback="$2"
-  CONFIG_PATH="$CONFIG_PATH" CONFIG_KEY="$key" CONFIG_FALLBACK="$fallback" python3 - <<'PY'
-import json, os, pathlib
-path = pathlib.Path(os.environ.get("CONFIG_PATH") or "")
+  ROOT_DIR="$ROOT_DIR" GATEWAY_CONFIG_PATH="$CONFIG_PATH" CONFIG_KEY="$key" CONFIG_FALLBACK="$fallback" python3 - <<'PY'
+import os, sys
 key = os.environ.get("CONFIG_KEY") or ""
 fallback = os.environ.get("CONFIG_FALLBACK") or ""
 try:
-    cfg = json.loads(path.read_text())
+    sys.path.insert(0, os.environ["ROOT_DIR"])
+    from src.gateway_config import load_config
+    cfg = load_config()
     cur = cfg
     for part in key.split("."):
         cur = cur.get(part) if isinstance(cur, dict) else None

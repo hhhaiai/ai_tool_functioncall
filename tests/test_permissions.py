@@ -167,6 +167,7 @@ class TestPermissionManager(unittest.TestCase):
         config = {
             "permissions": {
                 "enabled": True,
+                "default_allow": True,
                 "global_rules": [
                     {"pattern": "Bash", "allow": False, "reason": "dangerous"}
                 ],
@@ -351,6 +352,7 @@ class TestGlobalAPI(unittest.TestCase):
         config = {
             "permissions": {
                 "enabled": True,
+                "default_allow": True,
                 "global_rules": [
                     {"pattern": "Bash", "allow": False}
                 ],
@@ -362,6 +364,27 @@ class TestGlobalAPI(unittest.TestCase):
 
         allowed, reason = check_tool_permission("Read", "test_client", log=False)
         self.assertTrue(allowed)
+
+    def test_stable_downstream_id_uses_legacy_display_name_policy(self):
+        config = {
+            "downstream_keys": [{
+                "id": "client_stable",
+                "name": "friendly-name",
+                "key_hash": "legacy-hash",
+            }],
+            "permissions": {
+                "enabled": True,
+                "clients": {
+                    "friendly-name": {
+                        "allow_categories": ["read"],
+                        "default_allow": False,
+                    }
+                },
+            },
+        }
+        manager = PermissionManager(config)
+        self.assertTrue(manager.check_permission("Read", "client_stable")[0])
+        self.assertFalse(manager.check_permission("Bash", "client_stable")[0])
 
 
 class TestComplexScenarios(unittest.TestCase):

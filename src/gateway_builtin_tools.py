@@ -13,6 +13,7 @@ import concurrent.futures
 import contextvars
 import datetime as _dt
 import glob
+import hashlib
 import html
 import json
 import logging
@@ -21,9 +22,12 @@ import os
 import pathlib
 import re
 import select
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -32,6 +36,33 @@ from typing import Any, Callable
 from dataclasses import dataclass
 
 from .gateway_errors import ToolExecutionError, ToolResult
+from .gateway_file_ops import (
+    atomic_copy_file,
+    atomic_update_text,
+    atomic_write_bytes,
+    atomic_write_text,
+    durable_create_directory,
+    durable_delete_path,
+    durable_move_path,
+    fsync_directory,
+    path_write_locks,
+    remove_path_locked,
+    replace_bytes_locked,
+)
+from .gateway_process_ops import (
+    BoundedProcessStream as _BoundedProcessStream,
+    process_group_kwargs as _process_group_kwargs,
+    run_bounded_process as _shared_run_bounded_process,
+    terminate_process_group as _terminate_process_group,
+)
+from .gateway_sandbox import (
+    SANDBOX_WORKER_ERROR_PREFIX,
+    SANDBOX_WORKER_SETUP_EXIT,
+    SandboxDiffEntry,
+    sandbox_child_environment,
+    sandbox_worker_command,
+    workspace_job,
+)
 from .gateway_mcp import (
     McpSession,
     _enabled_mcp_servers,
@@ -394,39 +425,39 @@ def _tool_tree(args: Json) -> str:
 def _tool_create_directory(args: Json) -> str:
     _require_write_enabled()
     path = _resolve_workspace_path(str(args.get("path") or args.get("dir") or args.get("directory") or ""))
-    path.mkdir(parents=bool(args.get("parents", True)), exist_ok=bool(args.get("exist_ok", True)))
+    try:
+        durable_create_directory(
+            path,
+            parents=bool(args.get("parents", True)),
+            exist_ok=bool(args.get("exist_ok", True)),
+        )
+    except FileExistsError:
+        raise ToolExecutionError(f"directory already exists: {path}", failure_type="invalid_input")
     return f"created directory {path.relative_to(_workspace_root().resolve())}"
 
 def _tool_delete_path(args: Json) -> str:
     _require_write_enabled()
     path = _resolve_workspace_path(str(args.get("path") or args.get("file_path") or ""))
-    if not path.exists():
+    if path.resolve() == _workspace_root().resolve():
+        raise ToolExecutionError("refusing to delete workspace root", failure_type="permission_denied")
+    try:
+        durable_delete_path(path, recursive=bool(args.get("recursive")))
+    except FileNotFoundError:
         raise ToolExecutionError(f"path not found: {path}", failure_type="not_found")
-    if path.is_dir():
-        if path.resolve() == _workspace_root().resolve():
-            raise ToolExecutionError("refusing to delete workspace root", failure_type="permission_denied")
-        if not args.get("recursive"):
-            raise ToolExecutionError("refusing to delete directory without recursive=true", failure_type="invalid_input")
-        for child in sorted(path.rglob("*"), key=lambda p: len(p.parts), reverse=True):
-            if child.is_file() or child.is_symlink():
-                child.unlink()
-            elif child.is_dir():
-                child.rmdir()
-        path.rmdir()
-    else:
-        path.unlink()
+    except IsADirectoryError:
+        raise ToolExecutionError("refusing to delete directory without recursive=true", failure_type="invalid_input")
     return f"deleted {path.relative_to(_workspace_root().resolve())}"
 
 def _tool_move_path(args: Json) -> str:
     _require_write_enabled()
     src = _resolve_workspace_path(str(args.get("source") or args.get("src") or args.get("from") or args.get("path") or ""))
     dst = _resolve_workspace_path(str(args.get("destination") or args.get("dest") or args.get("to") or ""))
-    if not src.exists():
+    try:
+        durable_move_path(src, dst, overwrite=bool(args.get("overwrite")))
+    except FileNotFoundError:
         raise ToolExecutionError(f"source not found: {src}", failure_type="not_found")
-    if dst.exists() and not args.get("overwrite"):
+    except FileExistsError:
         raise ToolExecutionError(f"destination exists: {dst}", failure_type="invalid_input")
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    src.replace(dst)
     return f"moved {src.relative_to(_workspace_root().resolve())} to {dst.relative_to(_workspace_root().resolve())}"
 
 def _tool_copy_path(args: Json) -> str:
@@ -435,10 +466,10 @@ def _tool_copy_path(args: Json) -> str:
     dst = _resolve_workspace_path(str(args.get("destination") or args.get("dest") or args.get("to") or ""))
     if not src.is_file():
         raise ToolExecutionError(f"source file not found: {src}", failure_type="not_found")
-    if dst.exists() and not args.get("overwrite"):
+    try:
+        atomic_copy_file(src, dst, overwrite=bool(args.get("overwrite")))
+    except FileExistsError:
         raise ToolExecutionError(f"destination exists: {dst}", failure_type="invalid_input")
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.write_bytes(src.read_bytes())
     return f"copied {src.relative_to(_workspace_root().resolve())} to {dst.relative_to(_workspace_root().resolve())}"
 
 def _tool_glob(args: Json) -> str:
@@ -490,9 +521,8 @@ def _tool_write(args: Json) -> str:
     _require_write_enabled()
     path = _resolve_workspace_path(str(args.get("file_path") or args.get("path") or ""))
     content = str(args.get("content") if args.get("content") is not None else args.get("file_text") or "")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-    return f"wrote {len(content)} bytes to {path.relative_to(_workspace_root().resolve())}"
+    atomic_write_text(path, content, encoding="utf-8")
+    return f"wrote {len(content.encode('utf-8'))} bytes to {path.relative_to(_workspace_root().resolve())}"
 
 def _tool_edit(args: Json) -> str:
     _require_write_enabled()
@@ -502,11 +532,13 @@ def _tool_edit(args: Json) -> str:
     replace_all = bool(args.get("replace_all"))
     if not old:
         raise ToolExecutionError("missing old_string", failure_type="invalid_input")
-    text = path.read_text(encoding="utf-8", errors="replace")
-    if old not in text:
-        raise ToolExecutionError("old_string not found", failure_type="not_found")
-    count = text.count(old) if replace_all else 1
-    path.write_text(text.replace(old, new, -1 if replace_all else 1), encoding="utf-8")
+    def update(text: str) -> tuple[str, int]:
+        if old not in text:
+            raise ToolExecutionError("old_string not found", failure_type="not_found")
+        count = text.count(old) if replace_all else 1
+        return text.replace(old, new, -1 if replace_all else 1), count
+
+    count = atomic_update_text(path, update)
     return f"edited {path.relative_to(_workspace_root().resolve())}; replacements={count}"
 
 def _tool_multiedit(args: Json) -> str:
@@ -515,19 +547,21 @@ def _tool_multiedit(args: Json) -> str:
     edits = args.get("edits")
     if not isinstance(edits, list):
         raise ToolExecutionError("missing edits list", failure_type="invalid_input")
-    text = path.read_text(encoding="utf-8", errors="replace")
-    count = 0
-    for edit in edits:
-        if not isinstance(edit, dict):
-            raise ToolExecutionError("each edit must be an object", failure_type="invalid_input")
-        old = str(edit.get("old_string") or edit.get("old") or "")
-        new = str(edit.get("new_string") or edit.get("new") or "")
-        replace_all = bool(edit.get("replace_all"))
-        if old not in text:
-            raise ToolExecutionError(f"old_string not found for edit {count + 1}", failure_type="not_found")
-        text = text.replace(old, new, -1 if replace_all else 1)
-        count += 1
-    path.write_text(text, encoding="utf-8")
+    def update(text: str) -> tuple[str, int]:
+        count = 0
+        for edit in edits:
+            if not isinstance(edit, dict):
+                raise ToolExecutionError("each edit must be an object", failure_type="invalid_input")
+            old = str(edit.get("old_string") or edit.get("old") or "")
+            new = str(edit.get("new_string") or edit.get("new") or "")
+            replace_all = bool(edit.get("replace_all"))
+            if old not in text:
+                raise ToolExecutionError(f"old_string not found for edit {count + 1}", failure_type="not_found")
+            text = text.replace(old, new, -1 if replace_all else 1)
+            count += 1
+        return text, count
+
+    count = atomic_update_text(path, update)
     return f"applied {count} edits to {path.relative_to(_workspace_root().resolve())}"
 
 
@@ -539,12 +573,72 @@ def _tool_regex_edit(args: Json) -> str:
     if not pattern:
         raise ToolExecutionError("missing regex pattern", failure_type="invalid_input")
     flags = re.MULTILINE | (re.IGNORECASE if args.get("ignore_case") else 0)
-    text = path.read_text(encoding="utf-8", errors="replace")
-    new_text, count = re.subn(pattern, replacement, text, 0 if args.get("replace_all", True) else 1, flags=flags)
-    if count == 0:
-        raise ToolExecutionError("regex pattern not found", failure_type="not_found")
-    path.write_text(new_text, encoding="utf-8")
+    def update(text: str) -> tuple[str, int]:
+        new_text, count = re.subn(
+            pattern,
+            replacement,
+            text,
+            0 if args.get("replace_all", True) else 1,
+            flags=flags,
+        )
+        if count == 0:
+            raise ToolExecutionError("regex pattern not found", failure_type="not_found")
+        return new_text, count
+
+    count = atomic_update_text(path, update)
     return f"regex edited {path.relative_to(_workspace_root().resolve())}; replacements={count}"
+
+
+def _bounded_tool_output(value: Any, limit: int | None = None) -> str:
+    text = str(value or "")
+    if limit is None:
+        limit = max(1024, int(os.environ.get("GATEWAY_TOOL_OUTPUT_MAX_CHARS") or "200000"))
+    if len(text) <= limit:
+        return text
+    head = max(1, limit * 3 // 4)
+    tail = max(1, limit - head)
+    omitted = len(text) - head - tail
+    return f"{text[:head]}\n[gateway: truncated {omitted} characters]\n{text[-tail:]}"
+
+
+def _run_bounded_process(
+    command: Any,
+    *,
+    cwd: pathlib.Path,
+    timeout: float,
+    shell: bool,
+    input_data: bytes | None = None,
+    writable_paths: tuple[str, ...] = (),
+    network_policy: str | None = None,
+    explicit_env: dict[str, str] | None = None,
+) -> Any:
+    """Run a process with bounded in-memory stdout/stderr capture."""
+    limit = max(1024, int(os.environ.get("GATEWAY_TOOL_OUTPUT_MAX_CHARS") or "200000"))
+    job = workspace_job(
+        command,
+        cwd,
+        shell=shell,
+        timeout_seconds=timeout,
+        max_output_bytes=limit,
+        writable_paths=writable_paths,
+        network_policy=network_policy,
+    )
+    completed = _shared_run_bounded_process(
+        sandbox_worker_command(job),
+        cwd=cwd,
+        timeout=timeout,
+        shell=False,
+        input_data=input_data,
+        stdout_limit=limit,
+        stderr_limit=limit,
+        env=sandbox_child_environment(explicit_env),
+    )
+    if (
+        completed.returncode == SANDBOX_WORKER_SETUP_EXIT
+        and completed.stderr.lstrip().startswith(SANDBOX_WORKER_ERROR_PREFIX)
+    ):
+        raise ToolExecutionError(completed.stderr.strip(), failure_type="sandbox_setup_failed")
+    return completed
 
 def _tool_shell(args: Json) -> str:
     _require_shell_enabled()
@@ -553,22 +647,23 @@ def _tool_shell(args: Json) -> str:
         raise ToolExecutionError("missing command", failure_type="invalid_input")
     timeout = float(args.get("timeout") or os.environ.get("GATEWAY_SHELL_TIMEOUT", "30"))
     cwd = _resolve_workspace_path(str(args.get("cwd") or args.get("workdir") or "."))
-    completed = subprocess.run(
+    completed = _run_bounded_process(
         command,
-        cwd=str(cwd),
+        cwd=cwd,
         shell=True,
-        text=True,
-        capture_output=True,
         timeout=timeout,
-        check=False,
+        writable_paths=(".",),
     )
     output = []
     output.append(f"exit_code={completed.returncode}")
     if completed.stdout:
-        output.append("stdout:\n" + completed.stdout)
+        output.append("stdout:\n" + _bounded_tool_output(completed.stdout))
     if completed.stderr:
-        output.append("stderr:\n" + completed.stderr)
-    return "\n".join(output)
+        output.append("stderr:\n" + _bounded_tool_output(completed.stderr))
+    content = "\n".join(output)
+    if completed.returncode != 0:
+        raise ToolExecutionError(content, failure_type="execution_failed")
+    return content
 
 
 def _tool_code_interpreter(args: Json) -> str:
@@ -590,15 +685,14 @@ def _tool_code_interpreter(args: Json) -> str:
         raise ToolExecutionError(f"unsupported code interpreter language: {language}", failure_type="invalid_input")
     timeout = float(args.get("timeout") or os.environ.get("GATEWAY_CODE_INTERPRETER_TIMEOUT", "30"))
     cwd = _resolve_workspace_path(str(args.get("cwd") or args.get("workdir") or "."))
-    completed = subprocess.run(
+    completed = _run_bounded_process(
         [sys.executable, "-c", code],
-        cwd=str(cwd),
-        text=True,
-        capture_output=True,
+        cwd=cwd,
+        shell=False,
         timeout=timeout,
-        check=False,
+        writable_paths=(".",),
     )
-    return json.dumps(
+    content = json.dumps(
         {
             "language": "python",
             "exit_code": completed.returncode,
@@ -608,6 +702,9 @@ def _tool_code_interpreter(args: Json) -> str:
         ensure_ascii=False,
         indent=2,
     )
+    if completed.returncode != 0:
+        raise ToolExecutionError(content, failure_type="execution_failed")
+    return content
 
 def _read_exec_available(proc: subprocess.Popen, timeout: float = 0.05, max_bytes: int = 200_000) -> str:
     output = bytearray()
@@ -625,27 +722,71 @@ def _read_exec_available(proc: subprocess.Popen, timeout: float = 0.05, max_byte
         timeout = 0
     return output.decode("utf-8", errors="replace")
 
+
+def _remove_exec_session(session_id: str) -> None:
+    scoped_id = _scoped_runtime_id(session_id)
+    with EXEC_SESSIONS_LOCK:
+        EXEC_SESSIONS.pop(scoped_id, None)
+        EXEC_SESSION_LAST_USED.pop(scoped_id, None)
+
+
+def _completed_exec_content(session_id: str, proc: subprocess.Popen, output: str) -> str:
+    _terminate_process_group(proc, timeout=0.2)
+    _remove_exec_session(session_id)
+    payload = {
+        "session_id": session_id,
+        "running": False,
+        "exit_code": proc.returncode,
+        "output": output,
+    }
+    content = json.dumps(payload, ensure_ascii=False)
+    if proc.returncode not in {0, None}:
+        failure_type = (
+            "sandbox_setup_failed"
+            if proc.returncode == SANDBOX_WORKER_SETUP_EXIT
+            and output.lstrip().startswith(SANDBOX_WORKER_ERROR_PREFIX)
+            else "execution_failed"
+        )
+        raise ToolExecutionError(content, failure_type=failure_type)
+    return content
+
 def _tool_exec_shell_start(args: Json) -> str:
     _require_shell_enabled()
+    _start_exec_session_reaper()
+    _reap_expired_exec_sessions()
     command = str(args.get("command") or args.get("cmd") or args.get("shell") or "")
     if not command:
         raise ToolExecutionError("missing command", failure_type="invalid_input")
     cwd = _resolve_workspace_path(str(args.get("cwd") or args.get("workdir") or "."))
     session_id = str(args.get("session_id") or f"exec_{uuid.uuid4().hex[:12]}")
     scoped_session_id = _scoped_runtime_id(session_id)
-    proc = subprocess.Popen(
+    job = workspace_job(
         command,
-        cwd=str(cwd),
+        cwd,
         shell=True,
+        timeout_seconds=float(os.environ.get("GATEWAY_EXEC_SESSION_TTL_SECONDS") or "900"),
+        max_output_bytes=max(1024, int(os.environ.get("GATEWAY_TOOL_OUTPUT_MAX_CHARS") or "200000")),
+        writable_paths=(".",),
+        long_lived=True,
+    )
+    proc = subprocess.Popen(
+        sandbox_worker_command(job),
+        cwd=str(cwd),
+        shell=False,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         bufsize=0,
+        env=sandbox_child_environment(),
+        **_process_group_kwargs(),
     )
     with EXEC_SESSIONS_LOCK:
         EXEC_SESSIONS[scoped_session_id] = proc
+        EXEC_SESSION_LAST_USED[scoped_session_id] = __import__("time").time()
     output = _read_exec_available(proc, float(args.get("read_timeout") or 0.05))
-    return json.dumps({"session_id": session_id, "pid": proc.pid, "running": proc.poll() is None, "output": output}, ensure_ascii=False)
+    if proc.poll() is not None:
+        return _completed_exec_content(session_id, proc, output)
+    return json.dumps({"session_id": session_id, "pid": proc.pid, "running": True, "output": output}, ensure_ascii=False)
 
 def _exec_session(args: Json) -> tuple[str, subprocess.Popen]:
     session_id = str(args.get("session_id") or args.get("id") or "")
@@ -654,6 +795,8 @@ def _exec_session(args: Json) -> tuple[str, subprocess.Popen]:
     scoped_session_id = _scoped_runtime_id(session_id)
     with EXEC_SESSIONS_LOCK:
         proc = EXEC_SESSIONS.get(scoped_session_id)
+        if proc:
+            EXEC_SESSION_LAST_USED[scoped_session_id] = __import__("time").time()
     if not proc:
         raise ToolExecutionError(f"exec session not found: {session_id}", failure_type="not_found")
     return session_id, proc
@@ -662,13 +805,18 @@ def _tool_write_stdin(args: Json) -> str:
     session_id, proc = _exec_session(args)
     if proc.poll() is not None:
         output = _read_exec_available(proc, 0)
-        return json.dumps({"session_id": session_id, "running": False, "exit_code": proc.returncode, "output": output}, ensure_ascii=False)
+        return _completed_exec_content(session_id, proc, output)
     chars = str(args.get("chars") if args.get("chars") is not None else args.get("input") or "")
     if chars and proc.stdin:
-        proc.stdin.write(chars.encode("utf-8"))
-        proc.stdin.flush()
+        try:
+            proc.stdin.write(chars.encode("utf-8"))
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
     output = _read_exec_available(proc, float(args.get("read_timeout") or 0.1))
-    return json.dumps({"session_id": session_id, "running": proc.poll() is None, "output": output}, ensure_ascii=False)
+    if proc.poll() is not None:
+        return _completed_exec_content(session_id, proc, output)
+    return json.dumps({"session_id": session_id, "running": True, "output": output}, ensure_ascii=False)
 
 def _tool_exec_wait(args: Json) -> str:
     session_id, proc = _exec_session(args)
@@ -678,22 +826,14 @@ def _tool_exec_wait(args: Json) -> str:
         output = _read_exec_available(proc, 0)
         return json.dumps({"session_id": session_id, "running": True, "timeout": True, "output": output}, ensure_ascii=False)
     output = _read_exec_available(proc, 0)
-    with EXEC_SESSIONS_LOCK:
-        EXEC_SESSIONS.pop(_scoped_runtime_id(session_id), None)
-    return json.dumps({"session_id": session_id, "running": False, "exit_code": proc.returncode, "output": output}, ensure_ascii=False)
+    return _completed_exec_content(session_id, proc, output)
 
 def _tool_exec_kill(args: Json) -> str:
     session_id, proc = _exec_session(args)
     if proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=float(args.get("timeout") or 2))
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=2)
+        _terminate_process_group(proc, timeout=float(args.get("timeout") or 2))
     output = _read_exec_available(proc, 0)
-    with EXEC_SESSIONS_LOCK:
-        EXEC_SESSIONS.pop(_scoped_runtime_id(session_id), None)
+    _remove_exec_session(session_id)
     return json.dumps({"session_id": session_id, "running": False, "exit_code": proc.returncode, "output": output}, ensure_ascii=False)
 
 def _tool_git(args: Json) -> str:
@@ -707,20 +847,19 @@ def _tool_git(args: Json) -> str:
     }
     if action not in allowed:
         raise ToolExecutionError(f"unsupported git action: {action}", failure_type="invalid_input")
-    cmd = ["git", *allowed[action]]
+    cmd = ["git", "--no-optional-locks", *allowed[action]]
     if action == "diff":
         if args.get("cached") or args.get("staged"):
             cmd.append("--cached")
         path = args.get("path") or args.get("file_path")
         if path:
             cmd.extend(["--", str(_resolve_workspace_path(str(path)).relative_to(_workspace_root()))])
-    completed = subprocess.run(
+    completed = _run_bounded_process(
         cmd,
-        cwd=str(_workspace_root()),
-        text=True,
-        capture_output=True,
+        cwd=_workspace_root(),
+        shell=False,
         timeout=float(args.get("timeout") or 20),
-        check=False,
+        network_policy="deny",
     )
     output = (completed.stdout or "") + (completed.stderr or "")
     if completed.returncode != 0:
@@ -773,25 +912,243 @@ def _tool_python_symbols(args: Json) -> str:
     symbols.sort(key=lambda item: int(item.get("line") or 0))
     return json.dumps({"file": str(path.relative_to(_workspace_root())), "symbols": symbols}, ensure_ascii=False, indent=2)
 
+_PATCH_FILE_DIRECTIVE_RE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+?)\s*$")
+_PATCH_MOVE_DIRECTIVE_RE = re.compile(r"^\*\*\* Move to: (.+?)\s*$")
+
+
+def _patch_target_paths(patch: str) -> tuple[pathlib.Path, ...]:
+    root = _workspace_root().resolve()
+    raw_targets: list[str] = []
+    for line in patch.splitlines():
+        match = _PATCH_FILE_DIRECTIVE_RE.match(line) or _PATCH_MOVE_DIRECTIVE_RE.match(line)
+        if match:
+            raw_targets.append(match.group(1).strip())
+    if not raw_targets:
+        raise ToolExecutionError("patch contains no supported file targets", failure_type="invalid_input")
+
+    targets: set[pathlib.Path] = set()
+    for raw_target in raw_targets:
+        if not raw_target or raw_target in {".", ".."}:
+            raise ToolExecutionError(f"invalid patch target: {raw_target}", failure_type="invalid_input")
+        raw_path = pathlib.Path(raw_target)
+        lexical = pathlib.Path(os.path.abspath(str(raw_path if raw_path.is_absolute() else root / raw_path)))
+        try:
+            lexical.relative_to(root)
+        except ValueError as exc:
+            raise ToolExecutionError(
+                f"patch target escapes workspace root: {raw_target}",
+                failure_type="permission_denied",
+            ) from exc
+        resolved = _resolve_workspace_path(raw_target)
+        if lexical != resolved:
+            raise ToolExecutionError(
+                f"patch target contains a symlink path component: {raw_target}",
+                failure_type="permission_denied",
+            )
+        if resolved == root:
+            raise ToolExecutionError("patch cannot target workspace root", failure_type="permission_denied")
+        targets.add(resolved)
+    return tuple(sorted(targets, key=str))
+
+
+def _snapshot_patch_targets(paths: tuple[pathlib.Path, ...]) -> dict[pathlib.Path, tuple[bool, bytes, int]]:
+    snapshots: dict[pathlib.Path, tuple[bool, bytes, int]] = {}
+    for path in paths:
+        if path.exists():
+            if not path.is_file():
+                raise ToolExecutionError(f"patch target is not a file: {path}", failure_type="invalid_input")
+            snapshots[path] = (True, path.read_bytes(), path.stat().st_mode & 0o7777)
+        else:
+            snapshots[path] = (False, b"", 0o600)
+    return snapshots
+
+
+def _rollback_patch_targets(snapshots: dict[pathlib.Path, tuple[bool, bytes, int]]) -> list[str]:
+    errors: list[str] = []
+    for path, (existed, content, mode) in snapshots.items():
+        try:
+            if existed:
+                replace_bytes_locked(path, content, mode=mode)
+            else:
+                remove_path_locked(path)
+        except Exception as exc:
+            errors.append(f"{path}: {exc}")
+    return errors
+
+
+def _patch_overlay_path(overlay_root: pathlib.Path, target: pathlib.Path) -> pathlib.Path:
+    return overlay_root / target.relative_to(_workspace_root().resolve())
+
+
+def _prepare_patch_overlay(
+    overlay_root: pathlib.Path,
+    snapshots: dict[pathlib.Path, tuple[bool, bytes, int]],
+) -> None:
+    for target, (existed, content, mode) in snapshots.items():
+        overlay_target = _patch_overlay_path(overlay_root, target)
+        overlay_target.parent.mkdir(parents=True, exist_ok=True)
+        if existed:
+            overlay_target.write_bytes(content)
+            overlay_target.chmod(mode)
+
+
+def _validate_patch_overlay(
+    overlay_root: pathlib.Path,
+    targets: tuple[pathlib.Path, ...],
+    snapshots: dict[pathlib.Path, tuple[bool, bytes, int]],
+) -> tuple[dict[pathlib.Path, tuple[bool, bytes, int]], tuple[SandboxDiffEntry, ...]]:
+    root = _workspace_root().resolve()
+    allowed_files = {target.relative_to(root) for target in targets}
+    allowed_directories = {pathlib.Path(".")}
+    for relative in allowed_files:
+        allowed_directories.update(relative.parents)
+
+    for path in overlay_root.rglob("*"):
+        relative = path.relative_to(overlay_root)
+        if path.is_symlink():
+            raise ToolExecutionError(
+                f"patch produced a symlink instead of a declared regular file: {relative}",
+                failure_type="permission_denied",
+            )
+        if path.is_dir():
+            if relative not in allowed_directories:
+                raise ToolExecutionError(
+                    f"patch produced an undeclared directory: {relative}",
+                    failure_type="permission_denied",
+                )
+            continue
+        if relative not in allowed_files:
+            raise ToolExecutionError(
+                f"patch produced an undeclared file: {relative}",
+                failure_type="permission_denied",
+            )
+
+    results: dict[pathlib.Path, tuple[bool, bytes, int]] = {}
+    diffs: list[SandboxDiffEntry] = []
+    for target in targets:
+        overlay_target = _patch_overlay_path(overlay_root, target)
+        if overlay_target.exists():
+            if not overlay_target.is_file() or overlay_target.is_symlink():
+                raise ToolExecutionError(
+                    f"patch target is not a regular file after execution: {target.relative_to(root)}",
+                    failure_type="invalid_input",
+                )
+            state = (True, overlay_target.read_bytes(), overlay_target.stat().st_mode & 0o7777)
+        else:
+            state = (False, b"", snapshots[target][2])
+        results[target] = state
+        if state != snapshots[target]:
+            before_exists, before_content, _before_mode = snapshots[target]
+            after_exists, after_content, _after_mode = state
+            operation = "update"
+            if not before_exists and after_exists:
+                operation = "create"
+            elif before_exists and not after_exists:
+                operation = "delete"
+            diffs.append(
+                SandboxDiffEntry(
+                    path=str(target.relative_to(root)),
+                    operation=operation,
+                    before_sha256=hashlib.sha256(before_content).hexdigest() if before_exists else None,
+                    after_sha256=hashlib.sha256(after_content).hexdigest() if after_exists else None,
+                )
+            )
+    if not diffs:
+        raise ToolExecutionError("patch reported success but produced no declared changes", failure_type="execution_failed")
+    declared = {str(path) for path in allowed_files}
+    if any(diff.path not in declared for diff in diffs):
+        raise ToolExecutionError("patch diff contains an undeclared target", failure_type="permission_denied")
+    return results, tuple(diffs)
+
+
+def _verify_patch_base_unchanged(
+    snapshots: dict[pathlib.Path, tuple[bool, bytes, int]],
+) -> None:
+    root = _workspace_root().resolve()
+    conflicts: list[str] = []
+    for target, snapshot in snapshots.items():
+        existed, content, mode = snapshot
+        if target.exists():
+            if not target.is_file() or target.is_symlink():
+                conflicts.append(str(target.relative_to(root)))
+                continue
+            current = (True, target.read_bytes(), target.stat().st_mode & 0o7777)
+        else:
+            current = (False, b"", mode)
+        if current != snapshot:
+            conflicts.append(str(target.relative_to(root)))
+    if conflicts:
+        raise ToolExecutionError(
+            "patch base changed during execution: " + ", ".join(conflicts),
+            failure_type="conflict",
+        )
+
+
+def _commit_patch_overlay(
+    results: dict[pathlib.Path, tuple[bool, bytes, int]],
+    snapshots: dict[pathlib.Path, tuple[bool, bytes, int]],
+) -> None:
+    committed: list[pathlib.Path] = []
+    try:
+        for target in sorted(results, key=str):
+            existed, content, mode = results[target]
+            if existed:
+                replace_bytes_locked(target, content, mode=mode)
+            elif target.exists():
+                remove_path_locked(target)
+            committed.append(target)
+        for parent in {target.parent for target in results}:
+            fsync_directory(parent)
+    except Exception as exc:
+        rollback_snapshots = {target: snapshots[target] for target in committed}
+        rollback_errors = _rollback_patch_targets(rollback_snapshots)
+        message = f"patch workspace commit failed: {exc}"
+        if rollback_errors:
+            message += "; rollback_failed: " + "; ".join(rollback_errors)
+        raise ToolExecutionError(message, failure_type="execution_failed") from exc
+
+
 def _tool_apply_patch(args: Json) -> str:
     _require_write_enabled()
     patch = str(args.get("patch") or args.get("input") or args.get("diff") or "")
     if not patch.strip():
         raise ToolExecutionError("missing patch", failure_type="invalid_input")
-    apply_patch_bin = os.environ.get("GATEWAY_APPLY_PATCH_BIN") or "apply_patch"
-    completed = subprocess.run(
-        [apply_patch_bin],
-        input=patch,
-        cwd=str(_workspace_root()),
-        text=True,
-        capture_output=True,
-        timeout=float(os.environ.get("GATEWAY_APPLY_PATCH_TIMEOUT", "30")),
-        check=False,
+    targets = _patch_target_paths(patch)
+    configured_patch_bin = os.environ.get("GATEWAY_APPLY_PATCH_BIN")
+    discovered_patch_bin = shutil.which("apply_patch") if not configured_patch_bin else None
+    apply_patch_command = (
+        [configured_patch_bin]
+        if configured_patch_bin
+        else [discovered_patch_bin]
+        if discovered_patch_bin
+        else [sys.executable, str(pathlib.Path(__file__).with_name("gateway_apply_patch.py"))]
     )
-    output = (completed.stdout or "") + (completed.stderr or "")
-    if completed.returncode != 0:
-        raise ToolExecutionError(output.strip() or "apply_patch failed", failure_type="execution_failed")
-    return output.strip() or "patch applied"
+    with path_write_locks(targets):
+        snapshots = _snapshot_patch_targets(targets)
+        with tempfile.TemporaryDirectory(prefix="gateway-patch-overlay-") as temp_dir, tempfile.TemporaryDirectory(
+            prefix="gateway-patch-codex-home-"
+        ) as codex_home:
+            overlay_root = pathlib.Path(temp_dir).resolve()
+            _prepare_patch_overlay(overlay_root, snapshots)
+            completed = _run_bounded_process(
+                apply_patch_command,
+                cwd=overlay_root,
+                shell=False,
+                timeout=float(os.environ.get("GATEWAY_APPLY_PATCH_TIMEOUT", "30")),
+                input_data=patch.encode("utf-8"),
+                writable_paths=tuple(str(path.relative_to(_workspace_root().resolve())) for path in targets),
+                network_policy="deny",
+                explicit_env={"CODEX_HOME": codex_home},
+            )
+            output = (completed.stdout or "") + (completed.stderr or "")
+            if completed.returncode != 0:
+                raise ToolExecutionError(output.strip() or "apply_patch failed", failure_type="execution_failed")
+            results, validated_diff = _validate_patch_overlay(overlay_root, targets, snapshots)
+            _verify_patch_base_unchanged(snapshots)
+            _commit_patch_overlay(results, snapshots)
+            summary = ", ".join(f"{entry.operation}:{entry.path}" for entry in validated_diff)
+            base_output = output.strip() or "patch applied"
+            return f"{base_output}\n[gateway validated diff: {summary}]"
 
 
 def _network_tool_url_policy() -> Json:
@@ -906,52 +1263,55 @@ def _tool_notebook_edit(args: Json) -> str:
     path = _resolve_workspace_path(str(args.get("notebook_path") or args.get("file_path") or args.get("path") or ""))
     if path.suffix != ".ipynb":
         raise ToolExecutionError("NotebookEdit requires a .ipynb file", failure_type="invalid_input")
-    notebook = json.loads(path.read_text(encoding="utf-8"))
-    cells = notebook.setdefault("cells", [])
-    if not isinstance(cells, list):
-        raise ToolExecutionError("notebook cells must be a list", failure_type="invalid_input")
-    edit_mode = str(args.get("edit_mode") or args.get("mode") or "replace").lower()
-    cell_id = args.get("cell_id")
-    cell_number = args.get("cell_number") if args.get("cell_number") is not None else args.get("index")
-    idx: int | None = None
-    if cell_id is not None:
-        for i, cell in enumerate(cells):
-            if isinstance(cell, dict) and str(cell.get("id")) == str(cell_id):
-                idx = i
-                break
-    elif cell_number is not None:
-        raw_idx = int(cell_number)
-        idx = raw_idx - 1 if raw_idx > 0 else raw_idx
-    if edit_mode not in {"insert", "append"} and (idx is None or idx < 0 or idx >= len(cells)):
-        raise ToolExecutionError("target notebook cell not found", failure_type="not_found")
-    source_value = args.get("new_source")
-    if source_value is None:
-        source_value = args.get("source")
-    if source_value is None:
-        source_value = args.get("content") or args.get("text") or ""
-    source = source_value if isinstance(source_value, list) else str(source_value).splitlines(keepends=True)
-    cell_type = str(args.get("cell_type") or "code")
-    if edit_mode in {"delete", "remove"}:
-        assert idx is not None
-        del cells[idx]
-        action = "deleted"
-    elif edit_mode in {"insert", "append"}:
-        new_cell = {"cell_type": cell_type, "metadata": {}, "source": source}
-        if cell_type == "code":
-            new_cell.update({"execution_count": None, "outputs": []})
-        insert_at = len(cells) if idx is None else max(min(idx, len(cells)), 0)
-        cells.insert(insert_at, new_cell)
-        action = f"inserted at {insert_at + 1}"
-    else:
-        assert idx is not None
-        cell = cells[idx]
-        if not isinstance(cell, dict):
-            raise ToolExecutionError("target cell must be an object", failure_type="invalid_input")
-        cell["source"] = source
-        if "cell_type" in args:
-            cell["cell_type"] = cell_type
-        action = f"replaced cell {idx + 1}"
-    path.write_text(json.dumps(notebook, ensure_ascii=False, indent=1), encoding="utf-8")
+    def update(raw_notebook: str) -> tuple[str, str]:
+        notebook = json.loads(raw_notebook)
+        cells = notebook.setdefault("cells", [])
+        if not isinstance(cells, list):
+            raise ToolExecutionError("notebook cells must be a list", failure_type="invalid_input")
+        edit_mode = str(args.get("edit_mode") or args.get("mode") or "replace").lower()
+        cell_id = args.get("cell_id")
+        cell_number = args.get("cell_number") if args.get("cell_number") is not None else args.get("index")
+        idx: int | None = None
+        if cell_id is not None:
+            for i, cell in enumerate(cells):
+                if isinstance(cell, dict) and str(cell.get("id")) == str(cell_id):
+                    idx = i
+                    break
+        elif cell_number is not None:
+            raw_idx = int(cell_number)
+            idx = raw_idx - 1 if raw_idx > 0 else raw_idx
+        if edit_mode not in {"insert", "append"} and (idx is None or idx < 0 or idx >= len(cells)):
+            raise ToolExecutionError("target notebook cell not found", failure_type="not_found")
+        source_value = args.get("new_source")
+        if source_value is None:
+            source_value = args.get("source")
+        if source_value is None:
+            source_value = args.get("content") or args.get("text") or ""
+        source = source_value if isinstance(source_value, list) else str(source_value).splitlines(keepends=True)
+        cell_type = str(args.get("cell_type") or "code")
+        if edit_mode in {"delete", "remove"}:
+            assert idx is not None
+            del cells[idx]
+            action = "deleted"
+        elif edit_mode in {"insert", "append"}:
+            new_cell = {"cell_type": cell_type, "metadata": {}, "source": source}
+            if cell_type == "code":
+                new_cell.update({"execution_count": None, "outputs": []})
+            insert_at = len(cells) if idx is None else max(min(idx, len(cells)), 0)
+            cells.insert(insert_at, new_cell)
+            action = f"inserted at {insert_at + 1}"
+        else:
+            assert idx is not None
+            cell = cells[idx]
+            if not isinstance(cell, dict):
+                raise ToolExecutionError("target cell must be an object", failure_type="invalid_input")
+            cell["source"] = source
+            if "cell_type" in args:
+                cell["cell_type"] = cell_type
+            action = f"replaced cell {idx + 1}"
+        return json.dumps(notebook, ensure_ascii=False, indent=1), action
+
+    action = atomic_update_text(path, update, errors="strict")
     return f"{action} in {path.relative_to(_workspace_root())}"
 
 def _tool_view_image(args: Json) -> str:
@@ -1226,13 +1586,77 @@ def _tool_multi_tool_use_parallel(args: Json) -> str:
     return json.dumps({"results": results}, ensure_ascii=False, indent=2)
 
 EXEC_SESSIONS: dict[str, subprocess.Popen] = {}
+EXEC_SESSION_LAST_USED: dict[str, float] = {}
 EXEC_SESSIONS_LOCK = threading.Lock()
+_EXEC_REAPER_STOP = threading.Event()
+_EXEC_REAPER_THREAD: threading.Thread | None = None
 AGENT_SESSIONS: dict[str, dict[str, Any]] = {}
 AGENT_SESSIONS_LOCK = threading.Lock()
 AGENT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=int(os.environ.get("GATEWAY_AGENT_SESSION_WORKERS") or "4"))
 PENDING_USER_QUESTIONS: dict[str, Json] = {}
 TEAM_SESSIONS: dict[str, Json] = {}
 TEAM_SESSIONS_LOCK = threading.Lock()
+
+
+def _scope_has_active_exec_sessions() -> bool:
+    """Return whether the current runtime scope owns a running exec process."""
+    prefix = f"{_runtime_scope_key()}:"
+    with EXEC_SESSIONS_LOCK:
+        return any(
+            key.startswith(prefix) and proc.poll() is None
+            for key, proc in EXEC_SESSIONS.items()
+        )
+
+
+def _reap_expired_exec_sessions(*, now: float | None = None) -> int:
+    import time
+    now = time.time() if now is None else now
+    ttl = max(1.0, float(os.environ.get("GATEWAY_EXEC_SESSION_TTL_SECONDS") or "900"))
+    expired: list[subprocess.Popen] = []
+    with EXEC_SESSIONS_LOCK:
+        for key, proc in list(EXEC_SESSIONS.items()):
+            last_used = EXEC_SESSION_LAST_USED.get(key, now)
+            if proc.poll() is not None or now - last_used >= ttl:
+                EXEC_SESSIONS.pop(key, None)
+                EXEC_SESSION_LAST_USED.pop(key, None)
+                expired.append(proc)
+    for proc in expired:
+        _terminate_process_group(proc)
+    return len(expired)
+
+
+def _start_exec_session_reaper() -> None:
+    global _EXEC_REAPER_THREAD
+    if _EXEC_REAPER_THREAD and _EXEC_REAPER_THREAD.is_alive():
+        return
+    _EXEC_REAPER_STOP.clear()
+
+    def run() -> None:
+        while not _EXEC_REAPER_STOP.wait(30.0):
+            _reap_expired_exec_sessions()
+
+    _EXEC_REAPER_THREAD = threading.Thread(target=run, name="gateway-exec-reaper", daemon=True)
+    _EXEC_REAPER_THREAD.start()
+
+
+def _cleanup_runtime_sessions() -> None:
+    _EXEC_REAPER_STOP.set()
+    with EXEC_SESSIONS_LOCK:
+        processes = list(EXEC_SESSIONS.values())
+        EXEC_SESSIONS.clear()
+        EXEC_SESSION_LAST_USED.clear()
+    for proc in processes:
+        _terminate_process_group(proc)
+    with AGENT_SESSIONS_LOCK:
+        for item in AGENT_SESSIONS.values():
+            future = item.get("future")
+            if isinstance(future, concurrent.futures.Future):
+                future.cancel()
+        AGENT_SESSIONS.clear()
+    AGENT_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+    with TEAM_SESSIONS_LOCK:
+        TEAM_SESSIONS.clear()
+    PENDING_USER_QUESTIONS.clear()
 
 
 def _agent_session_status(agent_id: str, item: dict[str, Any]) -> Json:
@@ -1588,6 +2012,15 @@ def _skill_dirs() -> list[pathlib.Path]:
             workspace / "skills",
             *_plugin_skill_dirs(workspace),
         ])
+    try:
+        from .gateway_admin_catalog_mutations import admin_skills_root
+
+        # Operator-managed service Skills are global, but project-local Skills
+        # retain precedence so one tenant cannot be surprised by a global
+        # catalog item shadowing its checked-in project instructions.
+        candidates.append(admin_skills_root())
+    except (ImportError, OSError, ValueError):
+        pass
     candidates.extend([
         # Then user-global skill stores used by Codex, Claude Code, and OMX.
         home / ".codex" / "skills",

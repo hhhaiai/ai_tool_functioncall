@@ -5,15 +5,13 @@ Handles HTTP routing, request/response processing, and API endpoints.
 """
 from __future__ import annotations
 
-import base64
-import hmac
 import html
 import json
 import os
-import pathlib
-import re
 import sys
 import traceback
+import threading
+import time
 import urllib.parse
 import urllib.error
 import urllib.request
@@ -23,42 +21,148 @@ from typing import Any
 Json = dict[str, Any]
 
 from .gateway_config import SUPPORTED_PATHS, MODEL_LIST_PATHS, TOKEN_COUNT_PATHS, DIRECT_TOOL_CALL_PATHS, _gateway_config, _normalize_request_path, _supported_public_paths, _upstream_config
+from .gateway_admin_security import (
+    _request_origin,
+    _url_origin,
+    check_admin_origin as _check_admin_origin_io,
+    check_admin_write as _check_admin_write_io,
+)
+from .gateway_admin_client_mutations import apply_admin_client_mutation
+from .gateway_admin_connector_mutations import apply_admin_connector_mutation
+from .gateway_admin_config_mutations import apply_admin_config_mutation
 from .gateway_errors import error_payload as _error_payload
+from .gateway_admin_catalog_mutations import (
+    _admin_skill_dir,
+    _admin_skill_file,
+    _admin_skills_root,
+    _safe_admin_skill_name,
+    apply_admin_catalog_mutation,
+)
+from .gateway_http_auth import (
+    check_admin as _check_admin_io,
+    check_downstream_key as _check_downstream_key_io,
+)
+from .gateway_http_io import (
+    _constant_time_equal,
+    _decode_form,
+    _decode_json_object,
+    _json_response,
+    _parse_basic_auth,
+    _read_limited_body as _read_limited_body_io,
+    _request_body_limit,
+    _request_content_length,
+    _safe_json_response,
+    _text_response,
+)
+from .gateway_http_security import send_cors_headers
 
 
 ADMIN_UI_PATHS = {"/ui", "/admin", "/config", "/admin/config-ui"}
-_ADMIN_SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_READINESS = threading.Event()
 
 
-def _safe_admin_skill_name(value: Any) -> str:
-    """Return a single safe service-side skill directory name, or empty."""
-    text = str(value or "").strip()
-    if not text or text in {".", ".."}:
-        return ""
-    if "/" in text or "\\" in text:
-        return ""
-    if not _ADMIN_SKILL_NAME_RE.fullmatch(text):
-        return ""
-    return text
+def _set_gateway_ready(ready: bool) -> None:
+    if ready:
+        _READINESS.set()
+    else:
+        _READINESS.clear()
 
 
-def _admin_skills_root() -> pathlib.Path:
-    return (pathlib.Path.cwd() / "skills").resolve(strict=False)
+def _gateway_is_ready() -> bool:
+    return _READINESS.is_set()
 
 
-def _admin_skill_dir(name: Any) -> pathlib.Path | None:
-    safe_name = _safe_admin_skill_name(name)
-    if not safe_name:
-        return None
-    root = _admin_skills_root()
-    target = (root / safe_name).resolve(strict=False)
+def _enforce_request_rate_limit(handler: BaseHTTPRequestHandler, client_id: str | None) -> None:
+    from .gateway_config import _gateway_config
+    from .gateway_errors import GatewayBusyError, GatewayUnavailableError
+    from .gateway_rate_limit import RATE_LIMIT_SERVICE
+    cfg = _gateway_config()
+    if not cfg.get("rate_limit_enabled", True):
+        return
     try:
-        target.relative_to(root)
-    except ValueError:
-        return None
-    if target == root:
-        return None
-    return target
+        rpm = max(1, int(cfg.get("rate_limit_rpm") or 120))
+    except (TypeError, ValueError):
+        rpm = 120
+    remote = str(getattr(handler, "client_address", ("unknown",))[0] or "unknown")
+    identity = str(client_id or f"anonymous:{remote}")
+    try:
+        decision = RATE_LIMIT_SERVICE.consume(identity, rpm, cfg)
+    except Exception as exc:
+        raise GatewayUnavailableError(
+            "request rate-limit backend unavailable",
+            detail={"backend": str(cfg.get("rate_limit_backend") or "memory")},
+        ) from exc
+    if not decision.allowed:
+        raise GatewayBusyError(
+            f"request rate limit exceeded ({rpm} requests/minute)",
+            detail={
+                "backend": decision.backend,
+                "retry_after_seconds": round(decision.retry_after_seconds, 3),
+            },
+        )
+
+
+def _capability_contract() -> Json:
+    from .gateway_admission import ADMISSION_SERVICE
+    from .gateway_rate_limit import RATE_LIMIT_SERVICE
+    from .gateway_http_security import cors_allowed_origins
+    from .gateway_sandbox import sandbox_capabilities
+    cfg = _gateway_config()
+    rate_snapshot = RATE_LIMIT_SERVICE.describe(cfg)
+    admission_snapshot = ADMISSION_SERVICE.describe(cfg)
+    return {
+        "api": {
+            "chat_completions": "orchestrated",
+            "responses": "orchestrated",
+            "messages": "orchestrated",
+            "assistants": "minimal_create_compatibility_only",
+            "threads": "minimal_create_compatibility_only",
+        },
+        "request_path": {
+            "authenticated_client_rate_limit": True,
+            "rate_limit_backend": {
+                "configured": rate_snapshot.get("configured_backend"),
+                "active": rate_snapshot.get("backend"),
+                "degraded": bool(rate_snapshot.get("degraded")),
+            },
+            "global_request_concurrency_limit": {
+                "configured_backend": admission_snapshot.get("configured_backend"),
+                "active_backend": admission_snapshot.get("backend"),
+                "scope": admission_snapshot.get("scope"),
+                "degraded": bool(admission_snapshot.get("degraded")),
+            },
+            "semantic_cache": "non_streaming_non_tool_exact_request_fingerprint",
+            "gateway_concurrency_module": "not_integrated_with_http_request_path",
+            "web2api_module": "not_integrated_with_http_request_path",
+            "gateway_stats_module": "auxiliary; primary HTTP counters use gateway_logging",
+        },
+        "security": {
+            "cors_enabled": bool(cfg.get("cors_enabled", False)),
+            "cors_allowed_origin_count": len(cors_allowed_origins(cfg)),
+            "cors_wildcard_allowed": False,
+            "request_concurrency_scope": admission_snapshot.get("scope"),
+            "execution_isolation": sandbox_capabilities(),
+        },
+        "operations": {
+            "persistent_storage_preflight": "/admin/storage.json",
+            "legacy_sqlite_compaction": "offline_cli_only",
+            "online_destructive_vacuum": False,
+        },
+        "observability": {
+            "request_id_header": "x-request-id",
+            "prometheus_metrics": "/admin/metrics",
+            "bounded_trace_ring": "/admin/traces.json",
+            "sensitive_metric_labels": False,
+            "trace_persistence": False,
+        },
+        "streaming": {
+            "passthrough": "bounded_upstream_sse",
+            "orchestrated_safe_text": "end_to_end_incremental",
+            "tool_decision_rounds": "upstream_incremental_bounded_until_round_classified",
+            "chat_only_rewrite_boundary": "buffered_for_correctness",
+            "client_disconnect_cancels_upstream": True,
+        },
+    }
 
 
 def _response_contains_tool_request(response: Json) -> bool:
@@ -80,25 +184,24 @@ def _response_contains_tool_request(response: Json) -> bool:
     return False
 
 
-def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: Json) -> None:
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    handler.send_response(status)
-    handler.send_header("Content-Type", "application/json; charset=utf-8")
-    handler.send_header("Content-Length", str(len(body)))
-    handler.send_header("Access-Control-Allow-Origin", "*")
-    handler.end_headers()
-    handler.wfile.write(body)
+def _semantic_cache_request_fingerprint(path: str, body: Json) -> str:
+    """Return an exact, canonical fingerprint for a cache-eligible request.
 
-
-def _safe_json_response(handler: BaseHTTPRequestHandler, status: int, payload: Json) -> None:
-    try:
-        _json_response(handler, status, payload)
-    except Exception:
-        try:
-            handler.send_response(500)
-            handler.end_headers()
-        except Exception:
-            pass
+    The former key used only the last user text, so different models, system
+    prompts, conversation histories, and generation settings could share an
+    answer. Keep the runtime scope separate, but bind every JSON request field
+    that can affect the response. ``stream`` is omitted because this cache is
+    only consulted on the non-streaming path.
+    """
+    canonical_body = {key: value for key, value in body.items() if key != "stream"}
+    payload = json.dumps(
+        {"version": 1, "path": _normalize_request_path(path), "body": canonical_body},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    import hashlib
+    return "gateway-request-v1:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _agent_runtime_scope_contract() -> Json:
@@ -488,215 +591,54 @@ def _agent_runtime_requirement_audit(
     }
 
 
-def _text_response(handler: BaseHTTPRequestHandler, status: int, payload: str, content_type: str = "text/html; charset=utf-8") -> None:
-    body = payload.encode("utf-8")
-    handler.send_response(status)
-    handler.send_header("Content-Type", content_type)
-    handler.send_header("Content-Length", str(len(body)))
-    handler.send_header("Access-Control-Allow-Origin", "*")
-    handler.end_headers()
-    handler.wfile.write(body)
-
-
-def _request_body_limit() -> int:
-    from .gateway_config import _gateway_config
-    try:
-        value = int(_gateway_config().get("max_request_body_bytes") or 64 * 1024 * 1024)
-    except (TypeError, ValueError):
-        value = 64 * 1024 * 1024
-    return max(1, value)
-
-
-def _request_content_length(handler: BaseHTTPRequestHandler) -> int:
-    raw = handler.headers.get("Content-Length", "0")
-    try:
-        return max(0, int(raw or 0))
-    except (TypeError, ValueError) as exc:
-        from .gateway_errors import GatewayError
-        raise GatewayError("invalid Content-Length header") from exc
-
-
 def _read_limited_body(handler: BaseHTTPRequestHandler) -> bytes:
-    content_length = _request_content_length(handler)
-    if content_length == 0:
-        return b""
-    limit = _request_body_limit()
-    if content_length > limit:
-        from .gateway_errors import RequestBodyTooLargeError
-        raise RequestBodyTooLargeError(f"request body too large: {content_length} bytes exceeds limit {limit}")
-    return handler.rfile.read(content_length)
+    return _read_limited_body_io(
+        handler,
+        content_length=_request_content_length(handler),
+        limit=_request_body_limit(),
+    )
 
 
 def _read_json(handler: BaseHTTPRequestHandler) -> Json:
-    raw = _read_limited_body(handler)
-    if not raw:
-        return {}
-    try:
-        return json.loads(raw.decode("utf-8"))
-    except json.JSONDecodeError as e:
-        from .gateway_errors import GatewayError
-        raise GatewayError(f"invalid JSON: {e}") from e
-
-
-def _constant_time_equal(left: object, right: object) -> bool:
-    """Compare auth material without leaking timing or failing on unicode input."""
-    return hmac.compare_digest(str(left).encode("utf-8"), str(right).encode("utf-8"))
-
-
-def _parse_basic_auth(header: str | None) -> tuple[str, str] | None:
-    if not header or not header.startswith("Basic "):
-        return None
-    try:
-        decoded = base64.b64decode(header[6:]).decode("utf-8")
-        if ":" in decoded:
-            username, password = decoded.split(":", 1)
-            return username, password
-    except Exception:
-        pass
-    return None
+    return _decode_json_object(_read_limited_body(handler))
 
 
 def _check_admin(handler: BaseHTTPRequestHandler) -> bool:
-    from .gateway_config import load_config, _hash_secret
-    try:
-        cfg = load_config()
-    except Exception as exc:
-        _handle_error(handler, handler.path.split("?", 1)[0], exc)
-        return False
-    admin = cfg.get("admin", {})
-    auth = handler.headers.get("Authorization")
-    creds = _parse_basic_auth(auth)
-    if creds:
-        username, password = creds
-        if _constant_time_equal(username, admin.get("username", "admin")):
-            if _constant_time_equal(_hash_secret(password), admin.get("password_hash") or ""):
-                return True
-    handler.send_response(401)
-    handler.send_header("WWW-Authenticate", 'Basic realm="Gateway Admin"')
-    handler.end_headers()
-    return False
+    return _check_admin_io(handler, handle_error=_handle_error)
 
 
 def _check_downstream_key(handler: BaseHTTPRequestHandler) -> str | None:
-    from .gateway_config import load_config, _hash_secret
-    cfg = load_config()
-    downstream_keys = cfg.get("downstream_keys") or []
-    if not downstream_keys:
-        return None
-    auth = handler.headers.get("Authorization") or handler.headers.get("authorization")
-    api_key = ""
-    if auth:
-        if auth.startswith("Bearer "):
-            api_key = auth[7:]
-        elif auth.startswith("Basic "):
-            creds = _parse_basic_auth(auth)
-            if creds:
-                api_key = creds[1]
-    if not api_key:
-        api_key = handler.headers.get("x-api-key") or handler.headers.get("X-API-Key") or ""
-    if not api_key:
-        from .gateway_errors import DownstreamAuthError
-        raise DownstreamAuthError("missing Authorization or x-api-key header")
-    key_hash = _hash_secret(api_key)
-    for dk in downstream_keys:
-        if isinstance(dk, dict) and dk.get("enabled", True):
-            if _constant_time_equal(dk.get("key_hash") or "", key_hash):
-                protocols = set(dk.get("protocols") or [])
-                if protocols:
-                    route = "models"
-                    if "/chat/completions" in handler.path:
-                        route = "chat_completions"
-                    elif "/responses" in handler.path:
-                        route = "responses"
-                    elif "/messages" in handler.path:
-                        route = "messages"
-                    elif "/tools/call" in handler.path or "/functions/call" in handler.path:
-                        route = "direct_tools"
-                    models_compatible = route == "models" and bool(protocols & {"models", "chat_completions", "responses", "messages"})
-                    if route not in protocols and not models_compatible:
-                        from .gateway_errors import DownstreamAuthError
-                        raise DownstreamAuthError(f"API key is not allowed for {route}")
-                return dk.get("name", "unknown")
-    from .gateway_errors import DownstreamAuthError
-    raise DownstreamAuthError("invalid API key")
+    return _check_downstream_key_io(handler)
 
 
 def _read_form(handler: BaseHTTPRequestHandler) -> dict[str, str]:
-    body = _read_limited_body(handler)
-    if not body:
-        return {}
-    raw = body.decode("utf-8")
-    content_type = handler.headers.get("Content-Type", "")
-    if "application/json" in content_type:
-        try:
-            data = json.loads(raw)
-            if isinstance(data, dict):
-                return {k: str(v) for k, v in data.items()}
-        except json.JSONDecodeError:
-            pass
-    import urllib.parse
-    parsed = urllib.parse.parse_qs(raw)
-    return {k: v[0] if v else "" for k, v in parsed.items()}
-
-
-def _url_origin(value: str | None) -> str | None:
-    if not value:
-        return None
-    try:
-        parsed = urllib.parse.urlparse(value.strip())
-    except Exception:
-        return None
-    if not parsed.scheme or not parsed.netloc or not parsed.hostname:
-        return None
-    try:
-        scheme = parsed.scheme.lower()
-        host = parsed.hostname.lower()
-        port = parsed.port
-    except ValueError:
-        return None
-    default_port = 443 if scheme == "https" else 80 if scheme == "http" else None
-    if port and port != default_port:
-        host = f"{host}:{port}"
-    return f"{scheme}://{host}"
-
-
-def _request_origin(handler: BaseHTTPRequestHandler) -> str | None:
-    host = (handler.headers.get("X-Forwarded-Host") or handler.headers.get("Host") or "").split(",", 1)[0].strip()
-    if not host:
-        return None
-    proto = (handler.headers.get("X-Forwarded-Proto") or "http").split(",", 1)[0].strip().lower()
-    return _url_origin(f"{proto}://{host}")
+    return _decode_form(
+        _read_limited_body(handler),
+        content_type=handler.headers.get("Content-Type", ""),
+    )
 
 
 def _check_admin_origin(handler: BaseHTTPRequestHandler, cfg: Json) -> bool:
-    """Reject browser cross-origin admin writes while keeping CLI requests working."""
-    source = handler.headers.get("Origin") or handler.headers.get("Referer")
-    if not source:
-        return True
-    source_origin = _url_origin(source)
-    if not source_origin:
-        _json_response(handler, 403, _error_payload("cross-origin admin request rejected"))
-        return False
-    allowed = {_request_origin(handler)}
-    gateway_cfg = cfg.get("gateway", {}) if isinstance(cfg.get("gateway"), dict) else {}
-    allowed.add(_url_origin(str(gateway_cfg.get("public_base_url") or "")))
-    if source_origin in {origin for origin in allowed if origin}:
-        return True
-    _json_response(handler, 403, _error_payload("cross-origin admin request rejected"))
-    return False
+    return _check_admin_origin_io(
+        handler,
+        cfg,
+        json_response=_json_response,
+        error_payload=_error_payload,
+    )
 
 
 def _check_admin_write(handler: BaseHTTPRequestHandler) -> bool:
-    """Validate admin auth + browser origin for state-changing admin writes."""
-    if not _check_admin(handler):
-        return False
-    from .gateway_config import load_config
-    return _check_admin_origin(handler, load_config())
+    return _check_admin_write_io(
+        handler,
+        check_admin=_check_admin,
+        check_origin=_check_admin_origin,
+    )
 
 
 def _redirect(handler: BaseHTTPRequestHandler, location: str = "/ui") -> None:
     handler.send_response(302)
     handler.send_header("Location", location)
+    send_cors_headers(handler)
     handler.end_headers()
 
 
@@ -788,17 +730,61 @@ def _fetch_upstream_models_for_admin(handler: BaseHTTPRequestHandler, overrides:
 class GatewayHandler(BaseHTTPRequestHandler):
     server_version = "NativeToolGateway/1.0"
 
+    def handle_one_request(self) -> None:
+        from .gateway_observability import begin_request, end_request, observe_request
+        started = time.monotonic()
+        request_id, root_token = begin_request()
+        self._observability_request_id = request_id
+        self._observability_header_token = None
+        self._observability_status = 0
+        try:
+            super().handle_one_request()
+        finally:
+            if getattr(self, "command", None):
+                try:
+                    observe_request(
+                        self.command,
+                        getattr(self, "path", ""),
+                        int(getattr(self, "_observability_status", 0) or 0),
+                        time.monotonic() - started,
+                    )
+                except Exception:
+                    pass
+            header_token = getattr(self, "_observability_header_token", None)
+            if header_token is not None:
+                end_request(header_token)
+            end_request(root_token)
+
+    def parse_request(self) -> bool:
+        parsed = super().parse_request()
+        if parsed:
+            from .gateway_observability import begin_request
+            request_id, token = begin_request(self.headers.get("x-request-id"))
+            self._observability_request_id = request_id
+            self._observability_header_token = token
+        return parsed
+
+    def send_response(self, code: int, message: str | None = None) -> None:
+        self._observability_status = int(code)
+        super().send_response(code, message)
+        request_id = str(getattr(self, "_observability_request_id", "") or "")
+        if request_id:
+            self.send_header("x-request-id", request_id)
+
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
 
     def do_HEAD(self) -> None:
         path = _normalize_request_path(self.path.split("?", 1)[0])
-        if path in {"/", "/healthz"} or path in ADMIN_UI_PATHS:
-            self.send_response(200)
+        if path in {"/", "/healthz", "/livez", "/readyz"} or path in ADMIN_UI_PATHS:
+            status = 503 if path in {"/healthz", "/readyz"} and not _gateway_is_ready() else 200
+            self.send_response(status)
             self.send_header("content-type", "text/plain; charset=utf-8")
+            send_cors_headers(self)
             self.end_headers()
             return
         self.send_response(404)
+        send_cors_headers(self)
         self.end_headers()
 
     def do_GET(self) -> None:
@@ -811,19 +797,38 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 "text/plain; charset=utf-8",
             )
             return
-        if path == "/healthz":
+        if path in {"/healthz", "/livez", "/readyz"}:
             from .gateway_builtin_tools import BUILTIN_TOOLS
+            ready = _gateway_is_ready()
+            if path in {"/healthz", "/readyz"} and not ready:
+                _json_response(self, 503, {"ok": False, "live": True, "ready": False})
+                return
             _json_response(
                 self,
                 200,
                 {
                     "ok": True,
+                    "live": True,
+                    "ready": ready,
                     "mode": os.environ.get("GATEWAY_TOOL_MODE", "orchestrate"),
                     "fake_prompt_tools": False,
                     "supported_paths": sorted(_supported_public_paths()),
                     "builtin_tool_count": len({tool.name for tool in BUILTIN_TOOLS.values()}),
                 },
             )
+            return
+        if path == "/capabilities":
+            _json_response(self, 200, _capability_contract())
+            return
+        from .gateway_admin_operations import handle_admin_operations_get
+        if handle_admin_operations_get(
+            self,
+            path,
+            check_admin=_check_admin,
+            json_response=_json_response,
+            text_response=_text_response,
+            ready=_gateway_is_ready,
+        ):
             return
         if path in MODEL_LIST_PATHS:
             import urllib.parse
@@ -833,6 +838,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             runtime_body: Json = {"metadata": {"session_id": query.get("session_id", ["models"])[0] or "models"}}
             try:
                 downstream_key = _check_downstream_key(self)
+                _enforce_request_rate_limit(self, downstream_key)
                 from .gateway_tool_runtime import _request_slot_scope
                 with _request_slot_scope():
                     metadata = runtime_body.setdefault("metadata", {})
@@ -883,24 +889,6 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 return
             from .gateway_config import load_config, _redacted_config
             _json_response(self, 200, {"config": _redacted_config(load_config())})
-            return
-        if path == "/admin/stats.json":
-            if not _check_admin(self):
-                return
-            from .gateway_logging import _stats_snapshot
-            _json_response(self, 200, {"stats": _stats_snapshot()})
-            return
-        if path == "/admin/requests.json":
-            if not _check_admin(self):
-                return
-            from .gateway_logging import _tail_requests
-            _json_response(self, 200, {"requests": _tail_requests(200)})
-            return
-        if path == "/admin/failures.json":
-            if not _check_admin(self):
-                return
-            from .gateway_logging import _tail_failures
-            _json_response(self, 200, {"failures": _tail_failures(200)})
             return
         if path == "/admin/memories.json":
             if not _check_admin(self):
@@ -1281,7 +1269,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if not _check_admin(self):
                 return
             try:
-                from marketplace import list_mcp_marketplace, list_skills_catalog, scan_local_skills
+                from .marketplace import list_mcp_marketplace, list_skills_catalog, scan_local_skills
                 mcp_items = list_mcp_marketplace()
                 skills = list_skills_catalog()
                 local_skills = scan_local_skills()
@@ -1314,224 +1302,57 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if path in {"/admin/config", "/admin/upstream-profile", "/admin/client-config", "/admin/password", "/admin/downstream-key", "/admin/mcp", "/admin/mcp-reload", "/admin/http-actions"}:
                 if not _check_admin(self):
                     return
-                from .gateway_config import load_config, save_config
-                cfg = load_config()
+                from .gateway_config import load_config_with_revision, save_config
+                cfg, config_revision = load_config_with_revision()
                 if not _check_admin_origin(self, cfg):
                     return
                 form = _read_form(self)
-                if path == "/admin/mcp-reload":
-                    from .gateway_mcp import _mcp_close_sessions
-                    _mcp_close_sessions()
-                elif path == "/admin/config":
-                    from .gateway_config import _admin_form_float, _admin_form_int, _profile_from_admin_form
-                    try:
-                        profile = _profile_from_admin_form(form, cfg.get("upstream") if isinstance(cfg.get("upstream"), dict) else None)
-                    except ValueError as exc:
-                        _json_response(self, 400, _error_payload(str(exc)))
+                client_mutation = apply_admin_client_mutation(
+                    path,
+                    cfg,
+                    config_revision,
+                    form,
+                )
+                if client_mutation.matched:
+                    if not client_mutation.success:
+                        _json_response(
+                            self,
+                            client_mutation.status,
+                            _error_payload(client_mutation.error),
+                        )
                         return
-                    profiles = cfg.get("upstream_profiles") if isinstance(cfg.get("upstream_profiles"), list) else []
-                    replaced = False
-                    for index, existing_profile in enumerate(profiles):
-                        if isinstance(existing_profile, dict) and existing_profile.get("id") == profile["id"]:
-                            profiles[index] = profile
-                            replaced = True
-                            break
-                    if not replaced:
-                        profiles.append(profile)
-                    cfg["active_upstream_id"] = profile["id"]
-                    cfg["active_upstream"] = profile["id"]
-                    cfg["upstream"] = profile
-                    cfg["upstream_profiles"] = profiles
-                    gateway_cfg = cfg.setdefault("gateway", {})
-                    gateway_cfg["tool_mode"] = form.get("tool_mode", gateway_cfg.get("tool_mode", "orchestrate"))
-                    invalid_field = None
-                    for field, default, parser in [
-                        ("max_tool_rounds", 5, _admin_form_int),
-                        ("max_concurrent_requests", 32, _admin_form_int),
-                        ("text_tool_adapter_compact_token_limit", 48000, _admin_form_int),
-                        ("concurrency_queue_timeout_seconds", 5.0, _admin_form_float),
-                        ("tool_execution_timeout_seconds", 60.0, _admin_form_float),
-                    ]:
-                        if invalid_field is not None:
-                            break
-                        try:
-                            gateway_cfg[field] = parser(form, (field,), gateway_cfg.get(field), default)
-                        except ValueError:
-                            invalid_field = field
-                    if invalid_field is not None:
-                        _json_response(self, 400, _error_payload(f"invalid numeric field: {invalid_field}"))
+                connector_mutation = apply_admin_connector_mutation(
+                    path,
+                    cfg,
+                    config_revision,
+                    form,
+                )
+                if connector_mutation.matched:
+                    if not connector_mutation.success:
+                        _json_response(
+                            self,
+                            connector_mutation.status,
+                            _error_payload(connector_mutation.error),
+                        )
                         return
-                    # Note: workspace_root is NOT saved - it's a runtime field determined per-request from client metadata
-                    gateway_cfg["allow_write_tools"] = form.get("allow_write_tools", "") != ""
-                    gateway_cfg["allow_shell_tools"] = form.get("allow_shell_tools", "") != ""
-                    gateway_cfg["request_logging"] = form.get("request_logging", "") != ""
-                    gateway_cfg["record_unsupported_tools"] = form.get("record_unsupported_tools", "") != ""
-                    gateway_cfg["text_tool_call_fallback_enabled"] = form.get("text_tool_call_fallback_enabled", "") != ""
-                    context_cfg = cfg.setdefault("context", {})
-                    context_cfg["enabled"] = form.get("context_enabled", "") != ""
-                    context_cfg["fanout_enabled"] = form.get("context_fanout_enabled", "") != ""
-                    context_cfg["quality_review_enabled"] = form.get("context_quality_review_enabled", "") != ""
-                    invalid_field = None
-                    for json_key, form_key, default in [
-                        ("max_input_tokens", "context_max_input_tokens", 1048576),
-                        ("fanout_chunk_tokens", "context_fanout_chunk_tokens", 120000),
-                        ("fanout_max_chunks", "context_fanout_max_chunks", 0),
-                        ("fanout_max_workers", "context_fanout_max_workers", 4),
-                    ]:
-                        if invalid_field is not None:
-                            break
-                        try:
-                            context_cfg[json_key] = _admin_form_int(form, (form_key,), context_cfg.get(json_key), default)
-                        except ValueError:
-                            invalid_field = form_key
-                    if invalid_field is not None:
-                        _json_response(self, 400, _error_payload(f"invalid numeric field: {invalid_field}"))
-                        return
-                    save_config(cfg)
-                elif path == "/admin/client-config":
-                    from .gateway_config import _admin_form_int
-                    gateway_cfg = cfg.setdefault("gateway", {})
-                    gateway_cfg["public_base_url"] = form.get("public_base_url", "").strip() or "http://127.0.0.1:8885"
-                    gateway_cfg["client_snippet_api_key"] = form.get("client_snippet_api_key", "").strip()
-                    gateway_cfg["downstream_model_alias"] = form.get("downstream_model_alias", "").strip()
-                    gateway_cfg["review_model_alias"] = form.get("review_model_alias", "").strip()
-                    gateway_cfg["codex_reasoning_effort"] = form.get("codex_reasoning_effort", "xhigh").strip() or "xhigh"
-                    invalid_field = None
-                    for field, default in [
-                        ("client_context_window", 1048576),
-                        ("client_auto_compact_token_limit", 943718),
-                        ("client_output_token_limit", 131072),
-                    ]:
-                        if invalid_field is not None:
-                            break
-                        try:
-                            gateway_cfg[field] = _admin_form_int(form, (field,), gateway_cfg.get(field), default)
-                        except ValueError:
-                            invalid_field = field
-                    if invalid_field is not None:
-                        _json_response(self, 400, _error_payload(f"invalid numeric field: {invalid_field}"))
-                        return
-                    save_config(cfg)
-                elif path == "/admin/password":
-                    from .gateway_config import _hash_secret
-                    old_password = form.get("old_password", "")
-                    new_password = form.get("new_password", "")
-                    if not old_password or not new_password:
-                        _json_response(self, 400, _error_payload("missing old_password or new_password"))
-                        return
-                    admin = cfg.get("admin", {})
-                    if not _constant_time_equal(_hash_secret(old_password), admin.get("password_hash") or ""):
-                        _json_response(self, 403, _error_payload("invalid old password"))
-                        return
-                    admin["password_hash"] = _hash_secret(new_password)
-                    admin["must_change_password"] = False
-                    cfg["admin"] = admin
-                    save_config(cfg)
-                elif path == "/admin/downstream-key":
-                    action = form.get("action", "add")
-                    if action == "add":
-                        key_name = form.get("name", "").strip()
-                        key_value = form.get("key", "").strip()
-                        if not key_name or not key_value:
-                            _json_response(self, 400, _error_payload("missing name or key"))
-                            return
-                        from .gateway_config import _hash_secret
-                        import datetime as _dt
-                        downstream_keys = cfg.setdefault("downstream_keys", [])
-                        downstream_keys.append({
-                            "name": key_name,
-                            "key_hash": _hash_secret(key_value),
-                            "prefix": key_value[:8],
-                            "enabled": True,
-                            "protocols": ["models", "chat_completions", "responses", "messages", "direct_tools"],
-                            "created_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-                        })
-                        save_config(cfg)
-                    elif action == "delete":
-                        key_name = form.get("name", "").strip()
-                        downstream_keys = cfg.get("downstream_keys") or []
-                        cfg["downstream_keys"] = [k for k in downstream_keys if k.get("name") != key_name]
-                        save_config(cfg)
-                elif path == "/admin/mcp":
-                    action = form.get("action", "add")
-                    if action == "add":
-                        server_name = form.get("name", "").strip()
-                        command = form.get("command", "").strip()
-                        if not server_name or not command:
-                            _json_response(self, 400, _error_payload("missing name or command"))
-                            return
-                        import shlex
-                        mcp_cfg = cfg.setdefault("mcp", {})
-                        servers = mcp_cfg.setdefault("servers", [])
-                        servers.append({
-                            "name": server_name,
-                            "command": shlex.split(command),
-                            "enabled": True,
-                        })
-                        save_config(cfg)
-                    elif action == "delete":
-                        server_name = form.get("name", "").strip()
-                        mcp_cfg = cfg.get("mcp", {})
-                        servers = mcp_cfg.get("servers") or []
-                        mcp_cfg["servers"] = [s for s in servers if s.get("name") != server_name]
-                        save_config(cfg)
-                elif path == "/admin/http-actions":
-                    action = form.get("action", "add")
-                    if action == "add":
-                        action_name = form.get("name", "").strip()
-                        url = form.get("url", "").strip()
-                        if not action_name or not url:
-                            _json_response(self, 400, _error_payload("missing name or url"))
-                            return
-                        actions_cfg = cfg.setdefault("http_actions", {})
-                        actions = actions_cfg.setdefault("actions", [])
-                        actions.append({
-                            "name": action_name,
-                            "url": url,
-                            "method": form.get("method", "POST").upper(),
-                            "description": form.get("description", ""),
-                            "enabled": True,
-                        })
-                        save_config(cfg)
-                    elif action == "delete":
-                        action_name = form.get("name", "").strip()
-                        actions_cfg = cfg.get("http_actions", {})
-                        actions = actions_cfg.get("actions") or []
-                        actions_cfg["actions"] = [a for a in actions if a.get("name") != action_name]
-                        save_config(cfg)
-                elif path == "/admin/upstream-profile":
-                    action = form.get("action", "save")
-                    if action == "save":
-                        from .gateway_config import _profile_from_admin_form
-                        try:
-                            profile = _profile_from_admin_form(form)
-                        except ValueError as exc:
-                            _json_response(self, 400, _error_payload(str(exc)))
-                            return
-                        profiles = cfg.setdefault("upstream_profiles", [])
-                        existing_idx = None
-                        for i, p in enumerate(profiles):
-                            if p.get("id") == profile.get("id"):
-                                existing_idx = i
-                                break
-                        if existing_idx is not None:
-                            profiles[existing_idx] = profile
-                        else:
-                            profiles.append(profile)
-                        save_config(cfg)
-                    elif action == "delete":
-                        profile_id = form.get("id", "").strip()
-                        profiles = cfg.get("upstream_profiles") or []
-                        cfg["upstream_profiles"] = [p for p in profiles if p.get("id") != profile_id]
-                        save_config(cfg)
-                    elif action == "activate":
-                        profile_id = form.get("id", "").strip()
-                        cfg["active_upstream_id"] = profile_id
-                        save_config(cfg)
+                config_mutation = apply_admin_config_mutation(
+                    path,
+                    cfg,
+                    config_revision,
+                    form,
+                )
+                if config_mutation.matched and not config_mutation.success:
+                    _json_response(
+                        self,
+                        config_mutation.status,
+                        _error_payload(config_mutation.error),
+                    )
+                    return
                 _redirect(self, "/ui")
                 return
             if path in SUPPORTED_PATHS or path in TOKEN_COUNT_PATHS or path in DIRECT_TOOL_CALL_PATHS:
                 downstream_key = _check_downstream_key(self)
+                _enforce_request_rate_limit(self, downstream_key)
                 from .gateway_tool_runtime import _request_slot_scope
                 with _request_slot_scope():
                     body = _read_json(self)
@@ -1580,7 +1401,6 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         semantic_cache_scope = ""
                         try:
                             from .gateway_cache import get_semantic_cache
-                            from .gateway_protocol import _last_user_text
                             from .gateway_tool_runtime import _request_runtime_scope_key, _request_scope_body, _request_workspace_root
                             cache = get_semantic_cache()
                             # Tool requests are schema-dependent and often
@@ -1603,7 +1423,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                                 and not body.get("tools")
                                 and not body.get("tool_choice")
                             )
-                            query_text = _last_user_text(path, body) if cache_allowed else ""
+                            query_text = _semantic_cache_request_fingerprint(path, body) if cache_allowed else ""
                             if query_text:
                                 scoped_body = _request_scope_body(body, downstream_key)
                                 scoped_root = _request_workspace_root(scoped_body)
@@ -1636,109 +1456,32 @@ class GatewayHandler(BaseHTTPRequestHandler):
                             _write_request_log(path, body, 200, response, downstream_key)
                             _json_response(self, 200, response)
                 return
-            # --- Skill Create ---
-            if path == "/admin/skill-create":
+            if path in {
+                "/admin/skill-create",
+                "/admin/skill-install.json",
+                "/admin/skill-delete.json",
+                "/admin/mcp-install.json",
+            }:
                 if not _check_admin_write(self):
                     return
-                form = _read_form(self)
-                skill_name = form.get("skill_name", "").strip()
-                skill_content = form.get("skill_content", "").strip()
-                if not skill_name or not skill_content:
-                    _json_response(self, 400, {"error": "skill_name and skill_content required"})
-                    return
-                safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", skill_name).strip("-")
-                skills_dir = _admin_skill_dir(safe_name)
-                if skills_dir is None:
-                    _json_response(self, 400, {"error": "invalid skill_name"})
-                    return
-                skills_dir.mkdir(parents=True, exist_ok=True)
-                (skills_dir / "SKILL.md").write_text(skill_content, encoding="utf-8")
-                _redirect(self, "/ui#skills")
-                return
-            # --- Skill Install from Marketplace ---
-            if path == "/admin/skill-install.json":
-                if not _check_admin_write(self):
-                    return
-                body = _read_json(self)
-                skill_id = body.get("id", "").strip()
-                if not skill_id:
-                    _json_response(self, 400, {"error": "id required"})
-                    return
-                try:
-                    from marketplace import get_skill_by_id
-                    skill = get_skill_by_id(skill_id)
-                    if not skill:
-                        _json_response(self, 404, {"error": f"skill not found: {skill_id}"})
-                        return
-                    skills_dir = _admin_skill_dir(skill_id)
-                    if skills_dir is None:
-                        _json_response(self, 400, {"error": "invalid skill id"})
-                        return
-                    skills_dir.mkdir(parents=True, exist_ok=True)
-                    content = "# " + skill["name"] + "\n\n" + skill.get("description", "") + "\n"
-                    (skills_dir / "SKILL.md").write_text(content, encoding="utf-8")
-                    _json_response(self, 200, {"ok": True, "name": skill_id})
-                except Exception as exc:
-                    _json_response(self, 500, {"error": str(exc)})
-                return
-            # --- Skill Delete ---
-            if path == "/admin/skill-delete.json":
-                if not _check_admin_write(self):
-                    return
-                body = _read_json(self)
-                skill_name = body.get("name", "").strip()
-                if not skill_name:
-                    _json_response(self, 400, {"error": "name required"})
-                    return
-                import shutil
-                skills_dir = _admin_skill_dir(skill_name)
-                if skills_dir is None:
-                    _json_response(self, 400, {"error": "invalid skill name"})
-                    return
-                if skills_dir.is_dir():
-                    shutil.rmtree(skills_dir)
-                    _json_response(self, 200, {"ok": True})
+                payload = _read_form(self) if path == "/admin/skill-create" else _read_json(self)
+                result = apply_admin_catalog_mutation(path, payload)
+                if result.redirect:
+                    _redirect(self, result.redirect)
                 else:
-                    _json_response(self, 404, {"error": "skill not found"})
-                return
-            # --- MCP Install from Marketplace ---
-            if path == "/admin/mcp-install.json":
-                if not _check_admin_write(self):
-                    return
-                body = _read_json(self)
-                mcp_id = body.get("id", "").strip()
-                if not mcp_id:
-                    _json_response(self, 400, {"error": "id required"})
-                    return
-                try:
-                    from marketplace import get_mcp_server_by_id
-                    server = get_mcp_server_by_id(mcp_id)
-                    if not server:
-                        _json_response(self, 404, {"error": f"MCP server not found: {mcp_id}"})
-                        return
-                    from .gateway_config import load_config, save_config
-                    cfg = load_config()
-                    mcp_cfg = cfg.setdefault("mcp", {})
-                    servers = mcp_cfg.setdefault("servers", [])
-                    if any(s.get("name") == mcp_id for s in servers):
-                        _json_response(self, 200, {"ok": True, "message": "already installed"})
-                        return
-                    cmd_parts = server.get("install_command", "").split()
-                    servers.append({"name": mcp_id, "command": cmd_parts[0] if cmd_parts else "npx", "args": cmd_parts[1:] if len(cmd_parts) > 1 else [], "enabled": True})
-                    save_config(cfg)
-                    _json_response(self, 200, {"ok": True, "name": mcp_id})
-                except Exception as exc:
-                    _json_response(self, 500, {"error": str(exc)})
+                    _json_response(self, result.status, result.payload)
                 return
             _json_response(self, 404, _error_payload("not found"))
         except Exception as exc:
             _handle_error(self, _normalize_request_path(self.path.split("?", 1)[0]), exc)
 
     def do_OPTIONS(self) -> None:
-        self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        from .gateway_http_security import cors_origin_allowed
+        if self.headers.get("Origin") and not cors_origin_allowed(self):
+            _json_response(self, 403, _error_payload("CORS origin is not allowed"))
+            return
+        self.send_response(204)
+        send_cors_headers(self, preflight=True)
         self.end_headers()
 
 
@@ -1759,7 +1502,18 @@ def _handle_error(handler: BaseHTTPRequestHandler, path: str, exc: Exception) ->
         _safe_json_response(handler, 401, _error_payload(str(exc)))
     elif isinstance(exc, GatewayBusyError):
         record_status(429)
-        _safe_json_response(handler, 429, _error_payload(str(exc)))
+        retry_after = 1
+        if isinstance(exc.detail, dict):
+            try:
+                retry_after = max(1, int(float(exc.detail.get("retry_after_seconds") or 0) + 0.999))
+            except (TypeError, ValueError, OverflowError):
+                retry_after = 1
+        _safe_json_response(
+            handler,
+            429,
+            _error_payload(str(exc), detail=exc.detail),
+            headers={"Retry-After": str(retry_after)},
+        )
     elif isinstance(exc, GatewayError):
         record_status(exc.status)
         _safe_json_response(handler, exc.status, _error_payload(str(exc), detail=exc.detail))

@@ -3,8 +3,11 @@
 import json
 import os
 import tempfile
+import concurrent.futures
+import stat
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -16,6 +19,7 @@ except ImportError:
     CRYPTO_AVAILABLE = False
 
 if CRYPTO_AVAILABLE:
+    import gateway_encryption as encryption
     from gateway_encryption import (
         encrypt_value,
         decrypt_value,
@@ -43,6 +47,39 @@ class TestEncryption(unittest.TestCase):
         # Should decrypt back to original
         decrypted = decrypt_value(encrypted)
         self.assertEqual(decrypted, original)
+
+    def test_concurrent_first_key_creation_uses_one_atomic_key(self):
+        old_key, old_fernet = encryption._encryption_key, encryption._fernet
+        try:
+            with tempfile.TemporaryDirectory() as td, patch.dict(
+                os.environ,
+                {
+                    "GATEWAY_ENCRYPTION_KEY_PATH": str(Path(td) / "encryption.key"),
+                    "GATEWAY_RUNTIME_DIR": str(Path(td) / "runtime"),
+                },
+                clear=False,
+            ):
+                encryption._encryption_key = None
+                encryption._fernet = None
+                with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+                    keys = list(executor.map(lambda _: encryption._load_or_create_key(), range(50)))
+                self.assertEqual(len(set(keys)), 1)
+                key_path = Path(td) / "encryption.key"
+                self.assertEqual(key_path.read_bytes(), keys[0])
+                self.assertEqual(stat.S_IMODE(key_path.stat().st_mode), 0o600)
+        finally:
+            encryption._encryption_key, encryption._fernet = old_key, old_fernet
+
+    def test_invalid_existing_key_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td, patch.dict(
+            os.environ,
+            {"GATEWAY_ENCRYPTION_KEY_PATH": str(Path(td) / "encryption.key")},
+            clear=False,
+        ):
+            key_path = Path(td) / "encryption.key"
+            key_path.write_bytes(b"invalid")
+            with self.assertRaises(Exception):
+                encryption._load_or_create_key()
 
     def test_decrypt_plain_text(self):
         """Test that plain text is returned as-is."""
@@ -158,12 +195,27 @@ class TestEncryption(unittest.TestCase):
         """Test that encrypting already encrypted values is idempotent."""
         original = "secret"
         encrypted1 = encrypt_value(original)
-        encrypted2 = encrypt_value(encrypted1)  # Encrypt again
+        encrypted2 = encrypt_value(encrypted1)
+        self.assertEqual(encrypted2, encrypted1)
+        self.assertEqual(decrypt_value(encrypted2), original)
 
-        # Should not double-encrypt
-        # (Actually it will, but decrypt should handle it)
-        decrypted = decrypt_value(encrypted2)
-        # This might fail if double-encrypted, showing we need idempotence
+    def test_wrong_encryption_key_fails_closed(self):
+        old_key, old_fernet = encryption._encryption_key, encryption._fernet
+        try:
+            encryption._encryption_key = Fernet.generate_key()
+            encryption._fernet = Fernet(encryption._encryption_key)
+            encrypted = encrypt_value("secret")
+            encryption._encryption_key = Fernet.generate_key()
+            encryption._fernet = Fernet(encryption._encryption_key)
+            with self.assertRaises(RuntimeError):
+                decrypt_value(encrypted)
+        finally:
+            encryption._encryption_key, encryption._fernet = old_key, old_fernet
+
+    def test_encrypted_config_requires_crypto_support(self):
+        with patch.object(encryption, "_CRYPTO_AVAILABLE", False):
+            with self.assertRaises(RuntimeError):
+                decrypt_config({"upstream": {"api_key": "encrypted:not-valid"}})
 
     def test_sensitive_field_detection(self):
         """Test automatic detection of sensitive fields."""

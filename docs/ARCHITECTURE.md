@@ -2,6 +2,8 @@
 
 > 真实测试上游 / Mimo 作为上游时默认按 **Gateway adapter** 处理：`tools_enabled=adapter`，`supports_tools=false`，`supports_function_calls=false`。真实地址只放本地 `.gateway_service.json`、`.env` 或运行时环境变量，不写入提交代码。当前探针显示 `/v1/messages` 在 forced tool_choice 下可返回 Anthropic `tool_use`，但上游直连没有 `/anthropic` 别名、没有 `/v1/tools/call` / `/v1/functions/call`，且 `/v1/responses` forced tool probe 未返回 Codex 需要的 `function_call`。因此 Claude Code/Codex 不直连该上游执行工具，而是连接 Gateway：Gateway-owned 工具（HTTP Action/MCP/WebFetch/WebSearch/calculator/Memory 等）由 Gateway 真执行；用户侧机器工具（Read/LS/Bash/Skill/GUI/local agent 等）由 Gateway 转成下游原生 tool request，让客户端在用户机器执行后回传结果。Mimo 上下文按 `1048576` tokens（1M）配置。
 
+> 当前产品边界：Assistants / Threads 仅提供 create 兼容响应；`gateway_web2api.py` 和 `gateway_concurrency.py` 的多上游能力没有接入生产 HTTP 请求路径。机器可读状态以 `GET /capabilities` 为准。
+
 ## 1. 系统定位
 
 ```
@@ -80,7 +82,7 @@ Anthropic Messages   →  gateway_protocol  →  任意下游格式
 
 Gateway 是中游服务，不把自身启动目录当作用户项目目录。每个请求会先解析当前下游项目根：请求体 `workspace_root` / `gateway_workspace` 最优先，其次是 Claude Code 的 `Primary working directory` / `Worktree`、Codex Responses 的 `<environment_context><cwd>`、metadata 中的 `projectDir` / `cwd`，最后才回退到 env/config/default。工具读写、项目级 `.traces`、SQLite 记忆隔离、`Skill` 工具和项目插件都使用该请求级项目根。
 
-`Skill` / `list_skills` / `read_skill` / `run_skill` 是真实 Gateway 工具。项目内 `.codex/skills`、`.claude/skills`、`.opencode/skills`、`.agents/skills`、`skills/` 优先；项目内 `.codex/plugins` / `.claude/plugins` / `.opencode/plugins` / `plugins` 的 manifest 可声明 skills，但声明路径必须仍在项目根内；用户全局 skills 与 `GATEWAY_SKILLS_DIRS` 在项目目录之后加载。
+`Skill` / `list_skills` / `read_skill` / `run_skill` 是真实 Gateway 工具。项目内 `.codex/skills`、`.claude/skills`、`.opencode/skills`、`.agents/skills`、`skills/` 优先；项目内 `.codex/plugins` / `.claude/plugins` / `.opencode/plugins` / `plugins` 的 manifest 可声明 skills，但声明路径必须仍在项目根内；Admin 管理的服务级 catalog 由 `GATEWAY_ADMIN_SKILLS_ROOT` 定位，在项目级 Skill 之后加载；随后才是用户全局 skills 与 `GATEWAY_SKILLS_DIRS`。Compose 将 Admin catalog 放在持久卷 `/app/data/skills`，避免向只读镜像层写入。
 
 ### 3.3 上下文管理（无限上下文）
 
@@ -155,11 +157,11 @@ src/
 │   ├── 请求/工具/缓存/质量统计
 │   ├── SQLite 持久化
 │   └── 仪表板/趋势/导出
-├── gateway_concurrency.py     # 并发优化
+├── gateway_concurrency.py     # 多上游实验模块（当前未接入 HTTP 请求路径）
 │   ├── ConnectionPool (连接池)
 │   ├── LoadBalancer (负载均衡)
 │   └── MultiUpstreamManager (多上游管理)
-├── gateway_web2api.py         # Web → API 引擎
+├── gateway_web2api.py         # Web → API 独立引擎（当前未接入 HTTP 请求路径）
 │   ├── CSS 选择器提取
 │   ├── 正则提取
 │   └── 自动元数据提取

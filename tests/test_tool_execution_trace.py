@@ -179,12 +179,36 @@ class TestExecuteToolCallTiming(unittest.TestCase):
             self.assertEqual(ftype, "execution_failed")
             self.assertIsNotNone(exec_ms)
             self.assertGreaterEqual(exec_ms, 0.0)
-            self.assertEqual(retry_cnt, 1)  # retry_limit=1 → 1 retry after first attempt
+            self.assertEqual(retry_cnt, 0)
             self.assertEqual(prov, "openai")
         finally:
             gateway.BUILTIN_TOOLS.pop("_test_trace", None)
             if orig:
                 gateway.BUILTIN_TOOLS["echo"] = orig
+
+    def test_unexpected_exception_records_failure_telemetry(self):
+        def broken_handler(args):
+            raise RuntimeError("unexpected")
+
+        gateway.BUILTIN_TOOLS["_test_unexpected"] = gateway.GatewayTool(
+            name="_test_unexpected",
+            description="",
+            parameters={},
+            handler=broken_handler,
+            risk="medium",
+        )
+        try:
+            call = ToolCall(call_id="t_unexpected", name="_test_unexpected", arguments={}, raw={})
+            result = gateway._execute_tool_call(call, provider="direct")
+            self.assertFalse(result.success)
+            rows = self._rows()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0][0], "_test_unexpected")
+            self.assertEqual(rows[0][1], "execution_failed")
+            self.assertEqual(rows[0][3], 0)
+            self.assertEqual(rows[0][4], "direct")
+        finally:
+            gateway.BUILTIN_TOOLS.pop("_test_unexpected", None)
 
 
 class TestExecuteToolCallRetry(unittest.TestCase):
@@ -223,7 +247,11 @@ class TestExecuteToolCallRetry(unittest.TestCase):
         def flaky_handler(args):
             attempts["count"] += 1
             if attempts["count"] < 3:
-                raise ToolExecutionError("transient", failure_type="execution_failed")
+                raise ToolExecutionError(
+                    "transient",
+                    failure_type="execution_failed",
+                    retryable=True,
+                )
             return "ok"
 
         gateway.BUILTIN_TOOLS["_test_flaky"] = gateway.GatewayTool(
@@ -253,8 +281,8 @@ class TestExecuteToolCallRetry(unittest.TestCase):
             gateway.BUILTIN_TOOLS.pop("_test_flaky", None)
             gateway._gateway_config = saved
 
-    def test_retry_exhausted_then_failure(self):
-        """After max retries exhausted, retry_count in DB equals total attempts - 1."""
+    def test_non_retryable_failure_runs_once(self):
+        """Permanent failures do not repeat potentially non-idempotent tools."""
         attempts = {"count": 0}
 
         def always_fail(args):
@@ -272,12 +300,11 @@ class TestExecuteToolCallRetry(unittest.TestCase):
             call = ToolCall(call_id="t_perm", name="_test_perm", arguments={}, raw={})
             result = gateway._execute_tool_call(call, provider="openai")
             self.assertFalse(result.success)
-            # retry_limit defaults to 1 (GATEWAY_TOOL_MAX_RETRIES env or 1)
-            # With retry_limit=1: attempt 1 fails → retry → attempt 2 fails → record
+            self.assertEqual(attempts["count"], 1)
             rows = self._rows()
             self.assertEqual(len(rows), 1)
             name, ftype, exec_ms, retry_cnt, prov = rows[0]
-            self.assertEqual(retry_cnt, 1)  # 1 retry after first attempt
+            self.assertEqual(retry_cnt, 0)
             self.assertEqual(prov, "openai")
         finally:
             gateway.BUILTIN_TOOLS.pop("_test_perm", None)

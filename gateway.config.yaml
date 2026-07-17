@@ -27,8 +27,16 @@ upstream:
   protocol: openai_chat              # openai_chat | anthropic_messages | openai_responses
   tools_enabled: adapter             # Mimo Messages 可 forced tool_use；Codex/Responses function_call 未证实，默认走 Gateway 本地真实工具适配
   timeout_seconds: 60
+  retry_max_attempts: 3              # 总尝试次数（含首次请求）
+  retry_initial_delay_seconds: 0.5   # 指数退避初始延迟
+  retry_max_delay_seconds: 4.0       # 单次重试最大延迟
+  retry_max_elapsed_seconds: 90.0    # 整个上游请求/重试总时限
   max_input_tokens: 1048576
   max_output_tokens: 131072
+  max_response_bytes: 33554432      # 非流式/聚合上游响应硬上限（32MB）
+  max_stderr_bytes: 262144          # curl stderr 内存保留上限（256KB）
+  max_stream_event_bytes: 1048576   # 单个 SSE event 上限（1MB）
+  max_stream_events: 100000         # 单次上游流最大事件数
   max_concurrency: 32
 
   # 上游 API 路径（通常不需要修改）
@@ -64,6 +72,7 @@ gateway:
   # 工具权限
   allow_write_tools: false           # 允许文件写入工具；仅可信本地 coding-agent 场景开启
   allow_shell_tools: false           # 允许 Shell 执行工具；生产默认关闭
+  tool_cache_persist_local_results: false  # 默认不把 Read/Grep 等本地文件内容写入 SQLite
   execute_user_side_tools_in_gateway: false  # 默认禁止在 Gateway 服务机执行用户侧文件/shell/GUI/local agent 工具
   allow_private_network_tools: false # 默认禁止 WebFetch/WebSearch/image_generation provider 访问 Gateway 服务端私网；仅管理员确认服务侧网络工具需要时开启
 
@@ -71,12 +80,28 @@ gateway:
   max_tool_rounds: 10                # 最大工具调用轮数
   tool_execution_timeout_seconds: 60 # 单次工具执行超时
   max_concurrent_requests: 32        # 最大并发请求数
+  concurrency_backend: sqlite       # sqlite 跨进程共享；memory 仅单进程
+  concurrency_db_path: .gateway_runtime/admission.sqlite3
+  concurrency_fallback_backend: none # 共享后端故障默认失败关闭；可显式设 memory 降级
+  concurrency_busy_timeout_ms: 1000
+  concurrency_lease_ttl_seconds: 120
+  concurrency_heartbeat_seconds: 30
+  concurrency_queue_timeout_seconds: 5
   max_request_body_bytes: 67108864   # POST 请求体读取前上限（默认 64MB，超限返回 413）
+  cors_enabled: false                # 默认关闭浏览器跨域访问
+  cors_allowed_origins: []           # 启用时仅允许精确 http(s) Origin，不支持通配符
 
   # 日志
   request_logging: true
   logging_backend: sqlite            # sqlite | jsonl
   max_log_payload_chars: 200000      # 单个 request/response 日志 payload 截断上限，防止 SQLite 膨胀
+  rate_limit_enabled: true           # Python 请求路径按认证客户端限流
+  rate_limit_rpm: 120                # 每个客户端/匿名来源每分钟请求数
+  rate_limit_backend: sqlite         # sqlite 跨进程共享；memory 仅单进程/测试
+  rate_limit_db_path: .gateway_runtime/rate_limits.sqlite3
+  rate_limit_fallback_backend: memory # SQLite 暂不可用时保持有界的进程内保护
+  rate_limit_busy_timeout_ms: 1000
+  rate_limit_state_ttl_seconds: 3600
   sqlite_log_path: gateway_log.sqlite3
 
   # 本地规划器（自动分析代码上下文）
@@ -137,6 +162,32 @@ context:
     protocol: ""
 
 # ----------------------------------------------------------------------------
+# 持久化数据维护
+# ----------------------------------------------------------------------------
+maintenance:
+  enabled: true
+  interval_seconds: 300
+  dry_run: false
+  batch_size: 1000
+  max_batches_per_run: 4
+  incremental_vacuum_pages: 256
+  request_log_retention_days: 30
+  request_log_max_rows: 100000
+  tool_failure_retention_days: 90
+  tool_failure_max_rows: 50000
+  memory_retention_days: 90
+  memory_max_rows: 50000
+  planner_session_retention_days: 30
+  planner_session_max_rows: 20000
+  planner_event_max_rows: 100000
+  # 只清理 Gateway 已知的 smoke/anonymous 临时目录；默认禁用并保持 dry-run。
+  runtime_cleanup_enabled: false
+  runtime_cleanup_dry_run: true
+  runtime_retention_days: 7
+  runtime_max_entries_per_run: 20
+  runtime_max_entry_bytes: 268435456
+
+# ----------------------------------------------------------------------------
 # 下游 API Keys（客户端认证）
 # ----------------------------------------------------------------------------
 downstream_keys:
@@ -150,6 +201,9 @@ downstream_keys:
 # ----------------------------------------------------------------------------
 mcp:
   servers: []
+  max_header_bytes: 65536            # MCP stdio header 上限（64KB）
+  max_message_bytes: 16777216        # 单条 MCP JSON-RPC 消息上限（16MB）
+  max_stderr_bytes: 262144           # 每个 MCP 会话保留的 stderr 上限（256KB）
   # - name: filesystem
   #   command: npx
   #   args: ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]

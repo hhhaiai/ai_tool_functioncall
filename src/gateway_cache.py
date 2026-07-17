@@ -341,6 +341,14 @@ class SemanticCache:
                             pass
                     return entry.response
 
+        # Gateway request fingerprints deliberately opt out of fuzzy matching:
+        # they encode the complete response-affecting request contract and are
+        # safe to reuse only on an exact key match.
+        if query.startswith("gateway-request-v1:"):
+            with self._lock:
+                self._misses += 1
+            return None
+
         # Slow path: compute embedding OUTSIDE the lock
         query_embedding = self.embedding_provider.embed(query)
 
@@ -377,7 +385,7 @@ class SemanticCache:
         # Compute embedding OUTSIDE the lock
         normalized_scope = self._normalize_scope_key(scope_key)
         key = self._make_key(query, normalized_scope)
-        embedding = self.embedding_provider.embed(query)
+        embedding = [] if query.startswith("gateway-request-v1:") else self.embedding_provider.embed(query)
 
         with self._lock:
             self._evict_expired()
@@ -449,16 +457,22 @@ class ToolResultCache:
         "WebFetch", "fetch_url",
         "WebSearch", "web_search",
     })
+    NETWORK_CACHEABLE_TOOLS = frozenset({
+        "WebFetch", "fetch_url",
+        "WebSearch", "web_search",
+    })
 
     def __init__(
         self,
         ttl_seconds: int = 30,
         max_entries: int = 500,
         persistent: bool = False,
+        persist_local_results: bool = False,
     ):
         self.ttl_seconds = ttl_seconds
         self.max_entries = max_entries
         self.persistent = persistent and _PERSISTENCE_AVAILABLE
+        self.persist_local_results = bool(persist_local_results)
         self._cache: dict[str, tuple[float, str, str, dict]] = {}  # key -> (timestamp, result, tool_name, arguments)
         self._lock = threading.Lock()
         self._hits = 0
@@ -474,13 +488,22 @@ class ToolResultCache:
         """Check if a tool is safe to cache."""
         return tool_name in self.CACHEABLE_TOOLS
 
+    def _uses_persistence(self, tool_name: str) -> bool:
+        return bool(
+            self.persistent
+            and (
+                self.persist_local_results
+                or tool_name in self.NETWORK_CACHEABLE_TOOLS
+            )
+        )
+
     def get(self, tool_name: str, arguments: dict) -> Optional[str]:
         """Get cached result for a tool call."""
         if not self.is_cacheable(tool_name):
             return None
 
         # Try persistent cache first if enabled
-        if self.persistent:
+        if self._uses_persistence(tool_name):
             args_hash = self._make_key(tool_name, arguments)
             try:
                 entry = gp.load_tool_cache_entry(tool_name, args_hash)
@@ -510,7 +533,7 @@ class ToolResultCache:
             return
 
         # Save to persistent cache if enabled
-        if self.persistent:
+        if self._uses_persistence(tool_name):
             args_hash = self._make_key(tool_name, arguments)
             try:
                 gp.save_tool_cache_entry(
@@ -519,6 +542,8 @@ class ToolResultCache:
                     result=result,
                     success=True,
                     ttl_seconds=self.ttl_seconds,
+                    workspace_key=str(arguments.get("__gateway_workspace_cache_key") or ""),
+                    runtime_key=str(arguments.get("__gateway_runtime_cache_key") or ""),
                 )
             except Exception as exc:
                 _logger.warning(f"Failed to save tool cache to database: {exc}")
@@ -570,6 +595,32 @@ class ToolResultCache:
                 del self._cache[key]
 
             return len(to_remove)
+
+    def invalidate_scope(self, workspace_key: str, runtime_key: str) -> int:
+        """Invalidate one exact tenant/workspace runtime scope.
+
+        Scope fields are internal cache-key components populated by the
+        canonical tool runtime.  Exact matching prevents one tenant's mutation
+        from evicting another tenant or workspace.
+        """
+        if not workspace_key or not runtime_key:
+            return 0
+        with self._lock:
+            to_remove = [
+                key
+                for key, (_, _, _, cached_args) in self._cache.items()
+                if cached_args.get("__gateway_workspace_cache_key") == workspace_key
+                and cached_args.get("__gateway_runtime_cache_key") == runtime_key
+            ]
+            for key in to_remove:
+                del self._cache[key]
+        persistent_removed = 0
+        if self.persistent:
+            try:
+                persistent_removed = gp.delete_tool_cache_scope(workspace_key, runtime_key)
+            except Exception as exc:
+                _logger.warning(f"Failed to invalidate persistent tool cache scope: {exc}")
+        return len(to_remove) + persistent_removed
 
     def clear(self) -> None:
         """Clear all cached results."""
@@ -649,6 +700,9 @@ def get_tool_result_cache() -> ToolResultCache:
                     ttl_seconds=30,
                     max_entries=500,
                     persistent=persistence_config.get("enabled", True),
+                    persist_local_results=bool(
+                        config.get("gateway", {}).get("tool_cache_persist_local_results", False)
+                    ),
                 )
 
     return _tool_result_cache
