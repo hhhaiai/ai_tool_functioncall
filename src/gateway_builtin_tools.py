@@ -52,11 +52,14 @@ from .gateway_file_ops import (
 from .gateway_process_ops import (
     BoundedProcessStream as _BoundedProcessStream,
     process_group_kwargs as _process_group_kwargs,
+    process_ready_pipe as _process_ready_pipe,
     run_bounded_process as _shared_run_bounded_process,
     terminate_process_group as _terminate_process_group,
+    wait_for_process_ready as _wait_for_process_ready,
 )
 from .gateway_sandbox import (
     SANDBOX_WORKER_ERROR_PREFIX,
+    SANDBOX_WORKER_READY_FD_ENV,
     SANDBOX_WORKER_SETUP_EXIT,
     SandboxDiffEntry,
     sandbox_child_environment,
@@ -632,6 +635,8 @@ def _run_bounded_process(
         stdout_limit=limit,
         stderr_limit=limit,
         env=sandbox_child_environment(explicit_env),
+        ready_fd_env_name=SANDBOX_WORKER_READY_FD_ENV,
+        startup_timeout=max(0.1, float(os.environ.get("GATEWAY_SANDBOX_STARTUP_TIMEOUT") or "5")),
     )
     if (
         completed.returncode == SANDBOX_WORKER_SETUP_EXIT
@@ -728,27 +733,50 @@ def _remove_exec_session(session_id: str) -> None:
     with EXEC_SESSIONS_LOCK:
         EXEC_SESSIONS.pop(scoped_id, None)
         EXEC_SESSION_LAST_USED.pop(scoped_id, None)
+        EXEC_SESSION_TERMINAL.pop(scoped_id, None)
 
 
-def _completed_exec_content(session_id: str, proc: subprocess.Popen, output: str) -> str:
-    _terminate_process_group(proc, timeout=0.2)
+def _close_exec_process_streams(proc: subprocess.Popen) -> None:
+    for stream in (proc.stdin, proc.stdout, proc.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            pass
+
+
+def _exec_result_content(
+    session_id: str,
+    exit_code: int | None,
+    output: str,
+    *,
+    classify_failure: bool = True,
+) -> str:
     _remove_exec_session(session_id)
     payload = {
         "session_id": session_id,
         "running": False,
-        "exit_code": proc.returncode,
+        "exit_code": exit_code,
         "output": output,
     }
     content = json.dumps(payload, ensure_ascii=False)
-    if proc.returncode not in {0, None}:
+    if classify_failure and exit_code not in {0, None}:
         failure_type = (
             "sandbox_setup_failed"
-            if proc.returncode == SANDBOX_WORKER_SETUP_EXIT
+            if exit_code == SANDBOX_WORKER_SETUP_EXIT
             and output.lstrip().startswith(SANDBOX_WORKER_ERROR_PREFIX)
             else "execution_failed"
         )
         raise ToolExecutionError(content, failure_type=failure_type)
     return content
+
+
+def _completed_exec_content(session_id: str, proc: subprocess.Popen, output: str) -> str:
+    _terminate_process_group(proc, timeout=0.2)
+    exit_code = proc.returncode
+    _close_exec_process_streams(proc)
+    return _exec_result_content(session_id, exit_code, output)
 
 def _tool_exec_shell_start(args: Json) -> str:
     _require_shell_enabled()
@@ -769,18 +797,60 @@ def _tool_exec_shell_start(args: Json) -> str:
         writable_paths=(".",),
         long_lived=True,
     )
-    proc = subprocess.Popen(
-        sandbox_worker_command(job),
-        cwd=str(cwd),
-        shell=False,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        bufsize=0,
-        env=sandbox_child_environment(),
-        **_process_group_kwargs(),
+    child_env, ready_read_fd, ready_write_fd, ready_popen_kwargs = _process_ready_pipe(
+        sandbox_child_environment(),
+        fd_env_name=SANDBOX_WORKER_READY_FD_ENV,
     )
+    try:
+        proc = subprocess.Popen(
+            sandbox_worker_command(job),
+            cwd=str(cwd),
+            shell=False,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
+            env=child_env,
+            **_process_group_kwargs(),
+            **ready_popen_kwargs,
+        )
+    except BaseException:
+        for fd in (ready_read_fd, ready_write_fd):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        raise
+    if ready_write_fd is not None:
+        try:
+            os.close(ready_write_fd)
+        except OSError:
+            pass
+    try:
+        _wait_for_process_ready(
+            proc,
+            ready_read_fd,
+            timeout=max(0.1, float(os.environ.get("GATEWAY_SANDBOX_STARTUP_TIMEOUT") or "5")),
+        )
+    except subprocess.TimeoutExpired as exc:
+        _terminate_process_group(proc)
+        output = _read_exec_available(proc, 0)
+        raise ToolExecutionError(
+            json.dumps(
+                {
+                    "session_id": session_id,
+                    "running": False,
+                    "exit_code": proc.returncode,
+                    "output": output,
+                    "error": "sandbox worker startup timed out",
+                },
+                ensure_ascii=False,
+            ),
+            failure_type="sandbox_setup_failed",
+        ) from exc
     with EXEC_SESSIONS_LOCK:
+        EXEC_SESSION_TERMINAL.pop(scoped_session_id, None)
         EXEC_SESSIONS[scoped_session_id] = proc
         EXEC_SESSION_LAST_USED[scoped_session_id] = __import__("time").time()
     output = _read_exec_available(proc, float(args.get("read_timeout") or 0.05))
@@ -788,21 +858,32 @@ def _tool_exec_shell_start(args: Json) -> str:
         return _completed_exec_content(session_id, proc, output)
     return json.dumps({"session_id": session_id, "pid": proc.pid, "running": True, "output": output}, ensure_ascii=False)
 
-def _exec_session(args: Json) -> tuple[str, subprocess.Popen]:
+def _exec_session(
+    args: Json,
+) -> tuple[str, subprocess.Popen | None, tuple[float, int | None, str] | None]:
     session_id = str(args.get("session_id") or args.get("id") or "")
     if not session_id:
         raise ToolExecutionError("missing session_id", failure_type="invalid_input")
     scoped_session_id = _scoped_runtime_id(session_id)
     with EXEC_SESSIONS_LOCK:
         proc = EXEC_SESSIONS.get(scoped_session_id)
+        terminal = EXEC_SESSION_TERMINAL.get(scoped_session_id)
         if proc:
             EXEC_SESSION_LAST_USED[scoped_session_id] = __import__("time").time()
+    if proc:
+        return session_id, proc, None
+    if terminal is not None:
+        return session_id, None, terminal
     if not proc:
         raise ToolExecutionError(f"exec session not found: {session_id}", failure_type="not_found")
-    return session_id, proc
+    raise ToolExecutionError(f"exec session not found: {session_id}", failure_type="not_found")
 
 def _tool_write_stdin(args: Json) -> str:
-    session_id, proc = _exec_session(args)
+    session_id, proc, terminal = _exec_session(args)
+    if terminal is not None:
+        _, exit_code, output = terminal
+        return _exec_result_content(session_id, exit_code, output)
+    assert proc is not None
     if proc.poll() is not None:
         output = _read_exec_available(proc, 0)
         return _completed_exec_content(session_id, proc, output)
@@ -819,7 +900,11 @@ def _tool_write_stdin(args: Json) -> str:
     return json.dumps({"session_id": session_id, "running": True, "output": output}, ensure_ascii=False)
 
 def _tool_exec_wait(args: Json) -> str:
-    session_id, proc = _exec_session(args)
+    session_id, proc, terminal = _exec_session(args)
+    if terminal is not None:
+        _, exit_code, output = terminal
+        return _exec_result_content(session_id, exit_code, output)
+    assert proc is not None
     try:
         proc.wait(timeout=float(args.get("timeout") or 30))
     except subprocess.TimeoutExpired:
@@ -829,12 +914,27 @@ def _tool_exec_wait(args: Json) -> str:
     return _completed_exec_content(session_id, proc, output)
 
 def _tool_exec_kill(args: Json) -> str:
-    session_id, proc = _exec_session(args)
+    session_id, proc, terminal = _exec_session(args)
+    if terminal is not None:
+        _, exit_code, output = terminal
+        return _exec_result_content(
+            session_id,
+            exit_code,
+            output,
+            classify_failure=False,
+        )
+    assert proc is not None
     if proc.poll() is None:
         _terminate_process_group(proc, timeout=float(args.get("timeout") or 2))
     output = _read_exec_available(proc, 0)
-    _remove_exec_session(session_id)
-    return json.dumps({"session_id": session_id, "running": False, "exit_code": proc.returncode, "output": output}, ensure_ascii=False)
+    exit_code = proc.returncode
+    _close_exec_process_streams(proc)
+    return _exec_result_content(
+        session_id,
+        exit_code,
+        output,
+        classify_failure=False,
+    )
 
 def _tool_git(args: Json) -> str:
     action = str(args.get("action") or args.get("subcommand") or "status").lower()
@@ -1587,6 +1687,7 @@ def _tool_multi_tool_use_parallel(args: Json) -> str:
 
 EXEC_SESSIONS: dict[str, subprocess.Popen] = {}
 EXEC_SESSION_LAST_USED: dict[str, float] = {}
+EXEC_SESSION_TERMINAL: dict[str, tuple[float, int | None, str]] = {}
 EXEC_SESSIONS_LOCK = threading.Lock()
 _EXEC_REAPER_STOP = threading.Event()
 _EXEC_REAPER_THREAD: threading.Thread | None = None
@@ -1613,16 +1714,37 @@ def _reap_expired_exec_sessions(*, now: float | None = None) -> int:
     now = time.time() if now is None else now
     ttl = max(1.0, float(os.environ.get("GATEWAY_EXEC_SESSION_TTL_SECONDS") or "900"))
     expired: list[subprocess.Popen] = []
+    completed: list[tuple[str, subprocess.Popen]] = []
+    removed_terminal = 0
     with EXEC_SESSIONS_LOCK:
         for key, proc in list(EXEC_SESSIONS.items()):
             last_used = EXEC_SESSION_LAST_USED.get(key, now)
-            if proc.poll() is not None or now - last_used >= ttl:
+            idle_seconds = now - last_used
+            if idle_seconds >= ttl:
                 EXEC_SESSIONS.pop(key, None)
                 EXEC_SESSION_LAST_USED.pop(key, None)
                 expired.append(proc)
+            elif proc.poll() is not None and idle_seconds >= 1.0:
+                # Preserve a bounded terminal snapshot so a client polling at
+                # the same time as the reaper still receives output/exit code.
+                EXEC_SESSIONS.pop(key, None)
+                EXEC_SESSION_LAST_USED.pop(key, None)
+                completed.append((key, proc))
+        for key, (finished_at, _exit_code, _output) in list(EXEC_SESSION_TERMINAL.items()):
+            if now - finished_at >= ttl:
+                EXEC_SESSION_TERMINAL.pop(key, None)
+                removed_terminal += 1
     for proc in expired:
         _terminate_process_group(proc)
-    return len(expired)
+        _close_exec_process_streams(proc)
+    for key, proc in completed:
+        output = _read_exec_available(proc, 0)
+        exit_code = proc.returncode
+        _close_exec_process_streams(proc)
+        with EXEC_SESSIONS_LOCK:
+            if key not in EXEC_SESSIONS:
+                EXEC_SESSION_TERMINAL[key] = (now, exit_code, output)
+    return len(expired) + len(completed) + removed_terminal
 
 
 def _start_exec_session_reaper() -> None:
@@ -1645,8 +1767,10 @@ def _cleanup_runtime_sessions() -> None:
         processes = list(EXEC_SESSIONS.values())
         EXEC_SESSIONS.clear()
         EXEC_SESSION_LAST_USED.clear()
+        EXEC_SESSION_TERMINAL.clear()
     for proc in processes:
         _terminate_process_group(proc)
+        _close_exec_process_streams(proc)
     with AGENT_SESSIONS_LOCK:
         for item in AGENT_SESSIONS.values():
             future = item.get("future")

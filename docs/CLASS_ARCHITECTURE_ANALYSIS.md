@@ -4,7 +4,7 @@
 > 分析范围: src/ 目录下所有 Python 模块  
 > 总类数: 45+
 
-> 注意：这是 2026-06-17 的结构快照，不是当前路由能力清单。当前 `GatewayHandler` 没有 `/api/web2api` 路由，`gateway_web2api.py` 和 `gateway_concurrency.py` 是未接入生产 HTTP 请求路径的独立模块；运行时能力以 `GET /capabilities` 为准。
+> 注意：这是 2026-06-17 的历史结构快照，不是当前路由能力清单。快照当时尚未接入 Web2API 和生产多上游路由；当前版本已经通过 `gateway_web2api.py` 和 `gateway_upstream_pool.py` 接入受保护 HTTP/canonical proxy 路径。运行时能力以 `GET /capabilities` 为准。
 
 ---
 
@@ -780,7 +780,7 @@ GET  /ui/config            → 配置编辑器
 GET  /api/config           → 获取配置
 POST /api/config           → 保存配置
 GET  /admin/stats.json     → 统计数据
-POST /api/web2api          → 历史设计项；当前 Handler 未接入
+POST /api/web2api          → 2026-06-17 快照中的历史设计项；当前版本已接入
 POST /v1/chat/completions  → OpenAI 兼容接口
 POST /v1/messages          → Anthropic 兼容接口
 ```

@@ -35,7 +35,7 @@
    如果上游完全不支持 tools，或只部分支持 tools，Gateway 可以把工具定义以文本协议方式提供给上游模型，解析上游返回的文本工具调用，再按工具归属处理：HTTP Action/MCP/网络/纯函数/记忆等 Gateway-owned 工具由 Gateway 真执行并回填；Read/LS/Bash/Skill/GUI/local agent 等用户侧工具返回下游原生工具请求，由 Claude Code/Codex 在用户机器执行并把结果回传。
 
 3. **配置与能力声明**
-   Gateway 提供 5-Tab Web UI（Dashboard / Models / Usage / Tools & Skills / Logs），管理上游 profile、下游 key、能力矩阵（tools、function calls、vision、streaming、JSON schema 等）、MCP 服务器、HTTP Actions，以及 **Skills**（从 workspace + user-global 目录扫描，支持列表和内容查看）。Admin UI 可通过上游 `/v1/models` 自动拉取模型列表。
+   Gateway 提供受 Basic Auth 保护的运维控制台，以及独立的 9-Tab `/ui/config` Config Center。运维面可管理上游 profile、下游 key、能力矩阵、MCP、HTTP Actions 和 **Skills**；Config Center 通过带 revision 的原子更新管理实际运行时字段。Admin UI 可通过上游 `/v1/models` 自动拉取模型列表。
 
 4. **长上下文 / 类无限上下文**
    Gateway 支持 token 估算、压缩、SQLite 记忆召回、超长输入 fan-out 分片与综合，让下游获得类似“无限上下文”的使用效果。
@@ -55,15 +55,15 @@
 | 流式 SSE 编排 + 流式缓存 | ✅ 已实现 | `src/gateway_streaming.py` |
 | 上下文压缩、SQLite 记忆、fan-out | ✅ 已实现 | `src/gateway_context.py` |
 | 语义缓存（精确 + 相似匹配） | ✅ 已实现 | `src/gateway_cache.py` |
-| 智力提升（问题分析、反思、质量评估） | ✅ 已实现 | `src/gateway_intelligence.py` |
+| 智力提升（规则 + 可插拔 LLM provider） | ✅ 已接入非流式与流式编排 | `src/gateway_intelligence.py`, `src/gateway_llm.py` |
 | Q&A 统计（请求/工具/缓存/质量） | ✅ 已实现 | `src/gateway_stats.py` |
 | Web 配置 UI（9 Tab） | ✅ 已实现 | `src/gateway_web_config.py` |
-| Assistants / Threads | ⚠️ 仅 create 兼容对象，不含持久化、messages、runs 或生命周期 | `src/gateway_assistants.py` |
-| Web2API（网页转结构化 API） | 🧩 模块和测试存在，但未接入当前 HTTP 请求路径 | `src/gateway_web2api.py` |
+| Assistants / Threads | ✅ Gateway-owned SQLite 生命周期、messages、runs、steps、tool-output resume、租户隔离 | `src/gateway_assistants.py` |
+| Web2API（网页转结构化 API） | ✅ 已接 `/v1/web2api`、`/api/web2api`、`/anthropic/v1/web2api` | `src/gateway_web2api.py` |
 | 单上游连接复用、重试、限界 | ✅ 已接入 | `src/gateway_proxy.py` |
-| 多上游负载均衡 | 🧩 独立模块存在，但未接入当前 HTTP 请求路径 | `src/gateway_concurrency.py` |
+| 多上游负载均衡 / 故障转移 | ✅ 已接 canonical proxy path，含熔断与恢复 | `src/gateway_upstream_pool.py` |
 | Claude Code 兼容层 | ✅ 已实现 | `src/gateway_claude_compat.py` |
-| Admin UI / client config / 上游模型自动获取 | ✅ 已实现 | `src/gateway_admin.py` |
+| Admin UI / Config API / cache、stats、provider 状态 | ✅ 已实现 | `src/gateway_admin.py`, `src/gateway_admin_api.py` |
 
 运行时能力以 `GET /capabilities` 为准。模块文件存在或单元测试通过，不代表该模块已经接入生产 HTTP 请求路径。
 
@@ -77,7 +77,7 @@
 ./scripts/agent_planner_acceptance.sh --full
 ```
 
-最近一次本地完整 CI 验证（2026-07-17）：Ruff、Mypy、Bandit、`pip check`、`pip-audit`、Compose、Docker build 和全量 pytest 均通过；pytest 为 `1418 passed, 2 skipped`。隔离 fake/local upstream 的 real-tool acceptance 同时通过直接真实工具执行和原生 tool-call 两轮编排。生产/公网部署前仍必须配置非默认 Admin 凭证，并以部署环境自己的门禁输出为准。
+最近一次本地完整 CI 验证（2026-07-24）：Ruff、17 个模块的 Mypy、Bandit、`pip check`、`pip-audit`、Compose、Docker build 和全量 pytest 均通过；pytest 为 `1492 passed, 2 skipped`。官方 `mimo_gateway.sh verify` 五阶段也完整通过，包括真实本地工具/两轮编排、安全边界、并发压力、Anthropic/Responses Skill 事件和本机 Claude/Codex CLI。生产/公网部署前仍必须配置非默认 Admin 凭证，并以部署环境自己的门禁输出为准。
 
 本轮真实测试上游 / Mimo 兼容结论（2026-05-25，地址只保存在本地 ignored 配置或环境变量中）：
 
@@ -102,6 +102,8 @@ Mimo 上下文按 1M 配置：upstream.max_input_tokens=1048576，gateway/client
 已覆盖：Anthropic SSE tool_use.input 规范化为 input_json_delta；streaming adapter 对 Read/Bash/Skill 返回下游工具请求；direct `/v1/tools/call` / `/v1/functions/call`；Claude Code / Codex 项目目录识别；项目级 `.traces` 不串服务目录；项目内 plugin skills；Memory/RecallMemory 项目根隔离；streaming passthrough 也会剥离 Gateway 内部 workspace 路由字段。
 可复跑的项目级 smoke：`tests/integration/project_scope_cli_smoke.py`；`./scripts/mimo_gateway.sh verify` 已包含它，设置 `GATEWAY_VERIFY_REQUIRE_CLI=1` 时会把 Claude Code CLI 与 Codex CLI 也作为必过项。示例 artifact: `.gateway_runtime/project-scope-cli-smoke-20260525-035342/summary.json`，`pass=true`。
 ```
+
+`verify` 只在真实本地工具验收阶段临时开启服务端用户工具/localhost 夹具权限，单元测试与最终 Claude/Codex Skill 归属检查会恢复生产安全边界；自定义 Admin 凭据可通过 `GATEWAY_VERIFY_ADMIN_USERNAME` / `GATEWAY_VERIFY_ADMIN_PASSWORD` 提供，不会进入 argv 或 launchd plist。
 
 ---
 
@@ -301,6 +303,17 @@ client = OpenAI(base_url="http://127.0.0.1:8885/v1", api_key="your-gateway-key")
 | `/v1/tools/call` | POST | 直接工具调用 |
 | `/v1/functions/call` | POST | 直接工具调用兼容路径 |
 | `/tools/call` | POST | 直接工具调用兼容路径（无 `/v1` 前缀） |
+| `/v1/web2api` / `/api/web2api` / `/anthropic/v1/web2api` | POST | 受下游认证、ACL、限流、准入和 SSRF 边界保护的网页结构化提取 |
+| `/v1/assistants` / `/v1/assistants/{id}` | GET/POST/DELETE | Assistant 列表、创建、读取、修改、删除 |
+| `/v1/threads` / `/v1/threads/{id}` | POST/GET/DELETE | Thread 创建、读取、修改、删除 |
+| `/v1/threads/{thread_id}/messages` | GET/POST | Message 列表和创建；资源路径另支持读取、修改、删除 |
+| `/v1/threads/{thread_id}/runs` | GET/POST | Run 列表和同步创建；另支持读取、修改、取消、提交 tool outputs 和 steps |
+| `/ui/config` | GET | 9-Tab Config Center（Basic Auth） |
+| `/api/config` / `/api/config/schema` | GET | 脱敏配置、revision 和可编辑 schema（Basic Auth） |
+| `/api/config` / `/api/config/update` | POST | revision-aware 原子配置更新（Basic Auth + same-origin） |
+| `/api/stats/dashboard` / `/api/cache/stats` | GET | 统计和缓存状态（Basic Auth） |
+| `/api/cache/clear` | POST | 清除内存及持久语义/工具缓存（Basic Auth + same-origin） |
+| `/api/upstreams/status` / `/api/intelligence/status` | GET | 脱敏上游池和 LLM provider 状态（Basic Auth） |
 
 ---
 
@@ -322,10 +335,13 @@ src/
 ├── gateway_context.py        # token 估算、压缩、记忆、fan-out
 ├── gateway_cache.py          # 语义缓存 (精确/相似匹配)
 ├── gateway_intelligence.py   # 智力提升 (问题分析/反思/质量评估)
+├── gateway_llm.py            # 可插拔 LLM intelligence provider
 ├── gateway_stats.py          # Q&A 统计 (SQLite 持久化)
 ├── gateway_web_config.py     # Web 配置 UI (9 Tab)
+├── gateway_admin_api.py      # revision-aware 配置、统计和缓存管理 API
 ├── gateway_web2api.py        # Web → 结构化 API
-├── gateway_concurrency.py    # 连接池、负载均衡、多上游管理
+├── gateway_upstream_pool.py  # 多上游选择、熔断、恢复和状态快照
+├── gateway_assistants.py     # Assistants / Threads SQLite 生命周期
 ├── gateway_claude_compat.py  # Claude Code 兼容层
 ├── gateway_mcp.py            # MCP client / tools/list / tools/call
 ├── gateway_http_actions.py   # HTTP Action executor
@@ -393,6 +409,10 @@ git ls-files | xargs grep -l '47\.85\.40\.209' 2>/dev/null
 - 已存在配置文件如果 JSON 损坏或根节点不是对象，会 fail closed 返回结构化 500；不会回退到默认 `admin/admin` 或无下游鉴权。
 - 请求/响应日志和 Admin 配置展示会递归遮盖常见敏感字段（token、secret、password、cookie、API key、key hash 等），避免运维面泄漏凭据。
 - Admin 写操作会拒绝跨源浏览器 Origin/Referer 请求；无来源头的 CLI/脚本请求仍保持兼容。
+- `/ui/config` 及所有 `/api/config|stats|cache|upstreams|intelligence` 管理接口都要求 Admin Basic Auth；配置更新使用 revision 做乐观并发控制，密码占位符 `***` 或空值不会覆盖现有 secret。
+- 多上游只对可安全重试的 429/502/503/504/transport timeout 做有界故障转移；400 等客户端错误不会切换上游。SSE 一旦已经向下游输出首个事件，就不会切换 provider，以免拼接两个上游的响应。
+- Assistants Runs 是 Gateway-owned 持久同步生命周期：普通回答可完成 run，function call 可进入 `requires_action` 并由 `submit_tool_outputs` 恢复；当前不宣称 Assistants Run SSE streaming。
+- Intelligence 默认使用确定性规则。`intelligence.use_llm=true` 时使用注册 provider；默认非 strict 模式在 provider 失败时回退规则，`strict_mode=true` 则让请求明确失败。
 - HTTP POST 请求体有读取前上限，默认 64MB；可通过 `gateway.max_request_body_bytes` / `GATEWAY_MAX_REQUEST_BODY_BYTES` 调整，超限返回 413。
 - 请求/响应日志和 tool failure 内容会先遮盖敏感字段，再按 `gateway.max_log_payload_chars` / `GATEWAY_MAX_LOG_PAYLOAD_CHARS` 截断，避免 SQLite/JSONL 膨胀。
 - `gateway_app.py` 当前保留旧单体兼容导出层，新增实现应优先放入对应 `gateway_*` 模块。

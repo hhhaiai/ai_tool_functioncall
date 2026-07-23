@@ -24,6 +24,7 @@ from typing import Any
 CONTRACT_VERSION = "gateway-sandbox-job-v1"
 SETUP_EXIT = 125
 ERROR_PREFIX = "gateway sandbox worker setup failed:"
+READY_FD_ENV = "GATEWAY_SANDBOX_WORKER_READY_FD"
 
 _LANDLOCK_CREATE_RULESET_VERSION = 1
 _LANDLOCK_RULE_PATH_BENEATH = 1
@@ -66,6 +67,20 @@ def _fail(message: str) -> int:
     sys.stderr.write(f"{ERROR_PREFIX} {message}\n")
     sys.stderr.flush()
     return SETUP_EXIT
+
+
+def _signal_ready() -> None:
+    raw_fd = os.environ.pop(READY_FD_ENV, "")
+    if not raw_fd:
+        return
+    try:
+        ready_fd = int(raw_fd)
+    except ValueError as exc:
+        raise ValueError("sandbox worker readiness descriptor is invalid") from exc
+    try:
+        os.write(ready_fd, b"1")
+    finally:
+        os.close(ready_fd)
 
 
 def _positive_optional(value: Any, name: str) -> int | None:
@@ -423,6 +438,7 @@ def _exec_command(policy: dict[str, Any], command_spec: dict[str, Any]) -> None:
             raise RuntimeError("network deny is unavailable with the rlimit backend")
     else:
         raise ValueError(f"unsupported isolation backend: {backend}")
+    _signal_ready()
     os.execvpe(executable, argv, dict(os.environ))
 
 

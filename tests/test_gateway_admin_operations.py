@@ -112,6 +112,43 @@ def test_stats_requests_and_failures_contracts(
     ]
 
 
+def test_upstream_status_is_authenticated_and_credential_redacted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src import gateway_upstream_pool
+
+    snapshot = {
+        "enabled": True,
+        "strategy": "round_robin",
+        "max_attempts": 2,
+        "profiles": [{"id": "primary", "healthy": True}],
+        "excluded_profiles": [],
+    }
+    monkeypatch.setattr(gateway_upstream_pool, "upstream_pool_snapshot", lambda: snapshot)
+    responses = _Responses()
+
+    assert _handle("/api/upstreams/status", responses) is True
+    assert responses.json == [(200, {"upstream_pool": snapshot})]
+
+
+def test_intelligence_status_is_authenticated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src import gateway_llm
+
+    status_payload = {
+        "enabled": True,
+        "use_llm": False,
+        "mode": "rules",
+        "provider": "gateway_upstream",
+    }
+    monkeypatch.setattr(gateway_llm, "provider_status", lambda: status_payload)
+    responses = _Responses()
+
+    assert _handle("/api/intelligence/status", responses) is True
+    assert responses.json == [(200, {"intelligence": status_payload})]
+
+
 def test_storage_route_is_read_only_preflight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -220,4 +257,3 @@ def test_prometheus_renderer_emits_each_maintenance_failure_metric_once(
     lines = operations.prometheus_metrics_text(ready=True).splitlines()
     assert lines.count("# TYPE gateway_maintenance_failures_total counter") == 1
     assert lines.count("gateway_maintenance_failures_total 2") == 1
-

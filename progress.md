@@ -620,3 +620,119 @@
 - Confirmed the new Catalog module has no direct test file and is missing from CI Mypy/Bandit lists. Host Python still lacks Mypy, so no ad-hoc host type run was claimed; the last clean isolated CI evidence predates this module.
 - Recomputed current static import coupling: the largest strongly connected component contains 31 modules. Current largest files remain `tests/test_gateway.py` (13,626), `gateway_tool_runtime.py` (5,061), `gateway_agent_planner.py` (4,463), and `gateway_builtin_tools.py` (2,231).
 - No product code, real upstream, alarm/reminder function, historical database, credential, Git commit, or user-owned dirty change was modified during this audit; only persistent planning records were updated.
+# 2026-07-24 Phase 29 current full-function audit
+- Restored the existing planning context and ran the session catch-up helper; no unsynced context was reported.
+- Confirmed the worktree is intentionally dirty at commit `0c47f1e` on `codex/gateway-owned-multitool`, with current changes in `src/gateway_admission.py`, `src/gateway_rate_limit.py`, `src/gateway_sqlite.py`, `tests/test_gateway_admission.py`, and `tests/test_gateway_rate_limit.py`.
+- Started a fresh read-only completeness audit. Product code will not be edited, reverted, committed, or assumed correct merely because older audit phases reported success.
+- Inventoried the repository (57 source files, 54 test-tree entries at top level plus integrations, CI workflow, deployment assets, runtime artifacts) and extracted the current advertised feature/limitation contract from README and the Agent Planner matrix.
+- Confirmed the docs themselves disclose non-complete surfaces: minimal Assistants/Threads plus Web2API and multi-upstream modules not wired to the HTTP request path.
+- Traced the live HTTP capability and route contract and inspected the five-file dirty functional change. No product edits were made.
+- Re-audited the formerly open Admin catalog boundary and the intelligence integration. Catalog implementation/tests are now present; optional LLM intelligence still references a provider module absent from this checkout.
+- Ran a 260-test focused suite covering current dirty changes and the principal explicit partial/inactive surfaces; all passed in 25.19 seconds.
+- Ran the full repository suite: 1453 passed, 2 skipped in 120.30 seconds.
+- Began the static/security/dependency gate. Compile and JSON/YAML parsing passed; the combined command stopped at missing `python3 -m ruff`, so the remaining tools are being resolved individually.
+- Re-ran gates in an isolated `requirements-dev.txt` environment: Ruff/Bandit/pip-check/pip-audit passed, but Mypy failed on an unused `type: ignore` in the current uncommitted `gateway_sqlite.py` change. This is a current release-blocking gate failure, not an environment-only limitation.
+- Ran the official Agent Planner smoke gate. It failed at the multi-round smoke; diagnosed the runtime-inside-workspace sandbox interaction and proved the core workflow succeeds when runtime storage is separated from the client workspace.
+- Continued the integration set manually: strict protocol passed directly; public surface passed all 21 advertised paths with the current readiness event; remote multi-tenant pressure and long-context pressure passed with scoped audit/recall/streaming/compaction evidence.
+- Compared live Admin routes/UI against README and running documentation. Found a dormant 9-tab web-config module and several documented `/api/*` endpoints that are not wired to the current Handler.
+- Validated both Compose contracts, Dockerfile checks, full image build, and an actual container main-process startup/direct-tool/error-mapping smoke. Removed the temporary audit container/image afterwards.
+- Confirmed the only two skipped tests are live-upstream E2E cases gated by `TEST_UPSTREAM_URL`.
+- Completed the feature-by-feature classification and Phase 29 audit. Final conclusion: core Gateway scope is largely implemented and runnable, but the repository is not fully feature-complete or release-gate clean.
+- Moved the five audit-created integration runtime directories (about 2.3 MiB total) to macOS Trash after verification. They are recoverable; pre-existing runtime/history data was not touched.
+# 2026-07-24 — Phase 30 full-function remediation started
+- The user authorized implementation of every incomplete or blocked item identified by the Phase 29 audit, with stable release-ready behavior as the completion condition.
+- Restored the persistent plan and current dirty-worktree inventory. Existing changes in `src/gateway_admission.py`, `src/gateway_rate_limit.py`, `src/gateway_sqlite.py`, `tests/test_gateway_admission.py`, and `tests/test_gateway_rate_limit.py` are user-owned and must be preserved while overlapping fixes are made.
+- Added Phase 30 covering release gates, acceptance harnesses, Assistants/Threads, Web2API, multi-upstream routing, LLM intelligence, Admin APIs/UI, documentation synchronization, comprehensive regressions, deployment verification, and a final requirement-level completion audit.
+- Baseline SQLite/admission/rate-limit verification passed 35 focused tests. Removed the single unused Mypy suppression on the typed `fcntl` import without altering the user's synchronization/journal-mode behavior.
+- The default Python lacks Mypy; a clean dev environment will be used for the authoritative static and release gates.
+- Repaired the multiround smoke so Gateway runtime/config are outside the client workspace, preserving the production sandbox boundary while allowing pytest to inspect only client code.
+- Repaired public-surface readiness setup/restore to use the current HTTP readiness Event.
+- Both repaired smokes passed independently: multiround produced `Bash -> Read -> Read` with one upstream call and ignored unauthorized Edit; public surface exercised all 21 advertised paths successfully.
+- The complete repository Agent Planner acceptance wrapper now passes, including strict protocol, multi-user pressure, long-context compaction/isolation, and its 85-test focused regression gate.
+- Replaced the create-only Assistants helper with a private SQLite-backed resource service and began compatibility verification. The first legacy test exposed a missing non-content message-count field; the field and failed-create cleanup were restored before proceeding.
+- Added persistence, tenant isolation, run completion, tool-output resumption, failure/cancel, cascade-delete, and full HTTP lifecycle regressions. Their first run exposed same-second ordering drift, now corrected with an insertion-order tie-breaker.
+- Assistants/Threads focused verification now passes 39 tests across legacy compatibility, persistent CRUD, tenant isolation, messages, synchronous run execution, `requires_action`, tool-output resumption, terminal failure/cancel, cascade deletion, dynamic HTTP routing, route ACL, and truthful capabilities.
+- Added and verified the multi-upstream profile-pool regressions together with existing proxy-error, true-streaming, and legacy concurrency coverage: **79 passed in 6.11s**.
+- A source-inspection command used the stale root path `RUNNING_AND_TESTING.md`; the actual document is `docs/RUNNING_AND_TESTING.md`. The `&&` chain stopped before source output, so no code or state changed. Future documentation checks use the resolved path.
+- The first upstream-status focused pytest command used the stale class name `GatewayTests`; the live capability contract belongs to `NativeGatewayTests`, so pytest collected zero tests. The selector was corrected before validation; no product behavior was inferred from that failed command.
+- Wired the multi-upstream capability snapshot and authenticated status endpoint; focused Admin operations, pool, and capability verification passed **25 tests**.
+- Added the Gateway-owned pluggable LLM intelligence provider, configuration parsing, provider runtime/status, rule fallback, strict failure propagation, and authenticated intelligence status endpoint. Compile plus provider/intelligence/Admin/capability verification passed **98 tests**.
+- During Admin API implementation, source inspection caught `clear_persistent_caches()` inserted in the middle of `delete_tool_cache_scope()`. Although Python still compiled, the original scope deletion would have become unreachable; the function boundary was restored before any test claim.
+- The first unified Admin API regression run passed 74/75 tests. Its single failure was a legacy UI-only fixture using `upstream.url`; the canonical runtime field is `upstream.base_url`. Added a read-only render migration mapping without persisting the obsolete key.
+- A follow-up focused pytest command guessed a non-existent Agent Runtime scope test node and therefore collected zero tests. Located the exact live method `test_agent_runtime_audit_scope_contract_documents_non_conversation_exclusions` before rerunning the selection.
+- The corrected 78-test run produced 76 passes and two later config-decryption failures. Root cause was the new Admin HTTP fixture leaving a temporary Fernet instance in process-global encryption state after restoring `GATEWAY_RUNTIME_DIR`; the fixture now saves, clears, and restores both encryption globals so subsequent tests reload the correct repository key.
+- The next corrected unified Admin/config/cache/capability selection passed **78 tests**.
+- The first Assistants cleanup test patch referenced a non-existent function context and was rejected atomically by `apply_patch`; no test file changed. Re-read the live file and added capacity/retention coverage at the actual insertion point.
+- Added Assistants DB/retention/max-row defaults and bounded maintenance integration. Assistants lifecycle/cleanup, maintenance, Admin API, and config-sync focused verification passed **36 tests**.
+# 2026-07-24 — Phase 30 resumed: configuration/deployment synchronization
+
+- Restored the persistent planning context, ran the planning session catch-up helper, confirmed branch `codex/gateway-owned-multitool`, and preserved the existing dirty worktree.
+- Validated `gateway.config.json` with `python3 -m json.tool`; the new Assistants/cache/intelligence/multi-upstream/stats/Web2API sections are valid JSON.
+- Audited the environment and Compose templates and confirmed the newly integrated feature controls are not yet represented there; config-sync regression coverage also remains incomplete.
+- Synchronized `gateway.config.yaml`, `.env.example`, `docker-compose.yml`, and `docker-compose.prod.yml` with persistence, Assistants retention, cache, intelligence provider, upstream pool/failover, stats, and Web2API controls.
+- Added config-sync coverage that compares the new runtime sections to both JSON and YAML templates and pins every new environment/Compose default, including persistent container database paths and secure opt-in flags.
+- Focused configuration and deployment verification passed: **22 passed in 7.22s**. Development Compose also renders successfully with only expected warnings for unset local credentials.
+- Updated `README.md`, `docs/RUNNING_AND_TESTING.md`, and `docs/IMPLEMENTATION_STATUS.md` so Assistants, Web2API, multi-upstream failover, LLM provider, Config Center/Admin APIs, revision/same-origin semantics, and streaming failover limits match the live code. Removed the obsolete callable `_legacy_config_tabs()` schema from the production module.
+- Documentation/Admin/Web2API/Assistants/provider/upstream focused regression passed **162 tests**; canonical config-schema/capability selection passed **45 tests**.
+- Added `gateway_admin_api.py`, `gateway_assistants.py`, `gateway_llm.py`, and `gateway_upstream_pool.py` to the repository Mypy/Bandit gate. Ruff and focused Bandit pass, but the first focused Mypy run reported **33 type errors** caused by Optional/Any narrowing and one numeric conversion. These are now the active static-gate blockers; the gate will not be weakened or suppressed.
+# 2026-07-24 — Phase 31 current completeness re-audit started
+
+- The user requested a fresh audit of whether the current code fully implements every function.
+- Treating the live dirty worktree as authoritative and Phase 30 history only as context.
+- This phase is read-only for product code: no implementation edits, reversions, commits, or destructive cleanup are authorized.
+- Initial snapshot already shows Phase 30 is unfinished and its latest recorded release-gate blocker is 33 Mypy errors in newly integrated modules; all conclusions will be revalidated against current source and executable gates.
+- Read the current capability documentation, CI gate, live route declarations, and newly added implementation modules.
+- Found current-vs-legacy documentation contradictions around Assistants, Web2API, and multi-upstream integration.
+- Created an isolated audit virtual environment at `/tmp/ai_gateway_audit.VRnyBM/venv`; no repository dependencies or product files were changed.
+- Focused new-feature suite passed: 111 tests in 21.49 seconds.
+- Static/security/dependency gates passed: compile/config parsing, Ruff, selected-module Mypy, Bandit, `pip check`, and `pip-audit` are green.
+- Official Agent Planner smoke acceptance passed, including its 92-test regression selection.
+- Full pytest failed with 4 deterministic failures and 1485 passes, 2 skips. Re-ran all four exact nodes alone; all four failed again. Re-ran the three process/runtime nodes with host Python; all three failed again.
+- First combined diff/secret/Compose diagnostic had a Python `-c` quoting syntax error in the audit command itself; reran the meaningful diff and both Compose checks successfully with a simpler command. No product state changed.
+- Docker image build passed. Ephemeral container readiness and calculator execution passed; the audit assertion incorrectly read `supported_paths` from `/capabilities` instead of `/readyz`, but saved response inspection confirmed 24 ready paths, 67 builtins, and calculator output `42`. The exact smoke container was removed automatically.
+- Confirmed the two skipped full-suite cases are live-upstream E2E checks gated by `TEST_UPSTREAM_URL`; no current real-upstream credential was supplied, so real provider behavior remains unverified in this audit.
+- Completed Phase 31 with a negative completeness verdict: the broad feature set is substantially implemented and smokeable, but the repository is not currently fully functional/release-ready because four deterministic regressions keep the authoritative full gate red and documentation is inconsistent.
+- Moved the exact audit-created virtual environment, saved smoke JSON files, and four Agent Planner runtime directories to macOS Trash; they are recoverable. Removed the exact audit Docker image. No user-owned runtime/history data, product code, or Git commit was changed.
+
+# 2026-07-24 — Phase 32 release-blocking correction started
+
+- The active goal now explicitly authorizes implementing all audited functionality, not only reporting gaps.
+- Restored the live worktree and planning context; no unsynced session context was reported.
+- First correction batch targets the four deterministic full-suite regressions: proxy pool-state compatibility, Bash timeout partial output, immediate exec failure classification, and initial exec-session output/readiness semantics.
+- Existing dirty worktree changes remain in scope and must be preserved; no Git commit will be created unless explicitly requested.
+- Added an internal sandbox worker readiness pipe and separated policy-worker startup from real command execution/read timing.
+- Applied the readiness contract to bounded Bash/code/apply-patch jobs and long-lived exec sessions without changing stdout/stderr protocol or exposing Gateway secrets.
+- Made proxy upstream-pool accounting optional for compatibility/minimal clients.
+- Compilation and the four exact release-blocking regressions pass: 4 passed in 4.12 seconds.
+- The first broader regression command used two stale/nonexistent tool-runtime filenames and collected no tests. Enumerated the live test files before retrying; no product behavior was inferred from that command.
+- Hardened readiness-wait cancellation so an explicit cancellation during worker setup still terminates the complete process group and returns bounded captured output.
+- Broader proxy/process/sandbox/tool-runtime verification passed 75 tests in 26.60 seconds.
+- The first combined documentation patch failed atomically because overlapping source views made one Config Center line appear duplicated; split the patch against exact current text, then synchronized the live architecture/status documents and explicitly labeled the 2026-06-17 class analysis as a historical snapshot.
+- Current-feature/proxy/process/sandbox/Admin/Assistants/Web2API/provider selection passed 160 tests.
+- Full pytest passed: 1489 passed, 2 skipped in 105.32 seconds.
+- Complete clean-environment `scripts/ci_gate.sh` passed, including a second full run (1489 passed, 2 skipped), all static/type/security/dependency gates, Compose, and Docker build/removal.
+- Official Agent Planner acceptance passed after the fixes with its 92-test focused selection.
+- Controlled live-upstream tests: models passed; chat failed with provider HTTP 401. Reproduced directly without proxy, kept the credential secret, and did not mutate the ignored local config. This is now the only external E2E evidence gap.
+
+# 2026-07-24 — Phase 32 official `verify` repair and acceptance
+
+- Repaired `scripts/mimo_gateway.sh verify` so trusted-local user-side tools and localhost fixtures are enabled only for acceptance stages, while the unit suite and final Claude/Codex ownership smoke retain production-safe defaults.
+- Added environment-based Admin credential resolution in `tests/integration/security_gateway_checks.py`; the wrapper no longer passes Admin secrets on argv or adds them to the launchd plist.
+- Removed the gate's dependency on PATH-resolved `env`, which was shadowed by a non-executing local script on this host. The unit suite now runs in a Bash subshell with explicit unset/export behavior and failure-safe temporary cleanup.
+- Added macOS Bash 3.2 compatibility and regression contracts for verify-only overrides, normal safe defaults, secret handling, cleanup, and stage-five ownership isolation.
+- Fixed completed exec-session reaper delivery by retaining bounded terminal snapshots and closing process streams deterministically. Strengthened the regression to force a reaper/client race and still require exit code 6.
+- Stabilized scheduling-sensitive process tests while preserving behavioral coverage for partial timeout output, descendant cleanup, initial output, and live-session cache bypass.
+- Focused wrapper/process/deployment verification passed 37 tests; the exact process regressions also pass under `unittest`.
+- A standalone project-scope smoke passed every contract, including installed Claude/Codex CLIs.
+- The complete official `./scripts/mimo_gateway.sh verify` passed all five stages in one run against an isolated local mock upstream: 509 unittest cases, real tool acceptance, security guardrails, concurrent direct/model traffic, and full project-scope/Skill/CLI validation.
+- Stopped the isolated Gateway/mock server and moved nine exact audit-created temporary/runtime directories to macOS Trash, including the earlier clean CI environment and latest Agent Planner artifacts. No user-owned runtime/history data was touched.
+
+# 2026-07-24 — Phase 32 final release completion
+
+- Re-ran the authoritative full suite after the exec-session/wrapper corrections: **1492 passed, 2 skipped in 118.80s**.
+- Built a fresh isolated development environment and ran the complete `scripts/ci_gate.sh`: compile/config parsing, Ruff, 17-module Mypy, Bandit, `pip check`, `pip-audit` with no known vulnerabilities, a second full pytest **1492 passed, 2 skipped**, `git diff --check`, tracked secret-like file guard, both Compose renders, Docker build, and image removal all passed.
+- Recomputed the live capability snapshot: 24 supported public paths; persistent Assistants/Threads lifecycle; authenticated bounded Web2API; integrated upstream profile pool; all documented Config/Stats/Cache/Upstream/Intelligence operations present; intelligence defaults to intentional rule mode until enabled.
+- Audited every Phase 30 requirement against implementation modules, route wiring, direct regressions, full suites, official wrappers, container evidence, configuration, and documentation. No advertised Gateway surface remains partial, inactive, defective, or undocumented.
+- Updated README/running/status documentation with the final 2026-07-24 gate evidence and verify-specific security scope.
+- The only remaining evidence limitation is external: the ignored local live-provider credential returns HTTP 401 for chat both through and directly around Gateway, while models succeeds. No credential was printed, persisted, or changed.
+- Final high-risk focused selection passed **105 tests** after documentation/plan synchronization. `git diff --check` remains clean, ports 18888/19002 have no listeners, the final isolated CI environment was moved to Trash, and Git HEAD remains `0c47f1e` with no commit created.

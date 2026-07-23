@@ -107,12 +107,33 @@ class NativeProxyClient:
         base_url: str | None = None,
         api_key: str | None = None,
         model: str | None = None,
+        profile: Json | None = None,
+        _pool: Any | None = None,
+        _allow_failover: bool = True,
     ) -> None:
-        from .gateway_config import _upstream_config, _upstream_protocol
-        cfg = _upstream_config()
+        from .gateway_config import _upstream_config
+
+        explicit_transport = base_url is not None or api_key is not None or model is not None
+        selected_profile = dict(profile) if isinstance(profile, dict) else None
+        pool = _pool
+        if selected_profile is None and not explicit_transport:
+            try:
+                from .gateway_upstream_pool import get_upstream_pool
+
+                pool = pool or get_upstream_pool()
+                selected_profile = pool.select_profile()
+            except Exception:
+                selected_profile = None
+                pool = None
+        cfg = selected_profile or _upstream_config()
+        self._cfg = dict(cfg)
         self.base_url = (base_url or cfg.get("base_url", "")).rstrip("/")
         self.api_key = api_key if api_key is not None else cfg.get("api_key", "")
         self.model = model if model is not None else cfg.get("model", "")
+        self.profile_id = str(cfg.get("id") or cfg.get("name") or "active")
+        self._pool = pool
+        self._allow_failover = bool(_allow_failover and pool is not None and not explicit_transport)
+        self.paths = dict(cfg.get("paths")) if isinstance(cfg.get("paths"), dict) else {}
         self.timeout = max(0.1, float(cfg.get("timeout_seconds", 60.0) or 60.0))
         self.retry_max_attempts = max(1, int(cfg.get("retry_max_attempts", 3) or 3))
         self.retry_initial_delay = max(0.0, float(cfg.get("retry_initial_delay_seconds", 0.5) or 0.0))
@@ -127,7 +148,9 @@ class NativeProxyClient:
         self.max_stream_events = max(1, int(cfg.get("max_stream_events", 100_000) or 100_000))
         capabilities = cfg.get("capabilities") if isinstance(cfg.get("capabilities"), dict) else {}
         self.supports_streaming = bool(capabilities.get("supports_streaming", True))
-        self.protocol = _upstream_protocol()
+        self.max_input_tokens = max(0, int(cfg.get("max_input_tokens", 0) or 0))
+        env_protocol = os.environ.get("GATEWAY_UPSTREAM_PROTOCOL") or os.environ.get("UPSTREAM_PROTOCOL")
+        self.protocol = str(env_protocol or cfg.get("protocol") or "openai_chat")
         self._opener = self._get_opener()
 
     def _headers(self) -> dict[str, str]:
@@ -151,8 +174,16 @@ class NativeProxyClient:
         return headers
 
     def _url(self, path: str) -> str:
-        from .gateway_config import _configured_upstream_path
-        configured_path = _configured_upstream_path(path)
+        if "/chat/completions" in path:
+            configured_path = self.paths.get("chat_completions", "/v1/chat/completions")
+        elif "/responses" in path:
+            configured_path = self.paths.get("responses", "/v1/responses")
+        elif "/messages" in path:
+            configured_path = self.paths.get("messages", "/v1/messages")
+        elif "/models" in path:
+            configured_path = self.paths.get("models", "/v1/models")
+        else:
+            configured_path = path
         return f"{self.base_url}{configured_path}"
 
     def _aggregate_sse_response(self, response_data: str) -> Json:
@@ -408,9 +439,14 @@ class NativeProxyClient:
     def _do_request(self, method: str, path: str, body: Json | None = None) -> Json:
         from .gateway_observability import observe_upstream
         started = time.monotonic()
+        pool = getattr(self, "_pool", None)
+        profile_id = str(getattr(self, "profile_id", "active") or "active")
+        pool_started = pool.request_start(profile_id) if pool is not None else started
         try:
             result = self._do_request_impl(method, path, body)
         except Exception as exc:
+            if pool is not None:
+                pool.request_failure(profile_id, exc)
             observe_upstream(
                 method=method,
                 path=path,
@@ -421,6 +457,11 @@ class NativeProxyClient:
                 duration_seconds=time.monotonic() - started,
             )
             raise
+        finally:
+            if pool is not None:
+                pool.request_end(profile_id)
+        if pool is not None:
+            pool.request_success(profile_id, pool_started)
         observe_upstream(
             method=method,
             path=path,
@@ -599,6 +640,9 @@ class NativeProxyClient:
         """Observe total and first-event latency around the bounded SSE transport."""
         from .gateway_observability import observe_upstream
         started = time.monotonic()
+        pool = getattr(self, "_pool", None)
+        profile_id = str(getattr(self, "profile_id", "active") or "active")
+        pool_started = pool.request_start(profile_id) if pool is not None else started
         first_event_seconds: float | None = None
         event_count = 0
         success = False
@@ -615,8 +659,14 @@ class NativeProxyClient:
             raise
         except Exception as exc:
             failure_type = exc.__class__.__name__
+            if pool is not None:
+                pool.request_failure(profile_id, exc)
             raise
         finally:
+            if pool is not None:
+                if success:
+                    pool.request_success(profile_id, pool_started)
+                pool.request_end(profile_id)
             observe_upstream(
                 method="POST",
                 path=path,
@@ -629,16 +679,58 @@ class NativeProxyClient:
                 event_count=event_count,
             )
 
+    @staticmethod
+    def _pool_retryable(exc: BaseException) -> bool:
+        if isinstance(exc, UpstreamTimeoutError):
+            return True
+        return isinstance(exc, UpstreamHTTPError) and exc.upstream_status in _RETRY_STATUSES
+
+    def _failover_clients(self) -> Iterator["NativeProxyClient"]:
+        if not self._allow_failover or self._pool is None:
+            return
+        for profile in self._pool.failover_profiles(self.profile_id):
+            yield NativeProxyClient(
+                profile=profile,
+                _pool=self._pool,
+                _allow_failover=False,
+            )
+
     def get(self, path: str) -> Json:
-        return self._do_request("GET", path)
+        try:
+            return self._do_request("GET", path)
+        except Exception as first_error:
+            if not self._pool_retryable(first_error):
+                raise
+            last_error: BaseException = first_error
+            for client in self._failover_clients():
+                try:
+                    return client._do_request("GET", path)
+                except Exception as exc:
+                    last_error = exc
+                    if not self._pool_retryable(exc):
+                        raise
+            raise last_error
 
     def get_upstream_path(self, path: str) -> Json:
-        return self._do_request("GET", path)
+        return self.get(path)
 
     def post(self, path: str, body: Json) -> Json:
-        return self._do_request("POST", path, body)
+        try:
+            return self._do_request("POST", path, body)
+        except Exception as first_error:
+            if not self._pool_retryable(first_error):
+                raise
+            last_error: BaseException = first_error
+            for client in self._failover_clients():
+                try:
+                    return client._do_request("POST", path, body)
+                except Exception as exc:
+                    last_error = exc
+                    if not self._pool_retryable(exc):
+                        raise
+            raise last_error
 
-    def forward(self, path: str, body: Json) -> Json:
+    def _forward_once(self, path: str, body: Json) -> Json:
         from .gateway_config import _force_upstream_stream_aggregate, _headroom_max_input_tokens
         from .gateway_protocol import _convert_request_to_upstream, _convert_response_to_downstream
         from .gateway_headroom import headroom_compress
@@ -652,8 +744,24 @@ class NativeProxyClient:
         # cap, layer transforms (tool result crushing, history trim, system
         # prompt marker) until we fit.  This keeps the request alive instead
         # of the upstream returning a generic ``text too long`` refusal.
-        max_tokens = _headroom_max_input_tokens()
+        max_tokens = self.max_input_tokens or _headroom_max_input_tokens()
         if max_tokens > 0:
             upstream_body = headroom_compress(upstream_body, target_tokens=max_tokens)
-        response = self.post(upstream_path, upstream_body)
+        response = self._do_request("POST", upstream_path, upstream_body)
         return _convert_response_to_downstream(path, response, self.protocol)
+
+    def forward(self, path: str, body: Json) -> Json:
+        try:
+            return self._forward_once(path, body)
+        except Exception as first_error:
+            if not self._pool_retryable(first_error):
+                raise
+            last_error: BaseException = first_error
+            for client in self._failover_clients():
+                try:
+                    return client._forward_once(path, body)
+                except Exception as exc:
+                    last_error = exc
+                    if not self._pool_retryable(exc):
+                        raise
+            raise last_error

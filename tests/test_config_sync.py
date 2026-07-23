@@ -13,6 +13,8 @@ import stat
 from pathlib import Path
 from unittest.mock import patch
 
+import yaml
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src import gateway_config as gateway
@@ -151,6 +153,7 @@ class SyncActiveUpstreamTests(unittest.TestCase):
             self.assertIn("GATEWAY_SANDBOX_DENY_READ_PATHS=${GATEWAY_SANDBOX_DENY_READ_PATHS:-}", compose)
             self.assertIn("GATEWAY_SANDBOX_TENANT_ROOT=${GATEWAY_SANDBOX_TENANT_ROOT:-/app/workspace}", compose)
             self.assertIn("GATEWAY_SANDBOX_NETWORK_POLICY=${GATEWAY_SANDBOX_NETWORK_POLICY:-inherited}", compose)
+            self.assertIn("GATEWAY_SANDBOX_STARTUP_TIMEOUT=${GATEWAY_SANDBOX_STARTUP_TIMEOUT:-5}", compose)
             self.assertIn("GATEWAY_SANDBOX_CPU_SECONDS=${GATEWAY_SANDBOX_CPU_SECONDS:-}", compose)
             self.assertIn("GATEWAY_SANDBOX_MEMORY_BYTES=${GATEWAY_SANDBOX_MEMORY_BYTES:-}", compose)
             self.assertIn("GATEWAY_SANDBOX_MAX_PROCESSES=${GATEWAY_SANDBOX_MAX_PROCESSES:-}", compose)
@@ -165,6 +168,106 @@ class SyncActiveUpstreamTests(unittest.TestCase):
             self.assertIn("GATEWAY_RUNTIME_CLEANUP_DRY_RUN=${GATEWAY_RUNTIME_CLEANUP_DRY_RUN:-1}", compose)
             self.assertIn("GATEWAY_CONTEXT_MAX_INPUT_TOKENS=${GATEWAY_CONTEXT_MAX_INPUT_TOKENS:-1048576}", compose)
             self.assertIn("GATEWAY_CONTEXT_FANOUT_CHUNK_TOKENS=${GATEWAY_CONTEXT_FANOUT_CHUNK_TOKENS:-120000}", compose)
+
+    def test_integrated_feature_defaults_match_json_yaml_env_and_compose(self):
+        root = Path(__file__).resolve().parent.parent
+        with patch.dict(os.environ, {}, clear=True):
+            runtime = gateway._default_config()
+        json_template = json.loads(
+            (root / "gateway.config.json").read_text(encoding="utf-8")
+        )
+        yaml_template = yaml.safe_load(
+            (root / "gateway.config.yaml").read_text(encoding="utf-8")
+        )
+        sections = (
+            "persistence",
+            "assistants",
+            "cache",
+            "intelligence",
+            "concurrency",
+            "stats",
+            "web2api",
+        )
+        for section in sections:
+            self.assertEqual(runtime[section], json_template[section])
+            self.assertEqual(runtime[section], yaml_template[section])
+
+        env_example = (root / ".env.example").read_text(encoding="utf-8")
+        expected_env = {
+            "GATEWAY_PERSISTENCE_ENABLED": "1",
+            "GATEWAY_PERSISTENCE_DB_PATH": ".gateway_runtime/gateway.db",
+            "GATEWAY_ASSISTANTS_DB_PATH": ".gateway_runtime/assistants.sqlite3",
+            "GATEWAY_ASSISTANTS_RETENTION_DAYS": "30",
+            "GATEWAY_ASSISTANTS_MAX_ROWS": "50000",
+            "GATEWAY_CACHE_ENABLED": "1",
+            "GATEWAY_CACHE_MAX_ENTRIES": "1000",
+            "GATEWAY_CACHE_SIMILARITY_THRESHOLD": "0.92",
+            "GATEWAY_CACHE_TTL_SECONDS": "3600",
+            "GATEWAY_EMBEDDING_URL": "",
+            "GATEWAY_EMBEDDING_MODEL": "default",
+            "GATEWAY_EMBEDDING_API_KEY": "",
+            "GATEWAY_INTELLIGENCE_ENABLED": "1",
+            "GATEWAY_INTELLIGENCE_REFLECTION": "1",
+            "GATEWAY_INTELLIGENCE_DECOMPOSITION": "1",
+            "GATEWAY_INTELLIGENCE_QUALITY": "1",
+            "GATEWAY_INTELLIGENCE_MAX_REFLECTION_TOKENS": "500",
+            "GATEWAY_INTELLIGENCE_MAX_DECOMPOSITION_PARTS": "5",
+            "GATEWAY_INTELLIGENCE_QUALITY_THRESHOLD": "0.6",
+            "GATEWAY_INTELLIGENCE_USE_LLM": "0",
+            "GATEWAY_INTELLIGENCE_PROVIDER": "gateway_upstream",
+            "GATEWAY_INTELLIGENCE_MODEL": "",
+            "GATEWAY_INTELLIGENCE_LLM_TIMEOUT": "15.0",
+            "GATEWAY_INTELLIGENCE_MAX_INPUT_CHARS": "20000",
+            "GATEWAY_INTELLIGENCE_TEMPERATURE": "0.0",
+            "GATEWAY_INTELLIGENCE_STRICT_MODE": "0",
+            "GATEWAY_CONCURRENCY_ENABLED": "1",
+            "GATEWAY_CONCURRENCY_MAX_CONNECTIONS": "100",
+            "GATEWAY_CONCURRENCY_MAX_CONNECTIONS_PER_HOST": "10",
+            "GATEWAY_CONCURRENCY_RETRY_COUNT": "2",
+            "GATEWAY_CONCURRENCY_RETRY_DELAY": "1.0",
+            "GATEWAY_CONCURRENCY_STRATEGY": "round_robin",
+            "GATEWAY_MULTI_UPSTREAM_ENABLED": "0",
+            "GATEWAY_MULTI_UPSTREAM_MAX_ATTEMPTS": "0",
+            "GATEWAY_MULTI_UPSTREAM_FAILURE_THRESHOLD": "3",
+            "GATEWAY_MULTI_UPSTREAM_RECOVERY_SECONDS": "30.0",
+            "GATEWAY_STATS_ENABLED": "1",
+            "GATEWAY_STATS_RETENTION_DAYS": "30",
+            "GATEWAY_WEB2API_ENABLED": "1",
+            "GATEWAY_WEB2API_MAX_CONCURRENT": "5",
+            "GATEWAY_WEB2API_CACHE_TTL": "300",
+            "GATEWAY_WEB2API_TIMEOUT": "30",
+            "GATEWAY_WEB2API_MAX_CONTENT_BYTES": "5242880",
+            "GATEWAY_WEB2API_MAX_CACHE_ENTRIES": "256",
+            "GATEWAY_WEB2API_USER_AGENT": "Gateway-Web2API/1.0",
+            "GATEWAY_WEB2API_ALLOW_PRIVATE_NETWORK": "0",
+            "GATEWAY_WEB2API_ALLOW_REGEX": "0",
+            "GATEWAY_WEB2API_ALLOW_RAW_HTML": "0",
+        }
+        env_lines = {
+            name: value
+            for line in env_example.splitlines()
+            if line and not line.startswith("#") and "=" in line
+            for name, value in [line.split("=", 1)]
+        }
+        for name, value in expected_env.items():
+            self.assertEqual(env_lines.get(name), value, name)
+
+        compose_defaults = {
+            **expected_env,
+            "GATEWAY_PERSISTENCE_DB_PATH": "/app/data/runtime/gateway.db",
+            "GATEWAY_ASSISTANTS_DB_PATH": "/app/data/runtime/assistants.sqlite3",
+        }
+        for filename in ("docker-compose.yml", "docker-compose.prod.yml"):
+            compose = (root / filename).read_text(encoding="utf-8")
+            for name, value in compose_defaults.items():
+                self.assertIn(f"{name}=${{{name}:-{value}}}", compose, name)
+
+        self.assertFalse(runtime["concurrency"]["multi_upstream_enabled"])
+        self.assertFalse(runtime["intelligence"]["use_llm"])
+        self.assertFalse(runtime["intelligence"]["strict_mode"])
+        self.assertFalse(runtime["web2api"]["allow_private_network"])
+        self.assertFalse(runtime["web2api"]["allow_regex"])
+        self.assertFalse(runtime["web2api"]["allow_raw_html"])
 
     def test_main_upstream_overrides_stale_profile(self):
         """User edits on the top-level upstream must win over the profile list."""

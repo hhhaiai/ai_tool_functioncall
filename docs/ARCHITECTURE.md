@@ -2,7 +2,7 @@
 
 > 真实测试上游 / Mimo 作为上游时默认按 **Gateway adapter** 处理：`tools_enabled=adapter`，`supports_tools=false`，`supports_function_calls=false`。真实地址只放本地 `.gateway_service.json`、`.env` 或运行时环境变量，不写入提交代码。当前探针显示 `/v1/messages` 在 forced tool_choice 下可返回 Anthropic `tool_use`，但上游直连没有 `/anthropic` 别名、没有 `/v1/tools/call` / `/v1/functions/call`，且 `/v1/responses` forced tool probe 未返回 Codex 需要的 `function_call`。因此 Claude Code/Codex 不直连该上游执行工具，而是连接 Gateway：Gateway-owned 工具（HTTP Action/MCP/WebFetch/WebSearch/calculator/Memory 等）由 Gateway 真执行；用户侧机器工具（Read/LS/Bash/Skill/GUI/local agent 等）由 Gateway 转成下游原生 tool request，让客户端在用户机器执行后回传结果。Mimo 上下文按 `1048576` tokens（1M）配置。
 
-> 当前产品边界：Assistants / Threads 仅提供 create 兼容响应；`gateway_web2api.py` 和 `gateway_concurrency.py` 的多上游能力没有接入生产 HTTP 请求路径。机器可读状态以 `GET /capabilities` 为准。
+> 当前产品边界：Assistants / Threads 由 Gateway-owned SQLite 提供 assistants、threads、messages、runs、run steps、cancel 和 `submit_tool_outputs` 生命周期；Run 为同步编排，不宣称 Run SSE streaming。Web2API 已接入 `/v1/web2api`、`/api/web2api`、`/anthropic/v1/web2api`。生产多上游选择、熔断和安全故障转移由 `gateway_upstream_pool.py` 接入 canonical proxy path；流式首事件输出后固定 provider。机器可读状态以 `GET /capabilities` 为准。
 
 ## 1. 系统定位
 
@@ -108,7 +108,8 @@ Gateway 是中游服务，不把自身启动目录当作用户项目目录。每
 
 ### 3.4 配置管理
 
-- **Web UI**: `gateway_admin.py` + `gateway_http_handler.py`
+- **Admin UI**: `gateway_admin.py` + `gateway_http_handler.py`
+- **9-Tab Config Center**: `gateway_web_config.py` + `gateway_admin_api.py`
 - **配置文件**: `gateway_config.py`
 - 支持配置上游能力、模型参数、工具权限等
 
@@ -126,6 +127,7 @@ src/
 │   ├── OpenAI Chat ↔ OpenAI Responses
 │   └── 工具格式互转
 ├── gateway_proxy.py           # 上游 HTTP 客户端
+├── gateway_upstream_pool.py   # 生产多上游选择、熔断、恢复和故障转移
 ├── gateway_context.py         # 上下文压缩/记忆 ⭐
 │   ├── Token 估算
 │   ├── 消息压缩/摘要
@@ -153,21 +155,24 @@ src/
 │   ├── 问题分析 (复杂度/领域/工具需求)
 │   ├── 反思机制 (反思提示生成)
 │   └── 质量评估 (完整性/相关性/清晰度)
+├── gateway_llm.py             # 可插拔 Intelligence LLM provider registry
 ├── gateway_stats.py           # Q&A 统计 ⭐
 │   ├── 请求/工具/缓存/质量统计
 │   ├── SQLite 持久化
 │   └── 仪表板/趋势/导出
-├── gateway_concurrency.py     # 多上游实验模块（当前未接入 HTTP 请求路径）
+├── gateway_concurrency.py     # 兼容并发/连接池库；生产 profile 路由使用 gateway_upstream_pool
 │   ├── ConnectionPool (连接池)
 │   ├── LoadBalancer (负载均衡)
 │   └── MultiUpstreamManager (多上游管理)
-├── gateway_web2api.py         # Web → API 独立引擎（当前未接入 HTTP 请求路径）
+├── gateway_web2api.py         # 认证、限流和 SSRF 约束下的 Web → API 引擎
 │   ├── CSS 选择器提取
 │   ├── 正则提取
 │   └── 自动元数据提取
 ├── gateway_web_config.py      # Web 配置 UI
 │   ├── Tab 式配置界面 (9 个标签页)
 │   └── 配置 Schema + 更新 API
+├── gateway_admin_api.py       # Config/stats/cache/upstream/intelligence Admin API
+├── gateway_assistants.py      # Assistants/Threads/messages/runs/steps SQLite 生命周期
 └── gateway_claude_compat.py   # Claude Code 兼容层
     ├── 工具定义 (Read/Write/Edit/Bash/Glob/Grep/WebFetch/WebSearch)
     └── 格式化工具 (tool_result/tool_use)
@@ -198,7 +203,7 @@ src/
         │
         ▼
 ┌───────────────────┐
-│ gateway_proxy     │  ← 向上游发起请求（含重试）
+│ gateway_proxy     │  ← 向上游发起请求（含重试、profile pool 和安全故障转移）
 └───────────────────┘
         │
    ┌────┴────┐

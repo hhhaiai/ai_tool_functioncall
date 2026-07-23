@@ -217,6 +217,26 @@ def run_gateway_maintenance(config: Json, *, now: float | None = None) -> Json:
     )
     success = success and ok
 
+    assistants_config = config.get("assistants")
+    if isinstance(assistants_config, dict):
+        from .gateway_assistants import get_assistant_store
+
+        components["assistants"], ok = _run_component(
+            "assistants",
+            lambda: get_assistant_store().cleanup(
+                retention_days=int(assistants_config.get("retention_days") or 30),
+                max_rows=int(assistants_config.get("max_rows") or 50_000),
+                batch_size=batch_size,
+                max_batches=max_batches,
+                incremental_vacuum_pages=vacuum_pages,
+                dry_run=dry_run,
+                now=now,
+            ),
+        )
+        success = success and ok
+    else:
+        components["assistants"] = {"ok": True, "enabled": False}
+
     from .gateway_stats import cleanup_old_stats
     components["stats"], ok = _run_component(
         "stats",

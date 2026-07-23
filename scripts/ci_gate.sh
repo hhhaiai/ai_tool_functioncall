@@ -30,10 +30,14 @@ python3 -m mypy \
   src/gateway_admin_connector_mutations.py \
   src/gateway_admin_security.py \
   src/gateway_admin_operations.py \
+  src/gateway_admin_api.py \
+  src/gateway_assistants.py \
   src/gateway_http_auth.py \
   src/gateway_http_io.py \
+  src/gateway_llm.py \
   src/gateway_request_admission.py \
-  src/gateway_observability.py
+  src/gateway_observability.py \
+  src/gateway_upstream_pool.py
 python3 -m bandit -q -lll \
   src/gateway_sqlite.py \
   src/gateway_sqlite_compact.py \
@@ -44,11 +48,15 @@ python3 -m bandit -q -lll \
   src/gateway_admin_config_mutations.py \
   src/gateway_admin_connector_mutations.py \
   src/gateway_admin_security.py \
+  src/gateway_admin_api.py \
+  src/gateway_assistants.py \
   src/gateway_http_auth.py \
   src/gateway_http_io.py \
   src/gateway_http_security.py \
+  src/gateway_llm.py \
   src/gateway_sandbox.py \
-  src/gateway_sandbox_worker.py
+  src/gateway_sandbox_worker.py \
+  src/gateway_upstream_pool.py
 python3 -m pip check
 python3 -m pip_audit -r requirements.txt
 

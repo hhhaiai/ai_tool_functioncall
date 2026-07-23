@@ -690,6 +690,34 @@ def delete_tool_cache_scope(workspace_key: str, runtime_key: str) -> int:
         return 0
 
 
+def clear_persistent_caches(*, strict: bool = False) -> dict[str, int]:
+    """Atomically clear all persisted semantic and tool cache rows."""
+    try:
+        with _db_lock:
+            conn = _get_db()
+            semantic = int(conn.execute("SELECT COUNT(*) FROM semantic_cache").fetchone()[0])
+            tools = int(conn.execute("SELECT COUNT(*) FROM tool_cache").fetchone()[0])
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute("DELETE FROM semantic_cache")
+                conn.execute("DELETE FROM tool_cache")
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            return {"semantic": semantic, "tools": tools}
+    except RuntimeError as exc:
+        if "Database not initialized" in str(exc):
+            return {"semantic": 0, "tools": 0}
+        if strict:
+            raise
+        _logger.error("Failed to clear persistent caches: %s", exc)
+        return {"semantic": 0, "tools": 0}
+    except Exception as exc:
+        if strict:
+            raise
+        _logger.error("Failed to clear persistent caches: %s", exc)
+        return {"semantic": 0, "tools": 0}
 # ---------------------------------------------------------------------------
 # Memory System Persistence
 # ---------------------------------------------------------------------------
@@ -953,6 +981,7 @@ __all__ = [
     "save_tool_cache_entry",
     "load_tool_cache_entry",
     "delete_tool_cache_scope",
+    "clear_persistent_caches",
     "cleanup_expired_tool_cache",
     "save_memory",
     "load_memories",

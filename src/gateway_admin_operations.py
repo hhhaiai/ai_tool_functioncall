@@ -7,6 +7,8 @@ from typing import Any, Callable
 Json = dict[str, Any]
 
 _OPERATIONS_PATHS = {
+    "/api/intelligence/status",
+    "/api/upstreams/status",
     "/admin/metrics",
     "/admin/stats.json",
     "/admin/storage.json",
@@ -101,6 +103,16 @@ def handle_admin_operations_get(
     if path == "/admin/stats.json":
         from .gateway_logging import _stats_snapshot
         json_response(handler, 200, {"stats": _stats_snapshot()})
+        return True
+    if path == "/api/upstreams/status":
+        from .gateway_upstream_pool import upstream_pool_snapshot
+
+        json_response(handler, 200, {"upstream_pool": upstream_pool_snapshot()})
+        return True
+    if path == "/api/intelligence/status":
+        from .gateway_llm import provider_status
+
+        json_response(handler, 200, {"intelligence": provider_status()})
         return True
     if path == "/admin/storage.json":
         from .gateway_config import load_config

@@ -108,8 +108,12 @@ def run_smoke() -> dict[str, Any]:
     old_cwd = os.getcwd()
     old_ws = os.environ.get("GATEWAY_WORKSPACE_ROOT")
     old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
-    with tempfile.TemporaryDirectory(prefix="agent-planner-smoke-") as td:
+    with (
+        tempfile.TemporaryDirectory(prefix="agent-planner-smoke-") as td,
+        tempfile.TemporaryDirectory(prefix="agent-planner-runtime-") as runtime_td,
+    ):
         root = pathlib.Path(td)
+        runtime_root = pathlib.Path(runtime_td)
         (root / "src").mkdir()
         (root / "tests").mkdir()
         (root / "src" / "app.py").write_text("def ok():\n    return False\n", encoding="utf-8")
@@ -119,7 +123,7 @@ def run_smoke() -> dict[str, Any]:
         )
         (root / "src" / "__init__.py").write_text("", encoding="utf-8")
 
-        gateway.CONFIG_PATH = root / "gateway.config.json"
+        gateway.CONFIG_PATH = runtime_root / "gateway.config.json"
         cfg = gateway._default_config()
         cfg["gateway"]["workspace_root"] = str(root)
         cfg["gateway"]["tool_mode"] = "orchestrate"
@@ -132,7 +136,10 @@ def run_smoke() -> dict[str, Any]:
         gateway.save_config(cfg)
         os.chdir(root)
         os.environ["GATEWAY_WORKSPACE_ROOT"] = str(root)
-        os.environ["GATEWAY_RUNTIME_DIR"] = str(root / ".gateway_runtime")
+        # Gateway-owned state must never live under the downstream workspace.
+        # The sandbox intentionally denies access to runtime state; nesting it
+        # here would also make pytest collect the protected directory.
+        os.environ["GATEWAY_RUNTIME_DIR"] = str(runtime_root / "runtime")
         import src.gateway_agent_planner as planner
         planner._STORE = None
 

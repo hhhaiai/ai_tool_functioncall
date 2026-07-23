@@ -5,8 +5,19 @@ import os
 import pathlib
 import sqlite3
 import stat
+import threading
 import time
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Iterator
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None  # type: ignore
+
+
+_INITIALIZATION_LOCKS_GUARD = threading.Lock()
+_INITIALIZATION_LOCKS: dict[str, threading.RLock] = {}
 
 
 class SQLiteSecurityError(OSError):
@@ -126,6 +137,53 @@ def secure_sqlite_connect(
         raise
 
 
+@contextmanager
+def sqlite_initialization_lock(path: pathlib.Path | str) -> Iterator[None]:
+    """Serialize first-open schema and WAL setup within and across processes."""
+    database = pathlib.Path(path).expanduser().absolute()
+    try:
+        database.parent.mkdir(parents=True, exist_ok=True)
+        parent_metadata = database.parent.lstat()
+        if stat.S_ISLNK(parent_metadata.st_mode) or not stat.S_ISDIR(parent_metadata.st_mode):
+            raise SQLiteSecurityError(f"SQLite initialization parent is not a real directory: {database.parent}")
+    except SQLiteSecurityError:
+        raise
+    except OSError as exc:
+        raise SQLiteSecurityError(f"Cannot prepare SQLite initialization parent {database.parent}: {exc}") from exc
+    key = str(database)
+    with _INITIALIZATION_LOCKS_GUARD:
+        thread_lock = _INITIALIZATION_LOCKS.setdefault(key, threading.RLock())
+    lock_fd = -1
+    with thread_lock:
+        lock_path = database.parent / f".{database.name}.initialize.lock"
+        flags = os.O_CREAT | os.O_RDWR
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            lock_fd = os.open(lock_path, flags, 0o600)
+            metadata = os.fstat(lock_fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise SQLiteSecurityError(f"SQLite initialization lock is not a regular file: {lock_path}")
+            os.fchmod(lock_fd, 0o600)
+            if fcntl is not None:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield
+        except SQLiteSecurityError:
+            raise
+        except OSError as exc:
+            raise SQLiteSecurityError(f"Cannot lock SQLite initialization for {database}: {exc}") from exc
+        finally:
+            if lock_fd >= 0:
+                if fcntl is not None:
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+                os.close(lock_fd)
+
+
 def set_secure_sqlite_journal_mode(
     connection: sqlite3.Connection,
     path: pathlib.Path | str,
@@ -143,6 +201,11 @@ def set_secure_sqlite_journal_mode(
     while True:
         attempt += 1
         try:
+            current_row = connection.execute("PRAGMA journal_mode").fetchone()
+            current = str(current_row[0] if current_row else "").upper()
+            if current == normalized:
+                secure_sqlite_artifacts(path)
+                return current
             row = connection.execute(f"PRAGMA journal_mode={normalized}").fetchone()
             active = str(row[0] if row else "").upper()
             if active != normalized:
@@ -166,4 +229,5 @@ __all__ = [
     "secure_sqlite_artifacts",
     "secure_sqlite_connect",
     "set_secure_sqlite_journal_mode",
+    "sqlite_initialization_lock",
 ]

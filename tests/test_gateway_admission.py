@@ -135,6 +135,7 @@ def test_admission_storage_is_private_and_contains_no_request_identity(
     raw = b"".join(item.read_bytes() for item in runtime.glob("admission.db*"))
     assert b"client" not in raw
     with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
         row = connection.execute(
             "SELECT lease_id, owner_pid, owner_instance, limit_value FROM admission_leases"
         ).fetchone()

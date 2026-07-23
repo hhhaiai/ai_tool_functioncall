@@ -37,6 +37,7 @@ SUPPORTED_PATHS = {
 MODEL_LIST_PATHS = {"/v1/models"}
 TOKEN_COUNT_PATHS = {"/v1/messages/count_tokens", "/v1/chat/completions/count_tokens"}
 DIRECT_TOOL_CALL_PATHS = {"/v1/tools/call", "/v1/functions/call", "/tools/call"}
+WEB2API_PATHS = {"/v1/web2api", "/api/web2api"}
 ANTHROPIC_COMPAT_PREFIX = "/anthropic"
 
 
@@ -51,7 +52,7 @@ def _normalize_request_path(path: str) -> str:
 
 
 def _supported_public_paths() -> set[str]:
-    canonical = SUPPORTED_PATHS | DIRECT_TOOL_CALL_PATHS | MODEL_LIST_PATHS | TOKEN_COUNT_PATHS
+    canonical = SUPPORTED_PATHS | DIRECT_TOOL_CALL_PATHS | MODEL_LIST_PATHS | TOKEN_COUNT_PATHS | WEB2API_PATHS
     anthropic_aliases = {f"{ANTHROPIC_COMPAT_PREFIX}{path}" for path in canonical if path.startswith("/v1/")}
     return canonical | anthropic_aliases
 
@@ -352,6 +353,14 @@ def _default_config() -> Json:
                 str(pathlib.Path(os.environ.get("GATEWAY_RUNTIME_DIR", ".gateway_runtime")) / "gateway.db"),
             ),
         },
+        "assistants": {
+            "db_path": os.environ.get(
+                "GATEWAY_ASSISTANTS_DB_PATH",
+                str(pathlib.Path(os.environ.get("GATEWAY_RUNTIME_DIR", ".gateway_runtime")) / "assistants.sqlite3"),
+            ),
+            "retention_days": _env_int("GATEWAY_ASSISTANTS_RETENTION_DAYS", 30),
+            "max_rows": _env_int("GATEWAY_ASSISTANTS_MAX_ROWS", 50000),
+        },
         "downstream_keys": downstream_keys,
         "mcp": {
             "servers": [],
@@ -381,6 +390,13 @@ def _default_config() -> Json:
             "max_reflection_tokens": _env_int("GATEWAY_INTELLIGENCE_MAX_REFLECTION_TOKENS", 500),
             "max_decomposition_parts": _env_int("GATEWAY_INTELLIGENCE_MAX_DECOMPOSITION_PARTS", 5),
             "quality_threshold": _env_float("GATEWAY_INTELLIGENCE_QUALITY_THRESHOLD", 0.6),
+            "use_llm": _env_bool("GATEWAY_INTELLIGENCE_USE_LLM", False),
+            "provider": os.environ.get("GATEWAY_INTELLIGENCE_PROVIDER", "gateway_upstream"),
+            "model": os.environ.get("GATEWAY_INTELLIGENCE_MODEL", ""),
+            "llm_timeout": _env_float("GATEWAY_INTELLIGENCE_LLM_TIMEOUT", 15.0),
+            "max_input_chars": _env_int("GATEWAY_INTELLIGENCE_MAX_INPUT_CHARS", 20000),
+            "temperature": _env_float("GATEWAY_INTELLIGENCE_TEMPERATURE", 0.0),
+            "strict_mode": _env_bool("GATEWAY_INTELLIGENCE_STRICT_MODE", False),
         },
         "concurrency": {
             "enabled": _env_bool("GATEWAY_CONCURRENCY_ENABLED", True),
@@ -389,6 +405,10 @@ def _default_config() -> Json:
             "retry_count": _env_int("GATEWAY_CONCURRENCY_RETRY_COUNT", 2),
             "retry_delay": _env_float("GATEWAY_CONCURRENCY_RETRY_DELAY", 1.0),
             "load_balance_strategy": os.environ.get("GATEWAY_CONCURRENCY_STRATEGY", "round_robin"),
+            "multi_upstream_enabled": _env_bool("GATEWAY_MULTI_UPSTREAM_ENABLED", False),
+            "multi_upstream_max_attempts": _env_int("GATEWAY_MULTI_UPSTREAM_MAX_ATTEMPTS", 0),
+            "multi_upstream_failure_threshold": _env_int("GATEWAY_MULTI_UPSTREAM_FAILURE_THRESHOLD", 3),
+            "multi_upstream_recovery_seconds": _env_float("GATEWAY_MULTI_UPSTREAM_RECOVERY_SECONDS", 30.0),
         },
         "stats": {
             "enabled": _env_bool("GATEWAY_STATS_ENABLED", True),
@@ -425,6 +445,12 @@ def _default_config() -> Json:
             "max_concurrent": _env_int("GATEWAY_WEB2API_MAX_CONCURRENT", 5),
             "cache_ttl_seconds": _env_int("GATEWAY_WEB2API_CACHE_TTL", 300),
             "request_timeout": _env_int("GATEWAY_WEB2API_TIMEOUT", 30),
+            "max_content_bytes": _env_int("GATEWAY_WEB2API_MAX_CONTENT_BYTES", 5 * 1024 * 1024),
+            "max_cache_entries": _env_int("GATEWAY_WEB2API_MAX_CACHE_ENTRIES", 256),
+            "user_agent": os.environ.get("GATEWAY_WEB2API_USER_AGENT", "Gateway-Web2API/1.0"),
+            "allow_private_network": _env_bool("GATEWAY_WEB2API_ALLOW_PRIVATE_NETWORK", False),
+            "allow_regex": _env_bool("GATEWAY_WEB2API_ALLOW_REGEX", False),
+            "allow_raw_html": _env_bool("GATEWAY_WEB2API_ALLOW_RAW_HTML", False),
         },
     }
     _ensure_client_snippet_downstream_key(cfg)

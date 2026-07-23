@@ -4576,13 +4576,13 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
         return direct_response
     upstream = client or NativeProxyClient()
     from .gateway_config import _upstream_protocol
-    upstream_protocol = _upstream_protocol()
+    upstream_protocol = str(getattr(upstream, "protocol", "") or _upstream_protocol())
 
     # Convert request to upstream protocol format
     upstream_path, converted_body = _convert_request_to_upstream(path, memory_body, upstream_protocol)
 
     # Override model with configured upstream model
-    upstream_model = _config_env("UPSTREAM_MODEL", "") or _upstream_config().get("model", "")
+    upstream_model = _config_env("UPSTREAM_MODEL", "") or str(getattr(upstream, "model", "") or _upstream_config().get("model", ""))
     if upstream_model and "model" in converted_body:
         converted_body["model"] = upstream_model
 
@@ -4652,6 +4652,8 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
                     request_body["messages"] = msgs
             _logger.debug("Intelligence: %s", get_intelligence_summary(intel_result))
     except Exception as exc:
+        if "intel_cfg" in locals() and getattr(intel_cfg, "strict_mode", False):
+            raise
         _logger.debug("Intelligence enhancement skipped: %s", exc)
 
     # Keep Gateway planner/runtime metadata for response attachment and local

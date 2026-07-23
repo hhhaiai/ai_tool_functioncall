@@ -19,6 +19,7 @@ path_is_within = _gateway_sqlite.path_is_within
 secure_sqlite_artifacts = _gateway_sqlite.secure_sqlite_artifacts
 secure_sqlite_connect = _gateway_sqlite.secure_sqlite_connect
 set_secure_sqlite_journal_mode = _gateway_sqlite.set_secure_sqlite_journal_mode
+sqlite_initialization_lock = _gateway_sqlite.sqlite_initialization_lock
 
 Json = dict[str, Any]
 _PROCESS_INSTANCE = uuid.uuid4().hex
@@ -68,46 +69,50 @@ class SQLiteAdmissionBackend:
         with self._init_lock:
             if self._initialized:
                 return
-            deadline = time.monotonic() + max(2.0, self.busy_timeout_ms / 1000.0 + 1.0)
-            attempt = 0
-            while True:
-                attempt += 1
-                connection: sqlite3.Connection | None = None
-                try:
-                    connection = self._connect()
-                    connection.execute("PRAGMA auto_vacuum=INCREMENTAL")
-                    set_secure_sqlite_journal_mode(connection, self.path, "WAL")
-                    connection.execute("PRAGMA synchronous=NORMAL")
-                    connection.executescript(
-                        """
-                        CREATE TABLE IF NOT EXISTS admission_leases (
-                            lease_id TEXT PRIMARY KEY,
-                            owner_pid INTEGER NOT NULL,
-                            owner_instance TEXT NOT NULL,
-                            limit_value INTEGER NOT NULL,
-                            acquired_at REAL NOT NULL,
-                            heartbeat_at REAL NOT NULL,
-                            expires_at REAL NOT NULL
-                        );
-                        CREATE INDEX IF NOT EXISTS idx_admission_expires
-                            ON admission_leases(expires_at);
-                        CREATE TABLE IF NOT EXISTS admission_meta (
-                            key TEXT PRIMARY KEY,
-                            value INTEGER NOT NULL
-                        );
-                        INSERT OR IGNORE INTO admission_meta(key, value) VALUES ('rejections', 0);
-                        INSERT OR IGNORE INTO admission_meta(key, value) VALUES ('expired_reaped', 0);
-                        """
-                    )
-                    self._initialized = True
-                    return
-                except sqlite3.OperationalError as exc:
-                    if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
-                        raise
-                    time.sleep(min(0.25, 0.01 * (2 ** min(attempt - 1, 5))))
-                finally:
-                    if connection is not None:
-                        connection.close()
+            with sqlite_initialization_lock(self.path):
+                deadline = time.monotonic() + max(2.0, self.busy_timeout_ms / 1000.0 + 1.0)
+                attempt = 0
+                while True:
+                    attempt += 1
+                    connection: sqlite3.Connection | None = None
+                    try:
+                        connection = self._connect()
+                        connection.execute("PRAGMA auto_vacuum=INCREMENTAL")
+                        # Admission is also an all-writer coordination database
+                        # whose lease transactions use BEGIN IMMEDIATE. Avoid a
+                        # cross-process WAL SHM mapping for this narrow state.
+                        set_secure_sqlite_journal_mode(connection, self.path, "DELETE")
+                        connection.execute("PRAGMA synchronous=NORMAL")
+                        connection.executescript(
+                            """
+                            CREATE TABLE IF NOT EXISTS admission_leases (
+                                lease_id TEXT PRIMARY KEY,
+                                owner_pid INTEGER NOT NULL,
+                                owner_instance TEXT NOT NULL,
+                                limit_value INTEGER NOT NULL,
+                                acquired_at REAL NOT NULL,
+                                heartbeat_at REAL NOT NULL,
+                                expires_at REAL NOT NULL
+                            );
+                            CREATE INDEX IF NOT EXISTS idx_admission_expires
+                                ON admission_leases(expires_at);
+                            CREATE TABLE IF NOT EXISTS admission_meta (
+                                key TEXT PRIMARY KEY,
+                                value INTEGER NOT NULL
+                            );
+                            INSERT OR IGNORE INTO admission_meta(key, value) VALUES ('rejections', 0);
+                            INSERT OR IGNORE INTO admission_meta(key, value) VALUES ('expired_reaped', 0);
+                            """
+                        )
+                        self._initialized = True
+                        return
+                    except sqlite3.OperationalError as exc:
+                        if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+                            raise
+                        time.sleep(min(0.25, 0.01 * (2 ** min(attempt - 1, 5))))
+                    finally:
+                        if connection is not None:
+                            connection.close()
 
     def try_acquire(
         self,

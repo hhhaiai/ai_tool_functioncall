@@ -20,7 +20,7 @@ from typing import Any
 
 Json = dict[str, Any]
 
-from .gateway_config import SUPPORTED_PATHS, MODEL_LIST_PATHS, TOKEN_COUNT_PATHS, DIRECT_TOOL_CALL_PATHS, _gateway_config, _normalize_request_path, _supported_public_paths, _upstream_config
+from .gateway_config import SUPPORTED_PATHS, MODEL_LIST_PATHS, TOKEN_COUNT_PATHS, DIRECT_TOOL_CALL_PATHS, WEB2API_PATHS, _gateway_config, _normalize_request_path, _supported_public_paths, _upstream_config
 from .gateway_admin_security import (
     _request_origin,
     _url_origin,
@@ -57,7 +57,7 @@ from .gateway_http_io import (
 from .gateway_http_security import send_cors_headers
 
 
-ADMIN_UI_PATHS = {"/ui", "/admin", "/config", "/admin/config-ui"}
+ADMIN_UI_PATHS = {"/ui", "/ui/config", "/admin", "/config", "/admin/config-ui"}
 _READINESS = threading.Event()
 
 
@@ -107,16 +107,28 @@ def _capability_contract() -> Json:
     from .gateway_rate_limit import RATE_LIMIT_SERVICE
     from .gateway_http_security import cors_allowed_origins
     from .gateway_sandbox import sandbox_capabilities
+    from .gateway_llm import provider_status
+    from .gateway_upstream_pool import upstream_pool_snapshot
     cfg = _gateway_config()
     rate_snapshot = RATE_LIMIT_SERVICE.describe(cfg)
     admission_snapshot = ADMISSION_SERVICE.describe(cfg)
+    upstream_pool = upstream_pool_snapshot()
+    intelligence = provider_status()
     return {
         "api": {
             "chat_completions": "orchestrated",
             "responses": "orchestrated",
             "messages": "orchestrated",
-            "assistants": "minimal_create_compatibility_only",
-            "threads": "minimal_create_compatibility_only",
+            "assistants": "persistent_gateway_owned_lifecycle",
+            "threads": "persistent_gateway_owned_lifecycle",
+            "assistant_resources": {
+                "persistence": "private_sqlite",
+                "messages": True,
+                "runs": True,
+                "run_steps": True,
+                "tool_output_resume": True,
+                "tenant_isolation": "authenticated_downstream_client",
+            },
         },
         "request_path": {
             "authenticated_client_rate_limit": True,
@@ -132,9 +144,11 @@ def _capability_contract() -> Json:
                 "degraded": bool(admission_snapshot.get("degraded")),
             },
             "semantic_cache": "non_streaming_non_tool_exact_request_fingerprint",
-            "gateway_concurrency_module": "not_integrated_with_http_request_path",
-            "web2api_module": "not_integrated_with_http_request_path",
+            "gateway_concurrency_module": "integrated_profile_pool",
+            "upstream_pool": upstream_pool,
+            "web2api_module": "authenticated_bounded_http_request_path",
             "gateway_stats_module": "auxiliary; primary HTTP counters use gateway_logging",
+            "intelligence": intelligence,
         },
         "security": {
             "cors_enabled": bool(cfg.get("cors_enabled", False)),
@@ -144,7 +158,16 @@ def _capability_contract() -> Json:
             "execution_isolation": sandbox_capabilities(),
         },
         "operations": {
+            "config_ui": "/ui/config",
+            "config_api": "/api/config",
+            "config_schema": "/api/config/schema",
+            "config_update": "/api/config/update",
+            "stats_dashboard": "/api/stats/dashboard",
+            "cache_status": "/api/cache/stats",
+            "cache_clear": "/api/cache/clear",
             "persistent_storage_preflight": "/admin/storage.json",
+            "upstream_pool_status": "/api/upstreams/status",
+            "intelligence_status": "/api/intelligence/status",
             "legacy_sqlite_compaction": "offline_cli_only",
             "online_destructive_vacuum": False,
         },
@@ -219,6 +242,7 @@ def _agent_runtime_scope_contract() -> Json:
         set(MODEL_LIST_PATHS)
         | set(TOKEN_COUNT_PATHS)
         | set(DIRECT_TOOL_CALL_PATHS)
+        | set(WEB2API_PATHS)
         | {"/tools/call", "/v1/assistants", "/v1/threads"}
     )
     conversation_paths = sorted(
@@ -238,6 +262,14 @@ def _agent_runtime_scope_contract() -> Json:
             "/healthz",
             "/client-config",
             "/client-config.json",
+            "/api/config",
+            "/api/config/schema",
+            "/api/config/update",
+            "/api/stats/dashboard",
+            "/api/cache/stats",
+            "/api/cache/clear",
+            "/api/intelligence/status",
+            "/api/upstreams/status",
             "/admin/config.json",
             "/admin/stats.json",
             "/admin/requests.json",
@@ -603,6 +635,119 @@ def _read_json(handler: BaseHTTPRequestHandler) -> Json:
     return _decode_json_object(_read_limited_body(handler))
 
 
+def _serve_assistants_api(handler: BaseHTTPRequestHandler, method: str, path: str) -> bool:
+    """Serve one dynamic Gateway-owned Assistants/Threads resource request."""
+    from .gateway_assistants import handle_assistants_request, is_assistants_api_path
+
+    if not is_assistants_api_path(path):
+        return False
+    downstream_key: str | None = None
+    request_body: Json = {}
+    try:
+        downstream_key = _check_downstream_key(handler)
+        _enforce_request_rate_limit(handler, downstream_key)
+        from .gateway_tool_runtime import _request_slot_scope, record_gateway_public_endpoint, run_tool_orchestration
+
+        with _request_slot_scope():
+            if method.upper() == "POST":
+                request_body = _read_json(handler)
+            parsed = urllib.parse.urlparse(handler.path)
+            query = urllib.parse.parse_qs(parsed.query)
+
+            def execute_run(run_request: Json) -> Json:
+                return run_tool_orchestration(
+                    "/v1/chat/completions",
+                    run_request,
+                    client_id=downstream_key,
+                )
+
+            result = handle_assistants_request(
+                method,
+                path,
+                request_body,
+                query=query,
+                client_id=downstream_key,
+                executor=execute_run,
+            )
+            record_gateway_public_endpoint(
+                path,
+                request_body,
+                resource=result.resource,
+                action=result.action,
+                response=result.payload,
+                client_id=downstream_key,
+            )
+            from .gateway_logging import _record_request_stat, _write_request_log
+
+            _record_request_stat(path, result.status)
+            _write_request_log(path, request_body, result.status, result.payload, downstream_key)
+            _json_response(handler, result.status, result.payload)
+    except Exception as exc:
+        try:
+            from .gateway_tool_runtime import record_gateway_public_endpoint
+
+            record_gateway_public_endpoint(
+                path,
+                request_body,
+                resource="assistants_api",
+                action=method.lower(),
+                success=False,
+                failure_type=type(exc).__name__,
+                client_id=downstream_key,
+            )
+        except Exception:
+            pass
+        _handle_error(handler, path, exc)
+    return True
+
+
+def _serve_web2api(handler: BaseHTTPRequestHandler, path: str) -> bool:
+    if path not in WEB2API_PATHS:
+        return False
+    downstream_key: str | None = None
+    body: Json = {}
+    try:
+        downstream_key = _check_downstream_key(handler)
+        _enforce_request_rate_limit(handler, downstream_key)
+        from .gateway_tool_runtime import _request_slot_scope, record_gateway_public_endpoint
+
+        with _request_slot_scope():
+            body = _read_json(handler)
+            from .gateway_web2api import execute_web2api_request
+
+            response = execute_web2api_request(body)
+            record_gateway_public_endpoint(
+                path,
+                body,
+                resource="web2api",
+                action="extract",
+                response=response,
+                client_id=downstream_key,
+            )
+            from .gateway_logging import _record_request_stat, _write_request_log
+
+            _record_request_stat(path, 200)
+            _write_request_log(path, body, 200, response, downstream_key)
+            _json_response(handler, 200, response)
+    except Exception as exc:
+        try:
+            from .gateway_tool_runtime import record_gateway_public_endpoint
+
+            record_gateway_public_endpoint(
+                path,
+                body,
+                resource="web2api",
+                action="extract",
+                success=False,
+                failure_type=type(exc).__name__,
+                client_id=downstream_key,
+            )
+        except Exception:
+            pass
+        _handle_error(handler, path, exc)
+    return True
+
+
 def _check_admin(handler: BaseHTTPRequestHandler) -> bool:
     return _check_admin_io(handler, handle_error=_handle_error)
 
@@ -819,6 +964,17 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         if path == "/capabilities":
             _json_response(self, 200, _capability_contract())
+            return
+        if _serve_assistants_api(self, "GET", path):
+            return
+        from .gateway_admin_api import handle_admin_api_get
+        if handle_admin_api_get(
+            self,
+            path,
+            check_admin=_check_admin,
+            json_response=_json_response,
+            text_response=_text_response,
+        ):
             return
         from .gateway_admin_operations import handle_admin_operations_get
         if handle_admin_operations_get(
@@ -1286,6 +1442,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         try:
             path = _normalize_request_path(self.path.split("?", 1)[0])
+            from .gateway_admin_api import handle_admin_api_post
+            if handle_admin_api_post(
+                self,
+                path,
+                check_admin_write=_check_admin_write,
+                read_json=_read_json,
+                json_response=_json_response,
+            ):
+                return
             if path == "/admin/upstream-models.json":
                 if not _check_admin(self):
                     return
@@ -1350,6 +1515,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     return
                 _redirect(self, "/ui")
                 return
+            if _serve_assistants_api(self, "POST", path):
+                return
+            if _serve_web2api(self, path):
+                return
             if path in SUPPORTED_PATHS or path in TOKEN_COUNT_PATHS or path in DIRECT_TOOL_CALL_PATHS:
                 downstream_key = _check_downstream_key(self)
                 _enforce_request_rate_limit(self, downstream_key)
@@ -1372,23 +1541,6 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         _record_request_stat(path, 200)
                         _write_request_log(path, body, 200, response, downstream_key)
                         _json_response(self, 200, response)
-                        return
-                    from .gateway_assistants import handle_assistants_or_threads
-                    gateway_owned_response = handle_assistants_or_threads(path, body)
-                    if gateway_owned_response is not None:
-                        from .gateway_tool_runtime import record_gateway_public_endpoint
-                        record_gateway_public_endpoint(
-                            path,
-                            body,
-                            resource="assistants" if path == "/v1/assistants" else "threads",
-                            action="create",
-                            response=gateway_owned_response,
-                            client_id=downstream_key,
-                        )
-                        from .gateway_logging import _record_request_stat, _write_request_log
-                        _record_request_stat(path, 200)
-                        _write_request_log(path, body, 200, gateway_owned_response, downstream_key)
-                        _json_response(self, 200, gateway_owned_response)
                         return
                     stream = body.get("stream", False)
                     if stream:
@@ -1470,6 +1622,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     _redirect(self, result.redirect)
                 else:
                     _json_response(self, result.status, result.payload)
+                return
+            _json_response(self, 404, _error_payload("not found"))
+        except Exception as exc:
+            _handle_error(self, _normalize_request_path(self.path.split("?", 1)[0]), exc)
+
+    def do_DELETE(self) -> None:
+        try:
+            path = _normalize_request_path(self.path.split("?", 1)[0])
+            if _serve_assistants_api(self, "DELETE", path):
                 return
             _json_response(self, 404, _error_payload("not found"))
         except Exception as exc:

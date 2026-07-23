@@ -18,9 +18,9 @@ from dataclasses import dataclass
 from typing import Any
 
 try:
-    from .gateway_sqlite import path_is_within, secure_sqlite_artifacts, secure_sqlite_connect, set_secure_sqlite_journal_mode
+    from .gateway_sqlite import path_is_within, secure_sqlite_artifacts, secure_sqlite_connect, set_secure_sqlite_journal_mode, sqlite_initialization_lock
 except ImportError:  # pragma: no cover - legacy top-level import mode
-    from gateway_sqlite import path_is_within, secure_sqlite_artifacts, secure_sqlite_connect, set_secure_sqlite_journal_mode
+    from gateway_sqlite import path_is_within, secure_sqlite_artifacts, secure_sqlite_connect, set_secure_sqlite_journal_mode, sqlite_initialization_lock
 
 
 Json = dict[str, Any]
@@ -115,49 +115,53 @@ class SQLiteRateLimiter:
         with self._init_lock:
             if self._initialized:
                 return
-            deadline = time.monotonic() + max(2.0, self.busy_timeout_ms / 1000.0 + 1.0)
-            attempt = 0
-            while True:
-                attempt += 1
-                conn = None
-                try:
-                    conn = self._connect()
-                    conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
-                    set_secure_sqlite_journal_mode(conn, self.path, "WAL")
-                    conn.execute("PRAGMA synchronous=NORMAL")
-                    conn.execute(
-                        """
-                        CREATE TABLE IF NOT EXISTS rate_limit_buckets (
-                            identity_hash TEXT PRIMARY KEY,
-                            tokens REAL NOT NULL,
-                            updated_at REAL NOT NULL,
-                            last_seen REAL NOT NULL,
-                            rejected_count INTEGER NOT NULL DEFAULT 0
+            with sqlite_initialization_lock(self.path):
+                deadline = time.monotonic() + max(2.0, self.busy_timeout_ms / 1000.0 + 1.0)
+                attempt = 0
+                while True:
+                    attempt += 1
+                    conn = None
+                    try:
+                        conn = self._connect()
+                        conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+                        # This is an all-writer coordination database: every
+                        # token update is already serialized by BEGIN IMMEDIATE.
+                        # DELETE mode avoids a fragile cross-process WAL SHM map.
+                        set_secure_sqlite_journal_mode(conn, self.path, "DELETE")
+                        conn.execute("PRAGMA synchronous=NORMAL")
+                        conn.execute(
+                            """
+                            CREATE TABLE IF NOT EXISTS rate_limit_buckets (
+                                identity_hash TEXT PRIMARY KEY,
+                                tokens REAL NOT NULL,
+                                updated_at REAL NOT NULL,
+                                last_seen REAL NOT NULL,
+                                rejected_count INTEGER NOT NULL DEFAULT 0
+                            )
+                            """
                         )
-                        """
-                    )
-                    conn.execute(
-                        "CREATE INDEX IF NOT EXISTS idx_rate_limit_last_seen ON rate_limit_buckets(last_seen)"
-                    )
-                    conn.execute(
-                        """
-                        CREATE TABLE IF NOT EXISTS rate_limit_meta (
-                            key TEXT PRIMARY KEY,
-                            value INTEGER NOT NULL
+                        conn.execute(
+                            "CREATE INDEX IF NOT EXISTS idx_rate_limit_last_seen ON rate_limit_buckets(last_seen)"
                         )
-                        """
-                    )
-                    conn.execute(
-                        "INSERT OR IGNORE INTO rate_limit_meta(key, value) VALUES ('total_rejections', 0)"
-                    )
-                    break
-                except sqlite3.OperationalError as exc:
-                    if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
-                        raise
-                    time.sleep(min(0.25, 0.01 * (2 ** min(attempt - 1, 5))))
-                finally:
-                    if conn is not None:
-                        conn.close()
+                        conn.execute(
+                            """
+                            CREATE TABLE IF NOT EXISTS rate_limit_meta (
+                                key TEXT PRIMARY KEY,
+                                value INTEGER NOT NULL
+                            )
+                            """
+                        )
+                        conn.execute(
+                            "INSERT OR IGNORE INTO rate_limit_meta(key, value) VALUES ('total_rejections', 0)"
+                        )
+                        break
+                    except sqlite3.OperationalError as exc:
+                        if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+                            raise
+                        time.sleep(min(0.25, 0.01 * (2 ** min(attempt - 1, 5))))
+                    finally:
+                        if conn is not None:
+                            conn.close()
             self._initialized = True
 
     def consume(self, identity: str, rpm: int, *, now: float | None = None) -> RateLimitDecision:

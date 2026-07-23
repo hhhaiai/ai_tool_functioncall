@@ -25,7 +25,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import src.toolcall_gateway as gateway
-from src.gateway_config import _normalize_request_path
+from src.gateway_config import WEB2API_PATHS, _normalize_request_path
+from src.gateway_http_handler import _gateway_is_ready, _set_gateway_ready
 from src.gateway_persistence import PersistenceConfig, init_persistence
 
 Json = dict[str, Any]
@@ -34,8 +35,17 @@ Json = dict[str, Any]
 class PublicSurfaceUpstream(BaseHTTPRequestHandler):
     seen: list[Json] = []
     fail_models: bool = False
+    web2api_url: str = ""
 
     def do_GET(self):  # noqa: N802
+        if self.path == "/web2api-page":
+            raw = b"<html><head><title>Surface Web2API</title></head><body><h1>web2api ok</h1></body></html>"
+            self.send_response(200)
+            self.send_header("content-type", "text/html; charset=utf-8")
+            self.send_header("content-length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
         if self.path.endswith("/models"):
             if PublicSurfaceUpstream.fail_models:
                 self._json(503, {"error": {"message": "models temporarily unavailable"}})
@@ -134,6 +144,11 @@ def _payload_for(path: str, tenant: str, index: int, client_workspace: pathlib.P
             "function": {"name": "calculator", "arguments": json.dumps({"expression": "20+22"})},
             "call_id": session,
         }, "direct_tool"
+    if canonical in WEB2API_PATHS or path in WEB2API_PATHS:
+        return "POST", {
+            "url": PublicSurfaceUpstream.web2api_url,
+            "selectors": {"heading": "h1"},
+        }, "web2api"
     raise AssertionError(f"unhandled advertised path: {path} -> {canonical}")
 
 
@@ -141,7 +156,7 @@ def main() -> None:
     run_root = pathlib.Path(".gateway_runtime") / f"agent-planner-public-surface-{time.strftime('%Y%m%d-%H%M%S')}"
     run_root.mkdir(parents=True, exist_ok=True)
     old_config = gateway.CONFIG_PATH
-    old_ready = gateway.SQLITE_READY
+    old_ready = _gateway_is_ready()
     old_sqlite = os.environ.get("GATEWAY_SQLITE_LOG_PATH")
     old_runtime = os.environ.get("GATEWAY_RUNTIME_DIR")
     old_ws = os.environ.get("GATEWAY_WORKSPACE_ROOT")
@@ -167,9 +182,10 @@ def main() -> None:
         (client_workspace / "surface-client.txt").write_text("CLIENT_WORKSPACE_OK\n", encoding="utf-8")
         os.environ["GATEWAY_WORKSPACE_ROOT"] = str(service_workspace)
         os.environ["GATEWAY_UPSTREAM_STREAM_AGGREGATE"] = "0"
-        gateway.SQLITE_READY = False
+        _set_gateway_ready(True)
 
         upstream = ThreadingHTTPServer(("127.0.0.1", 0), PublicSurfaceUpstream)
+        PublicSurfaceUpstream.web2api_url = f"http://127.0.0.1:{upstream.server_address[1]}/web2api-page"
         upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
         upstream_thread.start()
 
@@ -183,6 +199,7 @@ def main() -> None:
         cfg["upstream"]["tools_enabled"] = "adapter"
         cfg["upstream"]["capabilities"]["supports_tools"] = False
         cfg["upstream"]["capabilities"]["supports_function_calls"] = False
+        cfg["web2api"]["allow_private_network"] = True
         gateway.save_config(cfg)
         init_persistence(PersistenceConfig(db_path=str(run_root / "gateway.db")))
 
@@ -229,6 +246,10 @@ def main() -> None:
                 _assert(payload.get("object") == "list", f"{path}: bad models payload {payload}")
             elif kind == "count_tokens":
                 _assert(isinstance(payload.get("input_tokens"), int), f"{path}: bad count_tokens payload {payload}")
+            elif kind == "web2api":
+                _assert(payload.get("object") == "gateway.web2api.result", f"{path}: bad Web2API payload {payload}")
+                extracted = payload.get("extracted") if isinstance(payload.get("extracted"), dict) else {}
+                _assert(extracted.get("heading") == "web2api ok", f"{path}: wrong Web2API extraction {payload}")
             results.append({"path": path, "canonical": canonical, "method": method, "status": status, "kind": kind})
 
         invalid_status, invalid_payload = _request_json(
@@ -383,7 +404,7 @@ def main() -> None:
         if upstream_thread is not None:
             upstream_thread.join(timeout=2)
         gateway.CONFIG_PATH = old_config
-        gateway.SQLITE_READY = old_ready
+        _set_gateway_ready(old_ready)
         if old_sqlite is None:
             os.environ.pop("GATEWAY_SQLITE_LOG_PATH", None)
         else:

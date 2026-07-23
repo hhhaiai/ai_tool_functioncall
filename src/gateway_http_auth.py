@@ -71,6 +71,10 @@ def check_admin(
 
 def downstream_route(path: str) -> str:
     """Return the stable ACL capability name for a supported HTTP route."""
+    if "/assistants" in path or "/threads" in path:
+        return "assistants"
+    if "/web2api" in path:
+        return "web2api"
     if "/chat/completions" in path:
         return "chat_completions"
     if "/responses" in path:
@@ -125,7 +129,11 @@ def check_downstream_key(handler: HTTPAuthHandler) -> str | None:
             models_compatible = route == "models" and bool(
                 protocols & {"models", "chat_completions", "responses", "messages"}
             )
-            if route not in protocols and not models_compatible:
+            assistants_compatible = route == "assistants" and bool(
+                protocols & {"assistants", "chat_completions", "responses", "messages"}
+            )
+            web2api_compatible = route == "web2api" and "direct_tools" in protocols
+            if route not in protocols and not models_compatible and not assistants_compatible and not web2api_compatible:
                 raise DownstreamAuthError(f"API key is not allowed for {route}")
         return str(entry.get("id") or entry.get("name") or "unknown")
 

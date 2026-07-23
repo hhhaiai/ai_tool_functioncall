@@ -1,15 +1,19 @@
 # Gateway 实现状态文档
 
-> 最后更新: 2026-07-17
+> 最后更新: 2026-07-24
 
-## 2026-07-17 当前能力校准
+## 2026-07-24 当前能力校准
 
 - OpenAI Chat、OpenAI Responses、Anthropic Messages 是当前完整编排路径。
-- Assistants / Threads 仅支持 Gateway-owned create 兼容响应，不包含持久化、查询、messages、runs、取消、分页或生命周期语义。
-- `gateway_web2api.py` 与 `gateway_concurrency.py` 的独立实现和测试仍保留，但当前没有接入生产 HTTP 请求路径；不得把模块存在表述为 `/api/web2api` 或多上游负载均衡已经上线。
-- 单上游连接复用、重试和资源限制由 `gateway_proxy.py` 提供；共享请求准入由 `gateway_admission.py` 提供，它们与历史 `gateway_concurrency.py` 多上游模块不是同一能力。
+- Assistants / Threads 已升级为按认证下游 client 隔离的 Gateway-owned SQLite 生命周期，支持 assistants、threads、messages、runs、run steps、cancel 和 `submit_tool_outputs`；Run 当前为同步编排，不宣称 SSE Run streaming。
+- Web2API 已接入 `/v1/web2api`、`/api/web2api`、`/anthropic/v1/web2api`，并纳入认证、ACL、限流、准入、日志、SSRF/redirect 重检和大小边界。
+- 多上游由 `gateway_upstream_pool.py` 接入 canonical proxy path，支持 round-robin、least-connections、random、熔断恢复和安全故障转移；流式开始输出后不会切换 provider。
+- `gateway_llm.py` 提供真实可插拔 intelligence provider registry；内置 `gateway_upstream` 复用 Gateway 上游凭据和 profile pool。默认 `use_llm=false`，非 strict 失败回退规则，strict 模式明确失败。
+- `/ui/config` 是 canonical 9-Tab Config Center；配置、schema、stats、cache、upstream pool 和 intelligence 状态 API 都使用 Admin Basic Auth，写操作另要求 same-origin 并使用 revision 乐观并发控制。
 - 权威机器可读状态是 `GET /capabilities`；下方较早日期的历史记录用于追溯，不覆盖当前能力声明。
-- 最新本地完整 CI：Ruff、Mypy、Bandit、依赖一致性/漏洞审计、全量 pytest（`1418 passed, 2 skipped`）、Compose 和生产 Docker build 均通过；隔离 fake/local upstream real-tool acceptance 通过。
+- 当前机器可读公开面包含 24 条路径，Gateway registry 包含 67 个唯一 built-in tools。
+- 最终 clean-env CI 已通过 Ruff、17 个模块的 Mypy、Bandit、依赖一致性/漏洞审计、`1492 passed, 2 skipped`、两套 Compose 渲染和 Docker 构建/删除。官方 `mimo_gateway.sh verify` 五阶段、Agent Planner acceptance、容器运行 smoke 和隔离 mock-upstream E2E 均通过。
+- 本地 ignored 配置的真实上游 `/v1/models` 可用，但 `/v1/chat/completions` 由提供方返回 401；直接绕过 Gateway 请求得到相同结果。该项属于当前外部凭据失效，不是 Gateway 路由/协议实现缺口；取得有效凭据后仍应补跑 live chat 证明。
 
 ## 2026-07-14 服务器外挂 Function Call 验证
 
@@ -128,15 +132,17 @@ local mock smoke
 下游 (Codex/Claude Code/DeepSeek/OpenCode)
     ↓ HTTP
 Gateway Handler (gateway_http_handler.py)
-    ├─ 智力增强 (gateway_intelligence.py)  ← 请求预处理
+    ├─ 智力增强 (gateway_intelligence.py + gateway_llm.py) ← 规则/Provider
     ├─ 语义缓存 (gateway_cache.py)         ← 缓存命中加速
     ├─ 统计记录 (gateway_stats.py)         ← Q&A 数据积累
     ├─ 协议转换 (gateway_protocol.py)      ← Anthropic ↔ OpenAI ↔ Responses
     ├─ 工具编排 (gateway_tool_runtime.py)  ← gateway-owned 执行 / 用户侧工具下发
     ├─ 流式处理 (gateway_streaming.py)     ← SSE 流式响应
     ├─ 上下文管理 (gateway_context.py)     ← 无限上下文/记忆/扇出
-    ├─ 请求准入 (gateway_admission.py)     ← 当前共享 SQLite lease 路径
-    └─ 多上游实验模块 (gateway_concurrency.py) ← 当前未接入 HTTP 请求路径
+    ├─ 请求准入 (gateway_admission.py)     ← 共享 SQLite lease 路径
+    ├─ 多上游池 (gateway_upstream_pool.py) ← 负载均衡、熔断、故障转移
+    ├─ Assistants (gateway_assistants.py)  ← SQLite 生命周期
+    └─ Web2API (gateway_web2api.py)         ← 认证后的受限网页提取
     ↓ HTTP
 上游 API (OpenAI/Anthropic/自定义)
 ```
@@ -238,10 +244,10 @@ Gateway 本地执行策略（仅 gateway-owned/显式 opt-in 本地工具）:
 
 ---
 
-### 4. Web2API 🧩（独立模块，当前未接入 HTTP）
+### 4. Web2API ✅（已接入受保护 HTTP 路径）
 
 **实现模块**: `src/gateway_web2api.py`
-**集成状态**: 模块和单元测试存在，但当前 HTTP Handler 没有 `/api/web2api` 路由。
+**集成状态**: 已接入 `/v1/web2api`、`/api/web2api`、`/anthropic/v1/web2api`；使用下游 Bearer/x-api-key 身份，并经过 ACL、共享限流/准入、请求日志和错误映射。
 
 功能:
 - `Web2ApiEngine` - Web 页面转 API 引擎
@@ -251,8 +257,11 @@ Gateway 本地执行策略（仅 gateway-owned/显式 opt-in 本地工具）:
 - 元数据提取 (title, meta, og:*)
 - 自动提取模式
 - SSRF 防护 (拒绝私有/回环地址)
+- 每次重定向后重新做 URL/DNS/IP 安全校验
+- 并发、超时、响应内容和缓存条目上限
+- regex、raw HTML、私网访问均为显式安全开关且默认关闭
 
-不得把模块 API 当作已发布 HTTP API。若产品决定接入，需先完成认证、共享限流/准入、SSRF 与重定向校验、响应限界、审计和部署门禁。
+该 API 是当前已发布 Gateway HTTP 能力；运行时开关、限界和路径以 `GET /capabilities` 与 Config Center schema 为准。
 
 ---
 
@@ -286,8 +295,8 @@ Gateway 本地执行策略（仅 gateway-owned/显式 opt-in 本地工具）:
 
 ### 7. 智力提升 (Intelligence Enhancement) ✅
 
-**实现模块**: `src/gateway_intelligence.py`
-**集成位置**: HTTP Handler 层 (非流式请求预处理)
+**实现模块**: `src/gateway_intelligence.py` + `src/gateway_llm.py`
+**集成位置**: 非流式与流式 canonical orchestration
 
 核心功能:
 - 问题分析 (`_analyze_question`)
@@ -298,6 +307,9 @@ Gateway 本地执行策略（仅 gateway-owned/显式 opt-in 本地工具）:
 - 回答质量评估 (`_assess_answer_quality`)
 - 增强系统提示构建
 - 自动注入到请求 body 中
+- 可插拔 provider registry；内置 `gateway_upstream` 复用真实上游池
+- provider 输入、输出、token、timeout、temperature 和结构化 JSON 边界
+- provider 失败时默认回退规则；`strict_mode=true` 时明确中止请求
 
 配置项:
 ```json
@@ -307,7 +319,10 @@ Gateway 本地执行策略（仅 gateway-owned/显式 opt-in 本地工具）:
     "reflection_enabled": true,
     "decomposition_enabled": true,
     "quality_assessment_enabled": true,
-    "quality_threshold": 0.6
+    "quality_threshold": 0.6,
+    "use_llm": false,
+    "provider": "gateway_upstream",
+    "strict_mode": false
   }
 }
 ```
@@ -321,21 +336,24 @@ Gateway 本地执行策略（仅 gateway-owned/显式 opt-in 本地工具）:
 
 核心功能:
 - Tab 式配置界面 (9 个配置标签页)
-- 上游配置 (URL, API Key, 模型, 超时)
+- 上游配置 (Base URL, API Key, 模型,协议、超时和限界)
 - 能力配置 (tools, function_calls, streaming, vision)
 - 上下文配置 (无限上下文参数)
 - 智力提升配置 (反思、分解、质量评估)
-- 并发配置 (连接池、负载均衡策略)
-- 缓存配置 (语义缓存、工具缓存)
-- 工具配置 (内置工具、Claude 兼容、MCP、HTTP Actions)
-- Web2API 配置
-- 安全配置 (认证、限流、CORS)
+- 并发配置 (连接池、多上游开关、负载均衡、熔断恢复)
+- 缓存、持久化、Assistants 保留配置
+- Web2API 并发、内容边界和安全开关
+- 安全配置 (限流、CORS 和 Admin 入口)
 
 API:
 ```
 GET  /ui/config           → 配置 UI 页面
+GET  /api/config          → 脱敏配置 + revision
 GET  /api/config/schema    → 配置 Schema JSON
+POST /api/config           → revision-aware 更新配置
 POST /api/config/update    → 更新配置
+GET  /api/upstreams/status → 脱敏上游池状态
+GET  /api/intelligence/status → Provider 状态
 ```
 
 ---
@@ -360,24 +378,23 @@ API:
 ```
 GET /api/stats/dashboard   → 统计仪表板
 GET /api/cache/stats       → 缓存统计
-GET /api/cache/clear       → 清除缓存
+POST /api/cache/clear      → 清除内存与持久语义/工具缓存
 ```
 
 ---
 
-### 10. 并发与多上游模块
+### 10. 并发与多上游模块 ✅
 
-**实现模块**: `src/gateway_concurrency.py` + `src/gateway_proxy.py`
+**实现模块**: `src/gateway_upstream_pool.py` + `src/gateway_proxy.py`
 
 集成状态:
-- `NativeProxyClient` 使用 opener 连接复用（减少 TCP 握手开销）
-- 自动重试 502/503/504 错误（30秒间隔，最长20分钟）
-- 可配置超时时间
-
-独立功能（当前未接入生产 HTTP 请求路径）:
-- `ConnectionPool` - HTTP 连接池
-- `LoadBalancer` - 负载均衡（round_robin/least_connections/random）
-- `MultiUpstreamManager` - 多上游管理 + 健康检查
+- profile pool 已接入非流式 canonical proxy path
+- 负载均衡支持 round-robin / least-connections / random
+- 429/502/503/504/timeout 可按有界 attempts 跨 profile 故障转移
+- 400 等客户端错误不跨上游重试
+- 连续失败熔断并在 recovery cooldown 后恢复
+- 流式首事件输出后固定 provider，不拼接两个上游响应
+- `/api/upstreams/status` 和 `/capabilities` 返回 credential-redacted 状态
 - `ConcurrentRequestExecutor` - 并发请求执行
 
 配置项:

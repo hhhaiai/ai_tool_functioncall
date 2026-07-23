@@ -804,7 +804,7 @@ def _render_html(**kw):
 <div class="shell">
 <div class="header">
   <div><h1>Gateway Control Center</h1><div class="subtitle">AI Tool FunctionCall Gateway</div></div>
-  <div class="actions"><a href="/client-config" class="btn ghost">Client Config</a><a href="/healthz" class="btn ghost" target="_blank">Health</a></div>
+  <div class="actions"><a href="/ui/config" class="btn ghost">Config Center</a><a href="/client-config" class="btn ghost">Client Config</a><a href="/healthz" class="btn ghost" target="_blank">Health</a></div>
 </div>
 <div class="stats-bar">
   <div class="stat"><div class="label">Model</div><div class="value">{E(upstream.get("model","—"))}</div></div>

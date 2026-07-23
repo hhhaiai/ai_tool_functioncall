@@ -2,12 +2,18 @@
 from __future__ import annotations
 
 import json
+import pathlib
+import tempfile
 import threading
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import urllib.error
+import urllib.request
+from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+import src.toolcall_gateway as gateway
 
 from src.gateway_web2api import (
     Web2ApiEngine,
@@ -261,8 +267,15 @@ class TestWeb2ApiEngine:
     def test_invalid_url_scheme(self):
         engine = Web2ApiEngine()
         result = engine.fetch_page("ftp://example.com")
-        assert "Invalid URL scheme" in result["error"]
+        assert "absolute http(s)" in result["error"]
         assert result["success"] is False
+
+    def test_private_network_is_blocked_by_default(self):
+        engine = Web2ApiEngine()
+        result = engine.fetch_page("http://127.0.0.1:9/private")
+        assert result["success"] is False
+        assert result["failure_type"] == "invalid_url"
+        assert "private network" in result["error"]
 
     def test_extract_with_css_selectors(self):
         engine = Web2ApiEngine()
@@ -335,6 +348,20 @@ class TestWeb2ApiEngine:
         assert "cache_hits" in stats
         assert "errors" in stats
 
+    def test_cache_is_bounded(self):
+        engine = Web2ApiEngine(max_cache_entries=2)
+        engine.fetch_page = MagicMock(return_value={
+            "url": "http://example.com",
+            "html": SAMPLE_HTML,
+            "text": "test",
+            "title": "Test",
+            "status": 200,
+            "success": True,
+        })
+        for index in range(3):
+            engine.extract_structured(f"http://example.com/{index}")
+        assert engine.stats["cache_entries"] == 2
+
     def test_concurrent_requests(self):
         engine = Web2ApiEngine(max_concurrent=2)
         errors = []
@@ -382,7 +409,7 @@ class TestWeb2ApiWithMockServer:
         thread.join(timeout=5)
 
     def test_fetch_real_page(self, mock_server):
-        engine = Web2ApiEngine()
+        engine = Web2ApiEngine(allow_private_network=True)
         result = engine.fetch_page(mock_server)
 
         assert result["success"] is True
@@ -392,7 +419,7 @@ class TestWeb2ApiWithMockServer:
         assert "title" in result
 
     def test_extract_structured(self, mock_server):
-        engine = Web2ApiEngine()
+        engine = Web2ApiEngine(allow_private_network=True)
         result = engine.extract_structured(
             mock_server,
             selectors={
@@ -409,7 +436,7 @@ class TestWeb2ApiWithMockServer:
         assert len(result["links"]) > 0
 
     def test_extract_auto_mode(self, mock_server):
-        engine = Web2ApiEngine()
+        engine = Web2ApiEngine(allow_private_network=True)
         result = engine.extract_structured(
             mock_server,
             extraction_mode="auto",
@@ -417,6 +444,43 @@ class TestWeb2ApiWithMockServer:
 
         assert result["success"] is True
         assert result["title"] == "Test Page"
+
+    def test_authenticated_http_endpoint(self, mock_server, tmp_path, monkeypatch):
+        old_config = gateway.CONFIG_PATH
+        runtime = tmp_path / "runtime"
+        monkeypatch.setenv("GATEWAY_RUNTIME_DIR", str(runtime))
+        monkeypatch.setenv("GATEWAY_SQLITE_LOG_PATH", str(runtime / "gateway-log.sqlite3"))
+        gateway.CONFIG_PATH = tmp_path / "gateway.config.json"
+        cfg = gateway._default_config()
+        cfg["web2api"]["allow_private_network"] = True
+        gateway.save_config(cfg)
+        reset_engine()
+        server = ThreadingHTTPServer(("127.0.0.1", 0), gateway.GatewayHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{server.server_address[1]}/v1/web2api",
+                data=json.dumps({
+                    "url": mock_server,
+                    "selectors": {"title": "h1"},
+                    "include_links": True,
+                }).encode("utf-8"),
+                headers={"authorization": "Bearer local-gateway-key", "content-type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            assert response.status == 200
+            assert payload["object"] == "gateway.web2api.result"
+            assert payload["extracted"]["title"] == "Welcome to Test Page"
+            assert payload["links"]
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+            reset_engine()
+            gateway.CONFIG_PATH = old_config
 
 
 class TestGlobalEngineFunctions:

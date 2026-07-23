@@ -47,416 +47,191 @@ class ConfigTab:
 # ---------------------------------------------------------------------------
 
 def _get_config_tabs() -> list[ConfigTab]:
-    """Get all configuration tabs."""
+    """Return the canonical schema for the live Gateway configuration UI."""
+    protocols = [
+        {"value": "openai_chat", "label": "OpenAI Chat"},
+        {"value": "openai_responses", "label": "OpenAI Responses"},
+        {"value": "anthropic_messages", "label": "Anthropic Messages"},
+    ]
+    strategies = [
+        {"value": "round_robin", "label": "轮询"},
+        {"value": "least_connections", "label": "最少连接"},
+        {"value": "random", "label": "随机"},
+    ]
     return [
         ConfigTab(
             id="upstream",
             label="上游配置",
             icon="🔗",
-            description="配置上游 API 服务器",
+            description="配置当前活跃上游；保存时会同步到对应 profile。",
             fields=[
+                ConfigField("upstream.base_url", "Base URL", "text", required=True, placeholder="https://api.example.com"),
+                ConfigField("upstream.api_key", "API Key", "password", description="留空或保持 *** 表示不修改。"),
+                ConfigField("upstream.model", "模型", "text", required=True),
+                ConfigField("upstream.protocol", "协议", "select", default="openai_chat", options=protocols),
                 ConfigField(
-                    name="upstream.url",
-                    label="上游 URL",
-                    field_type="text",
-                    description="上游 API 服务器地址",
-                    required=True,
-                    placeholder="https://api.example.com",
+                    "upstream.tools_enabled",
+                    "Tools 模式",
+                    "select",
+                    default="adapter",
+                    options=[
+                        {"value": "adapter", "label": "Gateway Adapter"},
+                        {"value": "native", "label": "Native"},
+                        {"value": "disabled", "label": "Disabled"},
+                    ],
                 ),
-                ConfigField(
-                    name="upstream.api_key",
-                    label="API Key",
-                    field_type="password",
-                    description="上游 API 密钥",
-                    required=True,
-                ),
-                ConfigField(
-                    name="upstream.model",
-                    label="模型",
-                    field_type="text",
-                    description="使用的模型名称",
-                    placeholder="gpt-4",
-                ),
-                ConfigField(
-                    name="upstream.timeout",
-                    label="超时时间 (秒)",
-                    field_type="number",
-                    description="请求超时时间",
-                    default=60,
-                    min_value=1,
-                    max_value=600,
-                ),
+                ConfigField("upstream.timeout_seconds", "请求超时（秒）", "number", default=60.0, min_value=0.1, max_value=600.0),
+                ConfigField("upstream.retry_max_attempts", "单上游重试次数", "number", default=3, min_value=1, max_value=20),
+                ConfigField("upstream.max_input_tokens", "最大输入 Token", "number", default=1048576, min_value=1000, max_value=10000000),
+                ConfigField("upstream.max_output_tokens", "最大输出 Token", "number", default=131072, min_value=1, max_value=1000000),
+                ConfigField("upstream.max_response_bytes", "最大响应字节", "number", default=33554432, min_value=1024, max_value=268435456),
+                ConfigField("upstream.max_concurrency", "上游最大并发", "number", default=32, min_value=1, max_value=10000),
             ],
         ),
         ConfigTab(
             id="capabilities",
             label="能力配置",
             icon="⚡",
-            description="配置上游 API 能力",
+            description="声明活跃上游真实支持的协议能力。",
             fields=[
-                ConfigField(
-                    name="upstream.capabilities.supports_tools",
-                    label="支持 Tools",
-                    field_type="boolean",
-                    description="上游是否支持 tool_calls",
-                    default=False,
-                ),
-                ConfigField(
-                    name="upstream.capabilities.supports_function_calls",
-                    label="支持 Function Calls",
-                    field_type="boolean",
-                    description="上游是否支持 function_call",
-                    default=False,
-                ),
-                ConfigField(
-                    name="upstream.capabilities.supports_streaming",
-                    label="支持流式响应",
-                    field_type="boolean",
-                    description="上游是否支持 SSE 流式响应",
-                    default=True,
-                ),
-                ConfigField(
-                    name="upstream.capabilities.supports_vision",
-                    label="支持视觉",
-                    field_type="boolean",
-                    description="上游是否支持图片输入",
-                    default=False,
-                ),
-                ConfigField(
-                    name="upstream.capabilities.supports_network",
-                    label="支持网络",
-                    field_type="boolean",
-                    description="上游是否支持联网搜索",
-                    default=False,
-                ),
+                ConfigField("upstream.capabilities.supports_streaming", "支持流式", "boolean", default=True),
+                ConfigField("upstream.capabilities.supports_tools", "支持 Tools", "boolean", default=False),
+                ConfigField("upstream.capabilities.supports_function_calls", "支持 Function Calls", "boolean", default=False),
+                ConfigField("upstream.capabilities.supports_parallel_tool_calls", "支持并行工具调用", "boolean", default=False),
+                ConfigField("upstream.capabilities.supports_vision", "支持视觉", "boolean", default=False),
+                ConfigField("upstream.capabilities.supports_network", "支持网络", "boolean", default=False),
+                ConfigField("upstream.capabilities.supports_web_search", "支持 Web Search", "boolean", default=False),
+                ConfigField("upstream.capabilities.supports_json_schema", "支持 JSON Schema", "boolean", default=False),
             ],
         ),
         ConfigTab(
             id="context",
             label="上下文配置",
             icon="📝",
-            description="配置无限上下文和记忆系统",
+            description="配置上下文压缩、扇出、质量审查和记忆治理。",
             fields=[
-                ConfigField(
-                    name="context.enabled",
-                    label="启用上下文管理",
-                    field_type="boolean",
-                    description="启用上下文压缩和记忆系统",
-                    default=True,
-                ),
-                ConfigField(
-                    name="context.max_input_tokens",
-                    label="最大输入 Token",
-                    field_type="number",
-                    description="最大输入 token 数量",
-                    default=1048576,
-                    min_value=1000,
-                    max_value=10000000,
-                ),
-                ConfigField(
-                    name="context.keep_recent_messages",
-                    label="保留最近消息数",
-                    field_type="number",
-                    description="压缩时保留的最近消息数量",
-                    default=12,
-                    min_value=1,
-                    max_value=100,
-                ),
-                ConfigField(
-                    name="context.summary_max_chars",
-                    label="摘要最大字符数",
-                    field_type="number",
-                    description="单条消息摘要的最大字符数",
-                    default=6000,
-                    min_value=100,
-                    max_value=50000,
-                ),
-                ConfigField(
-                    name="context.fanout_enabled",
-                    label="启用扇出并行",
-                    field_type="boolean",
-                    description="启用长对话扇出并行处理",
-                    default=True,
-                ),
-                ConfigField(
-                    name="context.fanout_chunk_tokens",
-                    label="扇出分块 Token",
-                    field_type="number",
-                    description="扇出并行时每块的 token 数量",
-                    default=120000,
-                    min_value=10000,
-                    max_value=500000,
-                ),
-                ConfigField(
-                    name="context.memory_enabled",
-                    label="启用记忆系统",
-                    field_type="boolean",
-                    description="启用对话记忆持久化",
-                    default=True,
-                ),
+                ConfigField("context.enabled", "启用上下文管理", "boolean", default=True),
+                ConfigField("context.max_input_tokens", "最大输入 Token", "number", default=1048576, min_value=1000, max_value=10000000),
+                ConfigField("context.keep_recent_messages", "保留最近消息", "number", default=12, min_value=1, max_value=1000),
+                ConfigField("context.summary_max_chars", "摘要最大字符", "number", default=6000, min_value=100, max_value=1000000),
+                ConfigField("context.fanout_enabled", "启用扇出", "boolean", default=True),
+                ConfigField("context.fanout_chunk_tokens", "扇出分块 Token", "number", default=120000, min_value=1000, max_value=10000000),
+                ConfigField("context.fanout_max_chunks", "最大分块数（0=不限）", "number", default=0, min_value=0, max_value=10000),
+                ConfigField("context.fanout_max_workers", "扇出 Worker", "number", default=4, min_value=1, max_value=128),
+                ConfigField("context.quality_review_enabled", "启用质量审查", "boolean", default=True),
+                ConfigField("context.memory_enabled", "启用记忆", "boolean", default=True),
+                ConfigField("context.memory_max_items", "单会话记忆上限", "number", default=200, min_value=1, max_value=100000),
             ],
         ),
         ConfigTab(
             id="intelligence",
             label="智力提升",
             icon="🧠",
-            description="配置智能增强功能",
+            description="规则增强可独立运行；LLM provider 复用 Gateway 上游传输。",
             fields=[
-                ConfigField(
-                    name="intelligence.enabled",
-                    label="启用智力提升",
-                    field_type="boolean",
-                    description="启用问题分析和回答质量评估",
-                    default=True,
-                ),
-                ConfigField(
-                    name="intelligence.reflection_enabled",
-                    label="启用反思",
-                    field_type="boolean",
-                    description="启用复杂问题的反思机制",
-                    default=True,
-                ),
-                ConfigField(
-                    name="intelligence.decomposition_enabled",
-                    label="启用问题分解",
-                    field_type="boolean",
-                    description="启用复杂问题的自动分解",
-                    default=True,
-                ),
-                ConfigField(
-                    name="intelligence.quality_assessment_enabled",
-                    label="启用质量评估",
-                    field_type="boolean",
-                    description="启用回答质量自动评估",
-                    default=True,
-                ),
-                ConfigField(
-                    name="intelligence.quality_threshold",
-                    label="质量阈值",
-                    field_type="number",
-                    description="回答质量阈值 (0-1)",
-                    default=0.6,
-                    min_value=0.0,
-                    max_value=1.0,
-                ),
+                ConfigField("intelligence.enabled", "启用智力提升", "boolean", default=True),
+                ConfigField("intelligence.reflection_enabled", "启用反思", "boolean", default=True),
+                ConfigField("intelligence.decomposition_enabled", "启用问题分解", "boolean", default=True),
+                ConfigField("intelligence.quality_assessment_enabled", "启用质量评估", "boolean", default=True),
+                ConfigField("intelligence.quality_threshold", "质量阈值", "number", default=0.6, min_value=0.0, max_value=1.0),
+                ConfigField("intelligence.use_llm", "启用 LLM Provider", "boolean", default=False),
+                ConfigField("intelligence.provider", "Provider", "text", default="gateway_upstream", required=True),
+                ConfigField("intelligence.model", "独立模型（可空）", "text", default=""),
+                ConfigField("intelligence.llm_timeout", "Provider 超时（秒）", "number", default=15.0, min_value=0.1, max_value=300.0),
+                ConfigField("intelligence.max_input_chars", "Provider 最大输入字符", "number", default=20000, min_value=256, max_value=200000),
+                ConfigField("intelligence.temperature", "Temperature", "number", default=0.0, min_value=0.0, max_value=2.0),
+                ConfigField("intelligence.strict_mode", "Strict 模式", "boolean", description="Provider 失败时阻止请求，不回退规则。", default=False),
             ],
         ),
         ConfigTab(
             id="concurrency",
-            label="并发配置",
+            label="并发与多上游",
             icon="🚀",
-            description="配置并发和负载均衡",
+            description="配置连接、选择策略、故障转移和熔断。",
             fields=[
-                ConfigField(
-                    name="concurrency.enabled",
-                    label="启用并发优化",
-                    field_type="boolean",
-                    description="启用连接池和负载均衡",
-                    default=True,
-                ),
-                ConfigField(
-                    name="concurrency.max_connections",
-                    label="最大连接数",
-                    field_type="number",
-                    description="最大并发连接数",
-                    default=100,
-                    min_value=1,
-                    max_value=1000,
-                ),
-                ConfigField(
-                    name="concurrency.max_connections_per_host",
-                    label="每主机最大连接数",
-                    field_type="number",
-                    description="每个上游主机的最大连接数",
-                    default=10,
-                    min_value=1,
-                    max_value=100,
-                ),
-                ConfigField(
-                    name="concurrency.retry_count",
-                    label="重试次数",
-                    field_type="number",
-                    description="请求失败后的重试次数",
-                    default=2,
-                    min_value=0,
-                    max_value=10,
-                ),
-                ConfigField(
-                    name="concurrency.load_balance_strategy",
-                    label="负载均衡策略",
-                    field_type="select",
-                    description="多上游时的负载均衡策略",
-                    default="round_robin",
-                    options=[
-                        {"value": "round_robin", "label": "轮询 (Round Robin)"},
-                        {"value": "least_connections", "label": "最少连接"},
-                        {"value": "random", "label": "随机"},
-                    ],
-                ),
+                ConfigField("concurrency.enabled", "启用连接优化", "boolean", default=True),
+                ConfigField("concurrency.max_connections", "最大连接", "number", default=100, min_value=1, max_value=10000),
+                ConfigField("concurrency.max_connections_per_host", "单主机连接", "number", default=10, min_value=1, max_value=10000),
+                ConfigField("concurrency.retry_count", "兼容重试次数", "number", default=2, min_value=0, max_value=20),
+                ConfigField("concurrency.load_balance_strategy", "负载均衡策略", "select", default="round_robin", options=strategies),
+                ConfigField("concurrency.multi_upstream_enabled", "启用多上游", "boolean", default=False),
+                ConfigField("concurrency.multi_upstream_max_attempts", "最大上游尝试（0=全部）", "number", default=0, min_value=0, max_value=100),
+                ConfigField("concurrency.multi_upstream_failure_threshold", "熔断失败阈值", "number", default=3, min_value=1, max_value=1000),
+                ConfigField("concurrency.multi_upstream_recovery_seconds", "熔断恢复秒数", "number", default=30.0, min_value=0.1, max_value=86400.0),
             ],
         ),
         ConfigTab(
             id="cache",
             label="缓存配置",
             icon="💾",
-            description="配置智能缓存系统",
+            description="配置租户隔离的语义缓存和持久化工具缓存策略。",
             fields=[
-                ConfigField(
-                    name="cache.semantic_enabled",
-                    label="启用语义缓存",
-                    field_type="boolean",
-                    description="启用基于语义相似度的缓存",
-                    default=True,
-                ),
-                ConfigField(
-                    name="cache.semantic_ttl",
-                    label="语义缓存 TTL (秒)",
-                    field_type="number",
-                    description="语义缓存条目过期时间",
-                    default=3600,
-                    min_value=60,
-                    max_value=86400,
-                ),
-                ConfigField(
-                    name="cache.semantic_threshold",
-                    label="相似度阈值",
-                    field_type="number",
-                    description="语义相似度阈值 (0-1)",
-                    default=0.85,
-                    min_value=0.5,
-                    max_value=1.0,
-                ),
-                ConfigField(
-                    name="cache.tool_result_enabled",
-                    label="启用工具结果缓存",
-                    field_type="boolean",
-                    description="缓存确定性工具的执行结果",
-                    default=True,
-                ),
-                ConfigField(
-                    name="cache.tool_result_ttl",
-                    label="工具缓存 TTL (秒)",
-                    field_type="number",
-                    description="工具结果缓存过期时间",
-                    default=300,
-                    min_value=10,
-                    max_value=3600,
-                ),
+                ConfigField("cache.enabled", "启用语义缓存", "boolean", default=True),
+                ConfigField("cache.max_entries", "最大条目", "number", default=1000, min_value=1, max_value=1000000),
+                ConfigField("cache.similarity_threshold", "相似度阈值", "number", default=0.92, min_value=0.0, max_value=1.0),
+                ConfigField("cache.ttl_seconds", "TTL（秒）", "number", default=3600, min_value=1, max_value=31536000),
+                ConfigField("cache.embedding_url", "Embedding URL", "text", default=""),
+                ConfigField("cache.embedding_model", "Embedding 模型", "text", default="default"),
+                ConfigField("cache.embedding_api_key", "Embedding API Key", "password", description="留空或保持 *** 表示不修改。"),
+                ConfigField("gateway.tool_cache_persist_local_results", "持久化本地工具结果", "boolean", default=False),
             ],
         ),
         ConfigTab(
             id="tools",
-            label="工具配置",
-            icon="🔧",
-            description="配置内置工具和 MCP",
+            label="工具与执行",
+            icon="🛠️",
+            description="配置 Gateway-owned 工具执行边界。",
             fields=[
-                ConfigField(
-                    name="tools.builtin_enabled",
-                    label="启用内置工具",
-                    field_type="boolean",
-                    description="启用 Gateway 内置工具 (echo_probe, calculator 等)",
-                    default=True,
-                ),
-                ConfigField(
-                    name="tools.claude_compat_enabled",
-                    label="启用 Claude 兼容",
-                    field_type="boolean",
-                    description="启用 Claude Code 工具兼容层",
-                    default=True,
-                ),
-                ConfigField(
-                    name="tools.mcp_enabled",
-                    label="启用 MCP",
-                    field_type="boolean",
-                    description="启用 Model Context Protocol 支持",
-                    default=True,
-                ),
-                ConfigField(
-                    name="tools.http_actions_enabled",
-                    label="启用 HTTP Actions",
-                    field_type="boolean",
-                    description="启用 HTTP 端点作为工具",
-                    default=True,
-                ),
+                ConfigField("gateway.tool_mode", "工具模式", "select", default="orchestrate", options=[
+                    {"value": "orchestrate", "label": "Orchestrate"},
+                    {"value": "native_passthrough", "label": "Native Passthrough"},
+                    {"value": "proxy", "label": "Proxy"},
+                ]),
+                ConfigField("gateway.max_tool_rounds", "最大工具轮次", "number", default=10, min_value=1, max_value=100),
+                ConfigField("gateway.tool_execution_timeout_seconds", "工具超时（秒）", "number", default=60.0, min_value=0.1, max_value=3600.0),
+                ConfigField("gateway.allow_write_tools", "允许写工具", "boolean", default=False),
+                ConfigField("gateway.allow_shell_tools", "允许 Shell 工具", "boolean", default=False),
+                ConfigField("gateway.execute_user_side_tools_in_gateway", "执行下游工具", "boolean", default=False),
+                ConfigField("gateway.text_tool_call_fallback_enabled", "文本 Tool Call 兜底", "boolean", default=True),
+                ConfigField("gateway.local_planner_enabled", "本地 Planner", "boolean", default=True),
+                ConfigField("http_actions.enabled", "启用 HTTP Actions", "boolean", default=True),
+                ConfigField("assistants.db_path", "Assistants 数据库", "text", default=".gateway_runtime/assistants.sqlite3"),
+                ConfigField("assistants.retention_days", "Assistants 保留天数", "number", default=30, min_value=0, max_value=36500),
+                ConfigField("assistants.max_rows", "Assistants 单表最大行数", "number", default=50000, min_value=1, max_value=10000000),
             ],
         ),
         ConfigTab(
             id="web2api",
             label="Web2API",
             icon="🌐",
-            description="配置网页转 API 功能",
+            description="配置受 SSRF、大小、并发和缓存边界保护的网页提取。",
             fields=[
-                ConfigField(
-                    name="web2api.enabled",
-                    label="启用 Web2API",
-                    field_type="boolean",
-                    description="启用网页内容提取为 API",
-                    default=True,
-                ),
-                ConfigField(
-                    name="web2api.timeout",
-                    label="请求超时 (秒)",
-                    field_type="number",
-                    description="网页请求超时时间",
-                    default=30,
-                    min_value=5,
-                    max_value=120,
-                ),
-                ConfigField(
-                    name="web2api.max_content_length",
-                    label="最大内容长度",
-                    field_type="number",
-                    description="提取内容的最大字符数",
-                    default=50000,
-                    min_value=1000,
-                    max_value=500000,
-                ),
+                ConfigField("web2api.enabled", "启用 Web2API", "boolean", default=True),
+                ConfigField("web2api.max_concurrent", "最大并发", "number", default=5, min_value=1, max_value=1000),
+                ConfigField("web2api.cache_ttl_seconds", "缓存 TTL", "number", default=300, min_value=0, max_value=86400),
+                ConfigField("web2api.request_timeout", "请求超时（秒）", "number", default=30, min_value=1, max_value=300),
+                ConfigField("web2api.max_content_bytes", "最大内容字节", "number", default=5242880, min_value=1024, max_value=268435456),
+                ConfigField("web2api.max_cache_entries", "最大缓存条目", "number", default=256, min_value=1, max_value=100000),
+                ConfigField("web2api.user_agent", "User-Agent", "text", default="Gateway-Web2API/1.0"),
+                ConfigField("web2api.allow_private_network", "允许私网", "boolean", default=False),
+                ConfigField("web2api.allow_regex", "允许正则提取", "boolean", default=False),
+                ConfigField("web2api.allow_raw_html", "允许返回原始 HTML", "boolean", default=False),
             ],
         ),
         ConfigTab(
             id="security",
-            label="安全配置",
+            label="安全与入口",
             icon="🔒",
-            description="配置安全和认证",
+            description="配置请求认证之后的共享限流、准入和浏览器 Origin。",
             fields=[
-                ConfigField(
-                    name="gateway.auth_required",
-                    label="启用认证",
-                    field_type="boolean",
-                    description="要求下游请求携带 API Key",
-                    default=True,
-                ),
-                ConfigField(
-                    name="gateway.rate_limit_enabled",
-                    label="启用限流",
-                    field_type="boolean",
-                    description="启用请求速率限制",
-                    default=True,
-                ),
-                ConfigField(
-                    name="gateway.rate_limit_rpm",
-                    label="每分钟请求数",
-                    field_type="number",
-                    description="每分钟最大请求数",
-                    default=60,
-                    min_value=1,
-                    max_value=10000,
-                ),
-                ConfigField(
-                    name="gateway.cors_enabled",
-                    label="启用 CORS",
-                    field_type="boolean",
-                    description="启用跨域资源共享",
-                    default=False,
-                ),
-                ConfigField(
-                    name="gateway.cors_allowed_origins",
-                    label="CORS Origin 白名单",
-                    field_type="text",
-                    description="逗号分隔的精确 http(s) Origin；不支持 * 通配符",
-                    default="",
-                    placeholder="https://console.example.com",
-                ),
+                ConfigField("gateway.max_concurrent_requests", "Gateway 最大并发", "number", default=32, min_value=1, max_value=10000),
+                ConfigField("gateway.concurrency_queue_timeout_seconds", "并发排队超时", "number", default=5.0, min_value=0.0, max_value=600.0),
+                ConfigField("gateway.rate_limit_enabled", "启用下游限流", "boolean", default=True),
+                ConfigField("gateway.rate_limit_rpm", "每 Key 每分钟请求", "number", default=120, min_value=1, max_value=1000000),
+                ConfigField("gateway.max_request_body_bytes", "最大请求体字节", "number", default=67108864, min_value=1024, max_value=1073741824),
+                ConfigField("gateway.cors_enabled", "启用 CORS", "boolean", default=False),
+                ConfigField("gateway.cors_allowed_origins", "CORS Origin 白名单", "text", description="逗号分隔的精确 http(s) Origin；不支持 *。", default=""),
+                ConfigField("gateway.public_base_url", "公开 Base URL", "text", default="http://127.0.0.1:8885"),
             ],
         ),
     ]
@@ -473,6 +248,8 @@ def _render_field(field: ConfigField, current_value: Any = None) -> str:
     desc = html.escape(field.description)
     placeholder = html.escape(field.placeholder)
     value = current_value if current_value is not None else field.default
+    if isinstance(value, list):
+        value = ", ".join(str(item) for item in value)
 
     required_attr = " required" if field.required else ""
     required_mark = " *" if field.required else ""
@@ -594,10 +371,24 @@ def _set_nested_value(config: dict[str, Any], path: str, value: Any) -> dict[str
 # Main UI Renderer
 # ---------------------------------------------------------------------------
 
-def render_web_config_ui(config: dict[str, Any] | None = None) -> str:
+def render_web_config_ui(
+    config: dict[str, Any] | None = None,
+    *,
+    revision: str = "",
+) -> str:
     """Render the complete web configuration UI."""
     if config is None:
         config = {}
+    else:
+        config = dict(config)
+    raw_upstream = config.get("upstream")
+    if isinstance(raw_upstream, dict):
+        upstream = dict(raw_upstream)
+        if not upstream.get("base_url") and upstream.get("url"):
+            upstream["base_url"] = upstream.get("url")
+        if upstream.get("timeout_seconds") is None and upstream.get("timeout") is not None:
+            upstream["timeout_seconds"] = upstream.get("timeout")
+        config["upstream"] = upstream
 
     tabs = _get_config_tabs()
 
@@ -617,6 +408,7 @@ def render_web_config_ui(config: dict[str, Any] | None = None) -> str:
         tab_panels += _render_tab(tab, config)
 
     # Build complete page
+    revision_json = json.dumps(str(revision or ""))
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -892,6 +684,7 @@ def render_web_config_ui(config: dict[str, Any] | None = None) -> str:
     </div>
 
     <script>
+        let configRevision = {revision_json};
         // Tab switching
         document.querySelectorAll('.tab-btn').forEach(btn => {{
             btn.addEventListener('click', () => {{
@@ -941,16 +734,19 @@ def render_web_config_ui(config: dict[str, Any] | None = None) -> str:
             }});
 
             try {{
-                const response = await fetch('/api/config', {{
+                const response = await fetch('/api/config/update', {{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'application/json' }},
-                    body: JSON.stringify(config),
+                    body: JSON.stringify({{ config: config, revision: configRevision }}),
                 }});
 
                 if (response.ok) {{
+                    const payload = await response.json();
+                    configRevision = payload.revision || configRevision;
                     alert('配置已保存');
                 }} else {{
-                    alert('保存失败: ' + response.statusText);
+                    const payload = await response.json().catch(() => ({{}}));
+                    alert('保存失败: ' + (payload.error?.message || response.statusText));
                 }}
             }} catch (error) {{
                 alert('保存失败: ' + error.message);

@@ -162,6 +162,90 @@ context:
     protocol: ""
 
 # ----------------------------------------------------------------------------
+# 持久化与 Assistants / Threads 生命周期
+# ----------------------------------------------------------------------------
+persistence:
+  enabled: true
+  db_path: .gateway_runtime/gateway.db
+
+assistants:
+  db_path: .gateway_runtime/assistants.sqlite3
+  retention_days: 30
+  max_rows: 50000
+
+# ----------------------------------------------------------------------------
+# 语义缓存
+# ----------------------------------------------------------------------------
+cache:
+  enabled: true
+  max_entries: 1000
+  similarity_threshold: 0.92
+  ttl_seconds: 3600
+  embedding_url: ""
+  embedding_model: default
+  embedding_api_key: ""
+
+# ----------------------------------------------------------------------------
+# 智能分析（默认使用规则；LLM provider 显式启用）
+# ----------------------------------------------------------------------------
+intelligence:
+  enabled: true
+  reflection_enabled: true
+  decomposition_enabled: true
+  quality_assessment_enabled: true
+  max_reflection_tokens: 500
+  max_decomposition_parts: 5
+  quality_threshold: 0.6
+  use_llm: false
+  provider: gateway_upstream
+  model: ""
+  llm_timeout: 15.0
+  max_input_chars: 20000
+  temperature: 0.0
+  strict_mode: false
+
+# ----------------------------------------------------------------------------
+# 上游连接池、负载均衡与故障转移
+# ----------------------------------------------------------------------------
+concurrency:
+  enabled: true
+  max_connections: 100
+  max_connections_per_host: 10
+  retry_count: 2
+  retry_delay: 1.0
+  load_balance_strategy: round_robin
+  multi_upstream_enabled: false
+  multi_upstream_max_attempts: 0
+  multi_upstream_failure_threshold: 3
+  multi_upstream_recovery_seconds: 30.0
+
+# ----------------------------------------------------------------------------
+# 运行统计
+# ----------------------------------------------------------------------------
+stats:
+  enabled: true
+  track_requests: true
+  track_tools: true
+  track_cache: true
+  track_quality: true
+  retention_days: 30
+
+# ----------------------------------------------------------------------------
+# Web2API（默认禁止私网、正则和原始 HTML）
+# ----------------------------------------------------------------------------
+web2api:
+  enabled: true
+  max_concurrent: 5
+  cache_ttl_seconds: 300
+  request_timeout: 30
+  max_content_bytes: 5242880
+  max_cache_entries: 256
+  user_agent: Gateway-Web2API/1.0
+  allow_private_network: false
+  allow_regex: false
+  allow_raw_html: false
+
+# ----------------------------------------------------------------------------
 # 持久化数据维护
 # ----------------------------------------------------------------------------
 maintenance:

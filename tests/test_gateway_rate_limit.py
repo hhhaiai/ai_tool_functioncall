@@ -86,6 +86,7 @@ def test_sqlite_rate_limit_storage_contains_only_hashed_identity(tmp_path):
     assert path.stat().st_mode & 0o777 == 0o600
     with sqlite3.connect(path) as connection:
         assert connection.execute("PRAGMA auto_vacuum").fetchone()[0] == 2
+        assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
 
 
 def test_sqlite_rate_limit_rejects_database_symlink(tmp_path):

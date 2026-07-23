@@ -2,7 +2,7 @@
 
 本文档涵盖从零开始部署、配置、启动和验证 `AI Tool FunctionCall Gateway` 的完整流程。
 
-**特性**：纯 Python 标准库实现，无第三方依赖，支持 macOS / Linux / Windows (WSL)。
+**特性**：核心服务以 Python 实现，使用 `cryptography` 加密持久配置中的敏感值，并可选使用 Pillow/GUI 依赖；支持 macOS / Linux / Windows (WSL)。
 
 ---
 
@@ -24,6 +24,7 @@
 | 依赖 | 版本 | 必需 | 说明 |
 |------|------|------|------|
 | Python | 3.10+ | ✅ | 核心运行时 |
+| requirements.txt | 当前锁定范围 | ✅ | `cryptography` 配置加密；Pillow 用于可选图像能力 |
 | sqlite3 | - | ✅ | Python 内置 |
 | curl | - | ✅ | 健康检查 |
 | screen / nohup | - | 可选 | 后台运行方式 |
@@ -156,7 +157,7 @@ curl http://127.0.0.1:8885/healthz
     "tool_mode": "orchestrate",
     "allow_write_tools": false,
     "allow_shell_tools": false,
-    "max_tool_rounds": 5,
+    "max_tool_rounds": 10,
     "tool_execution_timeout_seconds": 60,
     "max_concurrent_requests": 32,
     "request_logging": true,
@@ -177,6 +178,32 @@ curl http://127.0.0.1:8885/healthz
     "fanout_enabled": true,
     "fanout_chunk_tokens": 120000,
     "memory_enabled": true
+  },
+  "persistence": {
+    "enabled": true,
+    "db_path": ".gateway_runtime/gateway.db"
+  },
+  "assistants": {
+    "db_path": ".gateway_runtime/assistants.sqlite3",
+    "retention_days": 30,
+    "max_rows": 50000
+  },
+  "intelligence": {
+    "enabled": true,
+    "use_llm": false,
+    "provider": "gateway_upstream",
+    "strict_mode": false
+  },
+  "concurrency": {
+    "load_balance_strategy": "round_robin",
+    "multi_upstream_enabled": false,
+    "multi_upstream_max_attempts": 0
+  },
+  "web2api": {
+    "enabled": true,
+    "allow_private_network": false,
+    "allow_regex": false,
+    "allow_raw_html": false
   },
   "downstream_keys": [],
   "mcp": {
@@ -213,7 +240,7 @@ curl http://127.0.0.1:8885/healthz
 | `gateway.execute_user_side_tools_in_gateway` | false | 是否把用户侧文件/shell/GUI/local-agent 工具在 Gateway 服务机执行；默认 false，Gateway 只向下游返回 tool_use/tool_calls/function_call，由 Claude Code/Codex 在用户机器执行 |
 | `gateway.client_snippet_api_key` | - | 客户端连接 Gateway 的 API Key；保存配置时会自动同步为可认证的 downstream key |
 | `gateway.client_context_window` | 1048576 | 下游 Claude Code/Codex 配置片段中的上下文窗口；Mimo 按 1M 配置 |
-| `gateway.max_tool_rounds` | 5 | orchestrate 模式最大工具调用轮数；运行时优先使用 `GATEWAY_MAX_TOOL_ROUNDS` 环境变量，其次使用 Admin/配置文件保存值 |
+| `gateway.max_tool_rounds` | 10 | orchestrate 模式最大工具调用轮数；运行时优先使用 `GATEWAY_MAX_TOOL_ROUNDS` 环境变量，其次使用 Admin/配置文件保存值 |
 | `gateway.max_concurrent_requests` | 32 | Gateway 下游 API 请求并发上限；默认由共享 SQLite lease 在多个 Gateway 进程之间统一执行 |
 | `gateway.concurrency_backend` | sqlite | `sqlite` 为跨进程共享 admission；`memory` 仅适合单进程/测试 |
 | `gateway.concurrency_db_path` | `.gateway_runtime/admission.sqlite3` | 共享 admission lease 数据库路径；多 worker 必须指向同一文件 |
@@ -262,6 +289,11 @@ curl http://127.0.0.1:8885/healthz
 | `GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT` | gateway.text_tool_adapter_compact_token_limit | 文本工具适配前的压缩阈值上限，默认 48000；实际阈值动态计算；设为 0 可关闭 |
 | `GATEWAY_CONTEXT_MAX_INPUT_TOKENS` | context.max_input_tokens | Mimo 1M 模板为 `1048576` |
 | `GATEWAY_CLIENT_CONTEXT_WINDOW` | gateway.client_context_window | Claude Code/Codex 客户端上下文窗口，Mimo 模板为 `1048576` |
+| `GATEWAY_ASSISTANTS_DB_PATH` / `GATEWAY_ASSISTANTS_RETENTION_DAYS` / `GATEWAY_ASSISTANTS_MAX_ROWS` | assistants.* | Gateway-owned Assistants 数据库和容量治理；Compose 默认数据库位于持久卷 `/app/data/runtime/assistants.sqlite3` |
+| `GATEWAY_MULTI_UPSTREAM_ENABLED` / `GATEWAY_CONCURRENCY_STRATEGY` | concurrency.* | 多 profile 负载均衡显式开关和策略；默认关闭、策略为 round robin |
+| `GATEWAY_INTELLIGENCE_USE_LLM` / `GATEWAY_INTELLIGENCE_PROVIDER` / `GATEWAY_INTELLIGENCE_STRICT_MODE` | intelligence.* | LLM intelligence provider；默认关闭且 provider 失败时回退规则，strict 模式明确失败 |
+| `GATEWAY_WEB2API_*` | web2api.* | Web2API 并发、超时、内容/缓存上限和安全开关；私网、regex、raw HTML 默认均关闭 |
+| `GATEWAY_SANDBOX_STARTUP_TIMEOUT` | sandbox worker startup | sandbox 策略、资源限制和 OS 隔离初始化上限，默认 5 秒；该窗口与用户命令的 `timeout` / exec `read_timeout` 分开计时 |
 
 配置文件存在但 JSON 损坏或根节点不是对象时，Gateway 会 fail closed：Admin/API 请求返回结构化 500 `invalid gateway config`，不会静默回退到默认 `admin/admin` 或无下游鉴权。修复方式是恢复有效 `.gateway_service.json`，而不是依赖代码默认值。
 
@@ -386,17 +418,35 @@ curl -u admin:admin -X POST http://127.0.0.1:8885/api/cache/clear
 # 智力增强状态
 curl -u admin:admin http://127.0.0.1:8885/api/intelligence/status
 
+# 多上游连接池 / 熔断状态（凭据已遮盖）
+curl -u admin:admin http://127.0.0.1:8885/api/upstreams/status
+
 # 查看当前真实能力边界
 curl http://127.0.0.1:8885/capabilities
 
-# 更新配置
+# 获取当前配置及 revision
+curl -u admin:admin http://127.0.0.1:8885/api/config
+
+# 使用 GET 返回的 revision 原子更新配置
 curl -u admin:admin -X POST \
   -H "Content-Type: application/json" \
-  -d '{"cache":{"enabled":false}}' \
+  -d '{"config":{"cache":{"enabled":false}},"revision":"<revision-from-get>"}' \
   http://127.0.0.1:8885/api/config/update
+
+# Web2API（使用下游 Bearer key，不是 Admin Basic Auth）
+curl -H 'Authorization: Bearer your-gateway-api-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com","selectors":{"title":"title"}}' \
+  http://127.0.0.1:8885/v1/web2api
 ```
 
-`src/gateway_web2api.py` 当前是独立模块/测试能力，没有接入生产 HTTP Handler；`/api/web2api` 不是受支持路由。若未来决定接入，必须同时纳入下游认证、共享限流、请求准入、SSRF/重定向防护、响应大小限制和观测门禁。当前状态以 `/capabilities` 返回的 `web2api_module` 字段为准。
+`/v1/web2api`、`/api/web2api` 和 `/anthropic/v1/web2api` 都已接入生产 Handler，并共享下游认证、ACL、限流、请求准入、日志、SSRF/DNS/redirect 重检、内容类型和响应大小边界。`allow_private_network`、正则提取和 raw HTML 返回都只能由管理员配置显式开启。
+
+所有 `/api/config`、`/api/stats`、`/api/cache`、`/api/upstreams`、`/api/intelligence` 管理接口都要求 Admin Basic Auth。浏览器发起的 POST 还必须满足 same-origin 检查；无 Origin/Referer 的受信 CLI 请求保持可用。配置写入只接受 schema 中的可编辑字段，使用 revision 防止覆盖并发修改，并在保存后定向 reload 缓存、上游池、Web2API 或 Assistants store。
+
+Assistants / Threads 已提供持久 Gateway-owned 生命周期，包括 assistants CRUD/list、threads、messages、runs、cancel、`submit_tool_outputs` 和 run steps。Run 当前是同步编排：普通答案完成 run，工具调用进入 `requires_action` 后可提交 outputs 继续；不要把它配置成或宣传为 Assistants Run SSE streaming。
+
+多上游只在请求尚未产生下游流事件时执行安全故障转移。非流式 429/502/503/504/timeout 可按配置切换 profile；400 等客户端错误不会跨上游重试；流式一旦输出事件就固定当前 provider。
 
 ### 5.5 运行测试套件
 
@@ -443,6 +493,8 @@ GATEWAY_VERIFY_MODEL_REQUESTS=0 GATEWAY_VERIFY_DIRECT_REQUESTS=24 GATEWAY_VERIFY
 # 24-request concurrency/performance smoke OK
 # Claude/Codex project-scope smoke OK
 ```
+
+`verify` 的真实工具阶段会在其自身进程内临时启用 Gateway 侧用户工具执行和 localhost 测试夹具访问；普通 `start`/`foreground` 与 Compose 的安全默认仍保持关闭。单元测试阶段会清除这些临时开关，最后的 Claude/Codex 项目范围阶段也会恢复“用户侧 Skill 下发给客户端”的生产归属边界。若运行中的 Gateway 使用了非默认 Admin 凭据，可用 `GATEWAY_VERIFY_ADMIN_USERNAME` 与 `GATEWAY_VERIFY_ADMIN_PASSWORD`（或 `GATEWAY_VERIFY_ADMIN_AUTH=user:password`）传给安全检查；密码通过环境读取，不放入子进程 argv 或 launchd plist，也不会由脚本打印。
 
 也可以单独复跑项目根隔离 smoke：
 
@@ -797,6 +849,15 @@ ai_tool_functioncall/
 | `/v1/tools/call` | POST | 直接工具调用 |
 | `/v1/functions/call` | POST | 直接工具调用兼容路径 |
 | `/tools/call` | POST | 直接工具调用兼容路径（无 `/v1` 前缀） |
+| `/v1/web2api` / `/api/web2api` / `/anthropic/v1/web2api` | POST | 下游鉴权后的 Web2API |
+| `/v1/assistants` / `/v1/assistants/{id}` | GET/POST/DELETE | Assistant 生命周期 |
+| `/v1/threads/{thread_id}/messages` | GET/POST | Thread message 生命周期 |
+| `/v1/threads/{thread_id}/runs` | GET/POST | 同步 Run 生命周期及 tool-output resume 子路由 |
+| `/ui/config` | GET | Admin Config Center |
+| `/api/config` / `/api/config/schema` | GET | 脱敏配置、revision、schema |
+| `/api/config` / `/api/config/update` | POST | revision-aware 配置更新 |
+| `/api/cache/clear` | POST | 清除内存和持久缓存 |
+| `/api/upstreams/status` / `/api/intelligence/status` | GET | 脱敏运行状态 |
 
 ### C. 支持的工具
 
@@ -812,4 +873,4 @@ ai_tool_functioncall/
 
 ---
 
-**最后更新**: 2026-05-24
+**最后更新**: 2026-07-24

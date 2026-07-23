@@ -269,15 +269,15 @@ class ToolRuntimeStabilityTests(unittest.TestCase):
         self.call("Read", {"file_path": "background.txt"}, "background-before")
 
         command = (
+            "printf 'phase-one\\n' > background.txt; printf 'phase-one\\n'; "
             "python3 -u -c \"import pathlib,time; "
             "p=pathlib.Path('background.txt'); "
-            "p.write_text('phase-one\\n'); print('phase-one', flush=True); "
-            "time.sleep(0.35); p.write_text('phase-two\\n'); print('phase-two', flush=True); "
+            "time.sleep(0.8); p.write_text('phase-two\\n'); print('phase-two', flush=True); "
             "time.sleep(0.5)\""
         )
         started = self.call(
             "exec_shell_start",
-            {"session_id": "background-writer", "command": command, "read_timeout": 0.2},
+            {"session_id": "background-writer", "command": command, "read_timeout": 0.5},
             "background-start",
         )
         self.assertTrue(started["success"])
@@ -285,7 +285,7 @@ class ToolRuntimeStabilityTests(unittest.TestCase):
 
         first = self.call("Read", {"file_path": "background.txt"}, "background-phase-one")
         self.assertIn("phase-one", first["content"])
-        time.sleep(0.45)
+        time.sleep(0.9)
         second = self.call("Read", {"file_path": "background.txt"}, "background-phase-two")
         self.assertIn("phase-two", second["content"])
         self.assertNotIn("phase-one", second["content"])
@@ -325,9 +325,8 @@ class ToolRuntimeStabilityTests(unittest.TestCase):
 
     def test_bash_timeout_keeps_partial_output_and_kills_descendants(self):
         command = (
-            "python3 -u -c \"import pathlib,time; "
-            "pathlib.Path('child-started').write_text('yes'); print('CHILD-READY', flush=True); "
-            "time.sleep(1); pathlib.Path('child-survived').write_text('bad')\" & wait"
+            "(sleep 1; printf bad > child-survived) & child=$!; "
+            "printf 'CHILD-READY\\n'; printf yes > child-started; wait \"$child\""
         )
         timed_out = self.call("Bash", {"command": command, "timeout": 0.25}, "bash-timeout-tree")
         self.assertFalse(timed_out["success"])
@@ -403,6 +402,7 @@ class ToolRuntimeStabilityTests(unittest.TestCase):
         contents = [written["content"]]
         if written["success"]:
             time.sleep(0.1)
+            gateway_builtin_tools._reap_expired_exec_sessions(now=time.time() + 2)
             written = self.call(
                 "write_stdin",
                 {"session_id": "stdin-fail", "chars": "", "read_timeout": 0.1},

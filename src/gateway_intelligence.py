@@ -33,8 +33,10 @@ class IntelligenceConfig:
     max_reflection_tokens: int = 500
     max_decomposition_parts: int = 5
     quality_threshold: float = 0.6
-    use_llm: bool = False  # Use real LLM calls when available (requires gateway_llm.py)
+    use_llm: bool = False
     llm_timeout: float = 15.0
+    provider: str = "gateway_upstream"
+    strict_mode: bool = False
 
 
 def _intelligence_config(raw: dict | None = None) -> IntelligenceConfig:
@@ -51,6 +53,8 @@ def _intelligence_config(raw: dict | None = None) -> IntelligenceConfig:
         quality_threshold=raw.get("quality_threshold", 0.6),
         use_llm=raw.get("use_llm", False),
         llm_timeout=raw.get("llm_timeout", 15.0),
+        provider=str(raw.get("provider") or "gateway_upstream"),
+        strict_mode=bool(raw.get("strict_mode", False)),
     )
 
 
@@ -99,12 +103,14 @@ def _analyze_question_rules(text: str) -> dict:
     }
 
 
-def _analyze_question_llm(text: str, context: str = "") -> dict | None:
+def _analyze_question_llm(text: str, context: str = "", *, strict: bool = False) -> dict | None:
     """LLM-powered question analysis."""
     try:
         from .gateway_llm import llm_analyze_question
         return llm_analyze_question(text, context)
     except Exception as exc:
+        if strict:
+            raise
         _logger.debug("LLM question analysis failed: %s", exc)
         return None
 
@@ -122,7 +128,12 @@ def _suggest_approach_for(domain: str, complexity: str, requires_tools: bool) ->
     return "Provide a well-structured, comprehensive answer"
 
 
-def _analyze_question(text: str, config: IntelligenceConfig | None = None) -> QuestionAnalysis:
+def _analyze_question(
+    text: str,
+    config: IntelligenceConfig | None = None,
+    *,
+    context: str = "",
+) -> QuestionAnalysis:
     """Analyze a user question using LLM with rule-based fallback."""
     if config is None:
         config = IntelligenceConfig()
@@ -132,7 +143,7 @@ def _analyze_question(text: str, config: IntelligenceConfig | None = None) -> Qu
 
     # Try LLM analysis first if enabled
     if config.use_llm:
-        llm_result = _analyze_question_llm(text)
+        llm_result = _analyze_question_llm(text, context, strict=config.strict_mode)
         if llm_result and isinstance(llm_result, dict) and llm_result.get("complexity"):
             source = "llm"
         else:
@@ -224,8 +235,10 @@ def assess_quality(answer: str, question: str = "", config: IntelligenceConfig |
                 result.overall = float(llm_result.get("score", result.overall))
                 result.issues = list(llm_result.get("issues", result.issues))
                 result.suggestions = list(llm_result.get("suggestions", result.suggestions))
-        except Exception:
-            pass
+        except Exception as exc:
+            if config.strict_mode:
+                raise
+            _logger.debug("LLM quality assessment failed: %s", exc)
 
     needs_ref = result.overall < config.quality_threshold
     return QualityAssessment(
@@ -274,6 +287,8 @@ def reflect_on_answer(
             if improved and len(improved) > len(answer) * 0.5:
                 return improved
         except Exception as exc:
+            if config.strict_mode:
+                raise
             _logger.debug("LLM reflection failed: %s", exc)
 
     # No refinement needed for good answers
@@ -460,7 +475,7 @@ def enhance_intelligence(
     context = _extract_conversation_context(messages)
 
     # Analyze the question (LLM + rules fallback)
-    analysis = _analyze_question(last_user_msg, config=config)
+    analysis = _analyze_question(last_user_msg, config=config, context=context)
 
     # Build enhanced system prompt
     system_prompt = None

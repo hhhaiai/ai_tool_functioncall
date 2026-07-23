@@ -364,36 +364,55 @@ status_service() {
 }
 
 verify_all() {
+  # The acceptance suite intentionally exercises local filesystem/shell tools and
+  # a loopback HTTP fixture. Keep the normal service defaults fail-closed and
+  # enable these capabilities only for the explicit trusted-local verify action.
+  export GATEWAY_EXECUTE_USER_SIDE_TOOLS="${GATEWAY_VERIFY_EXECUTE_USER_SIDE_TOOLS:-1}"
+  export GATEWAY_ALLOW_PRIVATE_NETWORK_TOOLS="${GATEWAY_VERIFY_ALLOW_PRIVATE_NETWORK_TOOLS:-1}"
+  export GATEWAY_VERIFY_ADMIN_USERNAME="${GATEWAY_VERIFY_ADMIN_USERNAME:-$(configured_value admin.username admin)}"
+  export GATEWAY_VERIFY_ADMIN_PASSWORD="${GATEWAY_VERIFY_ADMIN_PASSWORD:-${GATEWAY_ADMIN_PASSWORD:-admin}}"
+
   echo "== 1/5 compile + unit tests =="
   python3 -m py_compile "$ROOT_DIR/src/toolcall_gateway.py" "$ROOT_DIR/src/gateway_app.py" "$ROOT_DIR/src/gateway_builtin_tools.py" "$ROOT_DIR/tests/test_gateway.py" "$ROOT_DIR/tests/integration/"*.py
   local test_dir
+  local unit_status=0
   test_dir="$(mktemp -d)"
-  env \
-    -u UPSTREAM_BASE_URL -u UPSTREAM_API_KEY -u UPSTREAM_MODEL \
-    -u UPSTREAM_MAX_CONCURRENCY -u UPSTREAM_TIMEOUT \
-    -u UPSTREAM_MAX_INPUT_TOKENS -u UPSTREAM_MAX_OUTPUT_TOKENS \
-    -u DOWNSTREAM_API_KEY -u GATEWAY_DOWNSTREAM_KEY \
-    -u GATEWAY_TOOLS_ENABLED -u GATEWAY_TOOL_MODE \
-    -u GATEWAY_ALLOW_WRITE_TOOLS -u GATEWAY_ALLOW_SHELL_TOOLS \
-    -u GATEWAY_CONTEXT_ENABLED -u GATEWAY_CONTEXT_FANOUT_ENABLED \
-    -u GATEWAY_CONTEXT_MAX_INPUT_TOKENS -u GATEWAY_CONTEXT_FANOUT_CHUNK_TOKENS \
-    -u GATEWAY_CONTEXT_FANOUT_MAX_CHUNKS -u GATEWAY_CONTEXT_FANOUT_MAX_WORKERS \
-    -u GATEWAY_UPSTREAM_STREAM_AGGREGATE -u GATEWAY_MEMORY_ENABLED \
-    -u GATEWAY_LOGGING_BACKEND -u GATEWAY_REQUEST_LOGGING \
-    -u GATEWAY_MAX_CONCURRENT_REQUESTS -u GATEWAY_WORKSPACE_ROOT \
-    -u GATEWAY_SKILLS_DIRS -u GATEWAY_PUBLIC_BASE_URL \
-    -u GATEWAY_DOWNSTREAM_MODEL_ALIAS -u GATEWAY_REVIEW_MODEL_ALIAS \
-    -u GATEWAY_ADMIN_PASSWORD -u GATEWAY_ADMIN_PASSWORD_HASH \
-    -u GATEWAY_CLIENT_CONTEXT_WINDOW -u GATEWAY_CLIENT_AUTO_COMPACT_TOKEN_LIMIT \
-    -u GATEWAY_CLIENT_OUTPUT_TOKEN_LIMIT -u GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT \
-    -u GATEWAY_MAX_REQUEST_BODY_BYTES -u GATEWAY_MAX_LOG_PAYLOAD_CHARS \
-    -u GATEWAY_MAX_TOOL_ROUNDS -u GATEWAY_TOOL_MAX_RETRIES \
-    -u GATEWAY_READ_DEFAULT_LIMIT -u GATEWAY_ALLOW_FILE_LOGGING \
-    PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}" \
-    GATEWAY_CONFIG_PATH="$test_dir/config.json" \
-    GATEWAY_SQLITE_LOG_PATH="$test_dir/gateway.sqlite3" \
+  (
+    # Use a Bash subshell instead of PATH-resolved `env`; a user executable named
+    # `env` must not be able to skip or alter the authoritative unit-test stage.
+    unset \
+      UPSTREAM_BASE_URL UPSTREAM_API_KEY UPSTREAM_MODEL \
+      UPSTREAM_MAX_CONCURRENCY UPSTREAM_TIMEOUT \
+      UPSTREAM_MAX_INPUT_TOKENS UPSTREAM_MAX_OUTPUT_TOKENS \
+      DOWNSTREAM_API_KEY GATEWAY_DOWNSTREAM_KEY \
+      GATEWAY_TOOLS_ENABLED GATEWAY_TOOL_MODE \
+      GATEWAY_ALLOW_WRITE_TOOLS GATEWAY_ALLOW_SHELL_TOOLS \
+      GATEWAY_EXECUTE_USER_SIDE_TOOLS GATEWAY_ALLOW_PRIVATE_NETWORK_TOOLS \
+      GATEWAY_CONTEXT_ENABLED GATEWAY_CONTEXT_FANOUT_ENABLED \
+      GATEWAY_CONTEXT_MAX_INPUT_TOKENS GATEWAY_CONTEXT_FANOUT_CHUNK_TOKENS \
+      GATEWAY_CONTEXT_FANOUT_MAX_CHUNKS GATEWAY_CONTEXT_FANOUT_MAX_WORKERS \
+      GATEWAY_UPSTREAM_STREAM_AGGREGATE GATEWAY_MEMORY_ENABLED \
+      GATEWAY_LOGGING_BACKEND GATEWAY_REQUEST_LOGGING \
+      GATEWAY_MAX_CONCURRENT_REQUESTS GATEWAY_WORKSPACE_ROOT \
+      GATEWAY_SKILLS_DIRS GATEWAY_PUBLIC_BASE_URL \
+      GATEWAY_DOWNSTREAM_MODEL_ALIAS GATEWAY_REVIEW_MODEL_ALIAS \
+      GATEWAY_ADMIN_PASSWORD GATEWAY_ADMIN_PASSWORD_HASH \
+      GATEWAY_VERIFY_ADMIN_AUTH GATEWAY_VERIFY_ADMIN_USERNAME \
+      GATEWAY_VERIFY_ADMIN_PASSWORD \
+      GATEWAY_CLIENT_CONTEXT_WINDOW GATEWAY_CLIENT_AUTO_COMPACT_TOKEN_LIMIT \
+      GATEWAY_CLIENT_OUTPUT_TOKEN_LIMIT GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT \
+      GATEWAY_MAX_REQUEST_BODY_BYTES GATEWAY_MAX_LOG_PAYLOAD_CHARS \
+      GATEWAY_MAX_TOOL_ROUNDS GATEWAY_TOOL_MAX_RETRIES \
+      GATEWAY_READ_DEFAULT_LIMIT GATEWAY_ALLOW_FILE_LOGGING
+    export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+    export GATEWAY_CONFIG_PATH="$test_dir/config.json"
+    export GATEWAY_SQLITE_LOG_PATH="$test_dir/gateway.sqlite3"
     python3 -m unittest discover -s "$ROOT_DIR/tests" -v
-  rm -rf "$test_dir"
+  ) || unit_status=$?
+  rm -rf -- "$test_dir"
+  if [[ "$unit_status" -ne 0 ]]; then
+    return "$unit_status"
+  fi
   if ! curl -fsS "http://127.0.0.1:${PORT}/healthz" >/dev/null 2>&1; then start_background >/dev/null; fi
   local effective_key
   effective_key="$(configured_value gateway.client_snippet_api_key "${DOWNSTREAM_API_KEY:-local-gateway-key}")"
@@ -404,11 +423,18 @@ verify_all() {
   echo "== 4/5 concurrency/performance smoke =="
   "$ROOT_DIR/tests/integration/stress_gateway_concurrency.py" --base-url "http://127.0.0.1:${PORT}" --key "$effective_key" --workers "${GATEWAY_VERIFY_WORKERS:-16}" --direct-tool-requests "${GATEWAY_VERIFY_DIRECT_REQUESTS:-32}" --model-requests "${GATEWAY_VERIFY_MODEL_REQUESTS:-1}"
   echo "== 5/5 Claude/Codex project-scope smoke =="
-  local cli_args=()
-  if [[ "${GATEWAY_VERIFY_REQUIRE_CLI:-0}" == "1" || "${GATEWAY_VERIFY_REQUIRE_CLI:-0}" == "true" || "${GATEWAY_VERIFY_REQUIRE_CLI:-0}" == "yes" ]]; then
-    cli_args+=(--require-claude --require-codex)
-  fi
-  "$ROOT_DIR/tests/integration/project_scope_cli_smoke.py" "${cli_args[@]}"
+  (
+    # This stage verifies the production ownership boundary: project-local
+    # Skill requests are surfaced to Claude/Codex, not executed by the service.
+    unset GATEWAY_EXECUTE_USER_SIDE_TOOLS GATEWAY_ALLOW_PRIVATE_NETWORK_TOOLS
+    if [[ "${GATEWAY_VERIFY_REQUIRE_CLI:-0}" == "1" || "${GATEWAY_VERIFY_REQUIRE_CLI:-0}" == "true" || "${GATEWAY_VERIFY_REQUIRE_CLI:-0}" == "yes" ]]; then
+      "$ROOT_DIR/tests/integration/project_scope_cli_smoke.py" --require-claude --require-codex
+    else
+      # Bash 3.2 treats expansion of an empty array as an unbound variable when
+      # nounset is enabled, so keep the no-argument path explicit.
+      "$ROOT_DIR/tests/integration/project_scope_cli_smoke.py"
+    fi
+  )
 }
 
 case "$ACTION" in

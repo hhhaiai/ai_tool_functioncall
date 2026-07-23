@@ -16,7 +16,15 @@ import urllib.request
 from typing import Any, Optional
 from html.parser import HTMLParser
 
+from .gateway_errors import BadRequestError, GatewayError
+from .gateway_http_actions import _http_action_opener, _validate_action_url
+
 Json = dict[str, Any]
+WEB2API_PATHS = {"/v1/web2api", "/api/web2api"}
+
+
+class Web2APIError(GatewayError):
+    status = 502
 
 
 class SimpleHTMLExtractor(HTMLParser):
@@ -171,6 +179,8 @@ class Web2ApiEngine:
         request_timeout: int = 30,
         max_content_bytes: int = 5 * 1024 * 1024,  # 5MB
         user_agent: str = "Gateway-Web2API/1.0",
+        allow_private_network: bool = False,
+        max_cache_entries: int = 256,
     ):
         self.enabled = enabled
         self.max_concurrent = max_concurrent
@@ -178,10 +188,13 @@ class Web2ApiEngine:
         self.request_timeout = request_timeout
         self.max_content_bytes = max_content_bytes
         self.user_agent = user_agent
+        self.allow_private_network = bool(allow_private_network)
+        self.max_cache_entries = max(1, int(max_cache_entries))
 
         self._cache: dict[str, tuple[float, dict]] = {}
         self._cache_lock = threading.Lock()
         self._semaphore = threading.Semaphore(max_concurrent)
+        self._stats_lock = threading.Lock()
 
         # Stats
         self._requests = 0
@@ -191,13 +204,16 @@ class Web2ApiEngine:
     @property
     def stats(self) -> dict[str, Any]:
         """Get engine statistics."""
-        return {
-            "enabled": self.enabled,
-            "requests": self._requests,
-            "cache_hits": self._cache_hits,
-            "errors": self._errors,
-            "cache_entries": len(self._cache),
-        }
+        with self._cache_lock, self._stats_lock:
+            return {
+                "enabled": self.enabled,
+                "requests": self._requests,
+                "cache_hits": self._cache_hits,
+                "errors": self._errors,
+                "cache_entries": len(self._cache),
+                "max_cache_entries": self.max_cache_entries,
+                "allow_private_network": self.allow_private_network,
+            }
 
     def _make_cache_key(self, url: str, selectors: dict | None = None) -> str:
         """Create cache key from URL and selectors."""
@@ -212,8 +228,9 @@ class Web2ApiEngine:
             if cache_key in self._cache:
                 timestamp, result = self._cache[cache_key]
                 if time.time() - timestamp < self.cache_ttl_seconds:
-                    self._cache_hits += 1
-                    return result
+                    with self._stats_lock:
+                        self._cache_hits += 1
+                    return dict(result)
                 else:
                     del self._cache[cache_key]
         return None
@@ -231,6 +248,9 @@ class Web2ApiEngine:
             ]
             for k in expired:
                 del self._cache[k]
+            while len(self._cache) > self.max_cache_entries:
+                oldest = min(self._cache, key=lambda item: self._cache[item][0])
+                del self._cache[oldest]
 
     def fetch_page(self, url: str) -> dict[str, Any]:
         """Fetch a web page and return raw content.
@@ -245,15 +265,24 @@ class Web2ApiEngine:
         if not self.enabled:
             return {"error": "Web2API is disabled", "success": False}
 
-        self._requests += 1
+        with self._stats_lock:
+            self._requests += 1
 
         # Validate URL
-        parsed = urllib.parse.urlparse(url)
-        if parsed.scheme not in ("http", "https"):
-            return {"error": f"Invalid URL scheme: {parsed.scheme}", "success": False}
+        action = {"allow_private_network": self.allow_private_network}
+        try:
+            _validate_action_url(url, action)
+        except Exception as exc:
+            with self._stats_lock:
+                self._errors += 1
+            return {
+                "error": str(exc),
+                "failure_type": "invalid_url",
+                "success": False,
+            }
 
         # Acquire semaphore for concurrency control
-        acquired = self._semaphore.acquire(timeout=30)
+        acquired = self._semaphore.acquire(timeout=max(0.1, float(self.request_timeout)))
         if not acquired:
             return {"error": "Too many concurrent requests", "success": False}
 
@@ -267,22 +296,41 @@ class Web2ApiEngine:
                 },
             )
 
-            with urllib.request.urlopen(req, timeout=self.request_timeout) as resp:
+            with _http_action_opener(action).open(req, timeout=self.request_timeout) as resp:
                 # Check content length
                 content_length = resp.headers.get("Content-Length")
-                if content_length and int(content_length) > self.max_content_bytes:
-                    return {
-                        "error": f"Content too large: {content_length} bytes",
-                        "success": False,
-                    }
-
-                html_bytes = resp.read(self.max_content_bytes)
+                try:
+                    declared_length = int(content_length) if content_length else 0
+                except (TypeError, ValueError):
+                    declared_length = 0
+                if declared_length > self.max_content_bytes:
+                    raise Web2APIError(
+                        f"Content too large: {declared_length} bytes",
+                        detail={"max_content_bytes": self.max_content_bytes},
+                    )
+                content_type = str(resp.headers.get("Content-Type", ""))
+                media_type = content_type.split(";", 1)[0].strip().lower()
+                if media_type and not (
+                    media_type.startswith("text/")
+                    or media_type in {"application/xhtml+xml", "application/xml", "application/json"}
+                    or media_type.endswith("+xml")
+                ):
+                    raise Web2APIError(
+                        f"Unsupported content type: {media_type}",
+                        detail={"content_type": media_type},
+                    )
+                html_bytes = resp.read(self.max_content_bytes + 1)
+                if len(html_bytes) > self.max_content_bytes:
+                    raise Web2APIError(
+                        f"Content exceeded max_content_bytes={self.max_content_bytes}",
+                        detail={"max_content_bytes": self.max_content_bytes},
+                    )
                 html = html_bytes.decode("utf-8", errors="replace")
 
                 return {
                     "url": resp.url,  # Final URL after redirects
                     "status": resp.status,
-                    "content_type": resp.headers.get("Content-Type", ""),
+                    "content_type": content_type,
                     "html": html,
                     "text": _extract_text_content(html),
                     "title": _extract_title(html),
@@ -290,14 +338,17 @@ class Web2ApiEngine:
                 }
 
         except urllib.error.HTTPError as e:
-            self._errors += 1
-            return {"error": f"HTTP {e.code}: {e.reason}", "success": False}
+            with self._stats_lock:
+                self._errors += 1
+            return {"error": f"HTTP {e.code}: {e.reason}", "failure_type": "http_error", "success": False}
         except urllib.error.URLError as e:
-            self._errors += 1
-            return {"error": f"URL error: {e.reason}", "success": False}
+            with self._stats_lock:
+                self._errors += 1
+            return {"error": f"URL error: {e.reason}", "failure_type": "transport_error", "success": False}
         except Exception as e:
-            self._errors += 1
-            return {"error": str(e), "success": False}
+            with self._stats_lock:
+                self._errors += 1
+            return {"error": str(e), "failure_type": "fetch_failed", "success": False}
         finally:
             self._semaphore.release()
 
@@ -446,6 +497,11 @@ def get_web2api_engine() -> Web2ApiEngine:
                     enabled=w2a_config.get("enabled", True),
                     max_concurrent=w2a_config.get("max_concurrent", 5),
                     cache_ttl_seconds=w2a_config.get("cache_ttl_seconds", 300),
+                    request_timeout=w2a_config.get("request_timeout", 30),
+                    max_content_bytes=w2a_config.get("max_content_bytes", 5 * 1024 * 1024),
+                    user_agent=str(w2a_config.get("user_agent") or "Gateway-Web2API/1.0"),
+                    allow_private_network=bool(w2a_config.get("allow_private_network", False)),
+                    max_cache_entries=w2a_config.get("max_cache_entries", 256),
                 )
 
     return _engine
@@ -456,3 +512,80 @@ def reset_engine() -> None:
     global _engine
     with _engine_lock:
         _engine = None
+
+
+def _bounded_string_mapping(value: Any, *, name: str, max_fields: int, max_value_chars: int) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise BadRequestError(f"{name} must be an object")
+    if len(value) > max_fields:
+        raise BadRequestError(f"{name} exceeds maximum field count {max_fields}")
+    result: dict[str, str] = {}
+    for raw_key, raw_value in value.items():
+        key = str(raw_key).strip()
+        item = str(raw_value)
+        if not key or len(key) > 128:
+            raise BadRequestError(f"{name} contains an invalid field name")
+        if not item or len(item) > max_value_chars:
+            raise BadRequestError(f"{name}.{key} is empty or too long")
+        result[key] = item
+    return result
+
+
+def execute_web2api_request(body: Json) -> Json:
+    """Validate and execute one authenticated HTTP Web2API request."""
+    from .gateway_config import load_config
+
+    cfg = load_config()
+    raw = cfg.get("web2api") if isinstance(cfg.get("web2api"), dict) else {}
+    if not bool(raw.get("enabled", True)):
+        raise Web2APIError("Web2API is disabled", detail={"enabled": False})
+    url = str(body.get("url") or "").strip()
+    if not url:
+        raise BadRequestError("missing required field: url")
+    mode = str(body.get("extraction_mode") or "auto").strip().lower()
+    if mode not in {"auto", "css", "regex"}:
+        raise BadRequestError("extraction_mode must be auto, css, or regex")
+    selectors = _bounded_string_mapping(
+        body.get("selectors"),
+        name="selectors",
+        max_fields=50,
+        max_value_chars=256,
+    )
+    regex_patterns = _bounded_string_mapping(
+        body.get("regex_patterns"),
+        name="regex_patterns",
+        max_fields=20,
+        max_value_chars=512,
+    )
+    if regex_patterns and not bool(raw.get("allow_regex", False)):
+        raise BadRequestError("regex extraction is disabled by the operator")
+    include_raw_html = bool(body.get("include_raw_html", False))
+    if include_raw_html and not bool(raw.get("allow_raw_html", False)):
+        raise BadRequestError("raw HTML responses are disabled by the operator")
+    result = get_web2api_engine().extract_structured(
+        url,
+        selectors=selectors or None,
+        regex_patterns=regex_patterns or None,
+        extraction_mode=mode,
+        include_raw_html=include_raw_html,
+        include_links=bool(body.get("include_links", False)),
+    )
+    if not result.get("success"):
+        failure_type = str(result.get("failure_type") or "fetch_failed")
+        if failure_type == "invalid_url":
+            raise BadRequestError(str(result.get("error") or "invalid Web2API URL"), detail=result)
+        raise Web2APIError(str(result.get("error") or "Web2API fetch failed"), detail=result)
+    return {"object": "gateway.web2api.result", **result}
+
+
+__all__ = [
+    "SimpleHTMLExtractor",
+    "WEB2API_PATHS",
+    "Web2APIError",
+    "Web2ApiEngine",
+    "execute_web2api_request",
+    "get_web2api_engine",
+    "reset_engine",
+]

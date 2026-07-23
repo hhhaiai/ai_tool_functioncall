@@ -361,7 +361,8 @@ def run_streaming_orchestration(
     try:
         gateway_cfg = _gateway_config()
         mode = str(os.environ.get("GATEWAY_TOOL_MODE") or gateway_cfg.get("tool_mode") or "orchestrate").lower()
-        upstream_protocol = _upstream_protocol()
+        upstream = NativeProxyClient()
+        upstream_protocol = str(getattr(upstream, "protocol", "") or _upstream_protocol())
 
         if mode in {"passthrough", "native_passthrough", "proxy"}:
             _stream_upstream_passthrough(handler, path, body)
@@ -377,7 +378,7 @@ def run_streaming_orchestration(
                 upstream_protocol=upstream_protocol,
                 gateway_cfg=gateway_cfg,
                 max_rounds=_configured_max_tool_rounds(gateway_cfg),
-                upstream=NativeProxyClient(),
+                upstream=upstream,
                 context_cfg=_context_config(),
                 client_id=client_id,
             )
@@ -495,6 +496,8 @@ def _run_streaming_orchestration_scoped(
                         _msgs[0]["content"] = _ex + "\n\n" + _enhancement
                     request_body["messages"] = _msgs
     except Exception as _exc:
+        if "_icfg" in locals() and getattr(_icfg, "strict_mode", False):
+            raise
         _logger.debug("Intelligence enhancement skipped: %s", _exc)
 
     # Keep the internal planner/runtime envelope for local synthesis guards and

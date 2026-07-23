@@ -11,7 +11,12 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from gateway_cache import SemanticCache, ToolResultCache, LocalEmbeddingProvider
-from gateway_persistence import init_persistence, close_persistence, PersistenceConfig
+from gateway_persistence import (
+    PersistenceConfig,
+    clear_persistent_caches,
+    close_persistence,
+    init_persistence,
+)
 
 
 class TestCachePersistence(unittest.TestCase):
@@ -158,6 +163,27 @@ class TestCachePersistence(unittest.TestCase):
         cache2 = ToolResultCache(ttl_seconds=60, persistent=True, persist_local_results=True)
         self.assertIsNone(cache2.get("Read", args_a))
         self.assertEqual(cache2.get("Read", args_b), "B")
+
+    def test_clear_persistent_caches_removes_both_cache_tables_atomically(self):
+        semantic = SemanticCache(
+            embedding_provider=LocalEmbeddingProvider(),
+            persistent=True,
+        )
+        tools = ToolResultCache(
+            ttl_seconds=60,
+            persistent=True,
+            persist_local_results=True,
+        )
+        semantic.put("question", {"answer": "cached"})
+        tools.put("Read", {"file_path": "cached.txt"}, "cached file")
+
+        cleared = clear_persistent_caches(strict=True)
+
+        self.assertEqual(cleared, {"semantic": 1, "tools": 1})
+        with sqlite3.connect(self.db_path) as conn:
+            semantic_count = conn.execute("SELECT COUNT(*) FROM semantic_cache").fetchone()[0]
+            tool_count = conn.execute("SELECT COUNT(*) FROM tool_cache").fetchone()[0]
+        self.assertEqual((semantic_count, tool_count), (0, 0))
 
     def test_v4_tool_cache_migration_adds_scope_and_drops_opaque_rows(self):
         close_persistence()

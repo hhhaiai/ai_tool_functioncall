@@ -22,6 +22,7 @@ from typing import Any, Iterable, Mapping, Sequence
 SANDBOX_CONTRACT_VERSION = "gateway-sandbox-job-v1"
 SANDBOX_WORKER_SETUP_EXIT = 125
 SANDBOX_WORKER_ERROR_PREFIX = "gateway sandbox worker setup failed:"
+SANDBOX_WORKER_READY_FD_ENV = "GATEWAY_SANDBOX_WORKER_READY_FD"
 
 _BASE_ENV_ALLOWLIST = {
     "COLORTERM",
@@ -455,6 +456,7 @@ def workspace_job(
 __all__ = [
     "SANDBOX_CONTRACT_VERSION",
     "SANDBOX_WORKER_ERROR_PREFIX",
+    "SANDBOX_WORKER_READY_FD_ENV",
     "SANDBOX_WORKER_SETUP_EXIT",
     "SandboxDiffEntry",
     "SandboxJob",

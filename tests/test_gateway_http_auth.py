@@ -152,6 +152,9 @@ def test_invalid_admin_credentials_fail_closed_with_basic_challenge(
         ("/anthropic/v1/messages", "messages"),
         ("/v1/tools/call", "direct_tools"),
         ("/v1/functions/call", "direct_tools"),
+        ("/v1/assistants", "assistants"),
+        ("/v1/threads/thread_1/messages", "assistants"),
+        ("/v1/web2api", "web2api"),
     ],
 )
 def test_downstream_route_contract(path: str, expected: str) -> None:
@@ -241,6 +244,42 @@ def test_models_route_is_compatible_with_conversation_protocol_key(
     ) == "client-stable-id"
 
 
+def test_assistants_route_accepts_explicit_or_conversation_protocol_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_downstream_config(
+        monkeypatch,
+        [
+            _entry("assistant-key", protocols=["assistants"]),
+            _entry("messages-key", protocols=["messages"], client_id="messages-client"),
+        ],
+    )
+    assert http_auth.check_downstream_key(
+        _Handler("/v1/assistants", {"Authorization": "Bearer assistant-key"})
+    ) == "client-stable-id"
+    assert http_auth.check_downstream_key(
+        _Handler("/v1/threads/thread_1/messages", {"Authorization": "Bearer messages-key"})
+    ) == "messages-client"
+
+
+def test_web2api_route_accepts_explicit_or_direct_tool_protocol_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_downstream_config(
+        monkeypatch,
+        [
+            _entry("web-key", protocols=["web2api"]),
+            _entry("tool-key", protocols=["direct_tools"], client_id="tool-client"),
+        ],
+    )
+    assert http_auth.check_downstream_key(
+        _Handler("/v1/web2api", {"Authorization": "Bearer web-key"})
+    ) == "client-stable-id"
+    assert http_auth.check_downstream_key(
+        _Handler("/api/web2api", {"Authorization": "Bearer tool-key"})
+    ) == "tool-client"
+
+
 def test_protocol_acl_denies_wrong_route_after_valid_authentication(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -278,4 +317,3 @@ def test_handler_and_facade_keep_authentication_entrypoints() -> None:
 
     assert gateway_app._check_admin is gateway_http_handler._check_admin
     assert gateway_app._check_downstream_key is gateway_http_handler._check_downstream_key
-

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import urllib.error
 import urllib.request
 from typing import Any
@@ -41,13 +42,26 @@ def request(method: str, url: str, *, key: str | None = None, admin: str | None 
         return exc.code, parsed
 
 
+def resolve_admin_auth(cli_value: str | None = None) -> str:
+    """Resolve verification credentials without putting a password in argv."""
+    if cli_value:
+        return cli_value
+    combined = os.environ.get("GATEWAY_VERIFY_ADMIN_AUTH", "").strip()
+    if combined:
+        return combined
+    username = os.environ.get("GATEWAY_VERIFY_ADMIN_USERNAME", "").strip() or "admin"
+    password = os.environ.get("GATEWAY_VERIFY_ADMIN_PASSWORD") or os.environ.get("GATEWAY_ADMIN_PASSWORD") or "admin"
+    return f"{username}:{password}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:8885")
     parser.add_argument("--key", default="local-gateway-key")
-    parser.add_argument("--admin", default="admin:admin")
+    parser.add_argument("--admin", default=None, help="Admin username:password; prefer GATEWAY_VERIFY_ADMIN_* env vars")
     args = parser.parse_args()
     base = args.base_url.rstrip("/")
+    admin_auth = resolve_admin_auth(args.admin)
     checks: list[dict[str, Any]] = []
 
     def add(name: str, ok: bool, detail: Any) -> None:
@@ -56,7 +70,7 @@ def main() -> int:
     status, body = request("GET", base + "/client-config")
     add("admin_client_config_requires_auth", status == 401, {"status": status, "body": str(body)[:200]})
 
-    status, body = request("GET", base + "/admin/config.json", admin=args.admin)
+    status, body = request("GET", base + "/admin/config.json", admin=admin_auth)
     add("admin_config_auth_ok", status == 200 and isinstance(body, dict) and "config" in body, {"status": status})
 
     status, body = request("POST", base + "/v1/tools/call", payload={"tool": "calculator", "arguments": {"expression": "1+1"}})
@@ -74,7 +88,7 @@ def main() -> int:
     status, body = request("POST", base + "/v1/tools/call", key=args.key, payload={"tool": "DeletePath", "arguments": {"path": ".", "recursive": True}})
     add("destructive_delete_workspace_root_denied", status == 200 and isinstance(body, dict) and body.get("success") is False and body.get("failure_type") == "permission_denied", body)
 
-    status, body = request("GET", base + "/client-config.json", admin=args.admin)
+    status, body = request("GET", base + "/client-config.json", admin=admin_auth)
     redacted_safe = status == 200 and isinstance(body, dict) and "codex_config_toml" in body and "claude_bash_profile_function" in body
     add("client_config_generation_ok", redacted_safe, {"status": status, "keys": list(body.keys()) if isinstance(body, dict) else None})
 
