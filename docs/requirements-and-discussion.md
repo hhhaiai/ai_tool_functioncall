@@ -3,6 +3,8 @@
 **日期：** 2026-05-16
 **状态：** 进行中
 
+> 历史需求快照：本文件保留早期讨论、当时的脚本集合和实现假设；当前运行与能力说明见 [`README.md`](../README.md)、[`文档中心`](README.md) 和 [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md)。
+
 ---
 
 ## 1. 项目定位
@@ -139,6 +141,7 @@ python3 -m unittest discover -s tests -v
 ```
 <function=Glob>
 <parameter=pattern>**/*.py
+```
 
 ## 2026-05-16 更新：SQLite 记忆与更多真实 tools
 

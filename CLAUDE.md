@@ -1,6 +1,8 @@
 # Gateway 项目进度跟踪
 
-> 最后更新: 2026-07-05
+> 文档属性：历史开发进度日志。本文大量内容按日期追加，旧测试数字、文件数量和 TODO 是当时快照，不是当前状态。
+>
+> 当前事实请优先查看 [`README.md`](README.md)、[`docs/README.md`](docs/README.md)、[`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) 顶部校准，并以 `GET /capabilities` 为机器可读准绳。最近一次全量 pytest（2026-07-24）为 `1492 passed, 2 skipped`。
 
 ## 项目概述
 
@@ -196,7 +198,7 @@ AI Gateway 中游服务 - 将各种上游 API（不支持/部分支持 tool call
 
 ### 2026-06-26: Chat-only 真实上游适配到 Codex / Claude Code 原生工具协议
 
-**目标确认**: 上游 `http://47.85.40.209:8885` 只按普通对话稳定工作；实测会接受 `tools` 字段但忽略工具，不返回协议级 `tool_calls/function_call/tool_use`。Gateway 必须在外层补齐真实协议字段，让 Codex / Claude Code 像连接原生 tools 模型一样执行本地文件、shell、skills 等用户侧工具。
+**目标确认**: 当时的真实测试上游（地址省略）只按普通对话稳定工作；实测会接受 `tools` 字段但忽略工具，不返回协议级 `tool_calls/function_call/tool_use`。Gateway 必须在外层补齐真实协议字段，让 Codex / Claude Code 像连接原生 tools 模型一样执行本地文件、shell、skills 等用户侧工具。
 
 **本轮实现/配置:**
 - ✅ 上游能力已实测：`/v1/models`、`/v1/chat/completions`、`/v1/responses`、`/v1/messages`、三类 stream 均可用；native tools/function calls 不可用。
@@ -329,7 +331,7 @@ python3 -m pytest -q
 assert "anonymous_spaces" in str(_request_workspace_root({}))  # ✓ SECURE
 ```
 
-详见：[SECURITY_FIX_WORKSPACE.md](SECURITY_FIX_WORKSPACE.md)
+详见：[docs/archive/SECURITY_FIX_WORKSPACE.md](docs/archive/SECURITY_FIX_WORKSPACE.md)
 
 ---
 
@@ -356,7 +358,7 @@ assert "anonymous_spaces" in str(_request_workspace_root({}))  # ✓ SECURE
 - ✅ 客户端（Claude Code/Codex）自动发送工作目录，无需配置
 - ✅ 向后兼容，现有客户端无需修改
 
-详见：[FIX_WORKSPACE_ROOT.md](FIX_WORKSPACE_ROOT.md)
+详见：[docs/archive/FIX_WORKSPACE_ROOT.md](docs/archive/FIX_WORKSPACE_ROOT.md)
 
 ---
 

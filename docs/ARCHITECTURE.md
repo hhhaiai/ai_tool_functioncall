@@ -1,8 +1,10 @@
 # Gateway 架构文档
 
+> 最后校准：2026-07-24。文档导航和历史资料边界见 [`文档中心`](README.md)；机器可读运行时能力以 `GET /capabilities` 为准。
+
 > 真实测试上游 / Mimo 作为上游时默认按 **Gateway adapter** 处理：`tools_enabled=adapter`，`supports_tools=false`，`supports_function_calls=false`。真实地址只放本地 `.gateway_service.json`、`.env` 或运行时环境变量，不写入提交代码。当前探针显示 `/v1/messages` 在 forced tool_choice 下可返回 Anthropic `tool_use`，但上游直连没有 `/anthropic` 别名、没有 `/v1/tools/call` / `/v1/functions/call`，且 `/v1/responses` forced tool probe 未返回 Codex 需要的 `function_call`。因此 Claude Code/Codex 不直连该上游执行工具，而是连接 Gateway：Gateway-owned 工具（HTTP Action/MCP/WebFetch/WebSearch/calculator/Memory 等）由 Gateway 真执行；用户侧机器工具（Read/LS/Bash/Skill/GUI/local agent 等）由 Gateway 转成下游原生 tool request，让客户端在用户机器执行后回传结果。Mimo 上下文按 `1048576` tokens（1M）配置。
 
-> 当前产品边界：Assistants / Threads 由 Gateway-owned SQLite 提供 assistants、threads、messages、runs、run steps、cancel 和 `submit_tool_outputs` 生命周期；Run 为同步编排，不宣称 Run SSE streaming。Web2API 已接入 `/v1/web2api`、`/api/web2api`、`/anthropic/v1/web2api`。生产多上游选择、熔断和安全故障转移由 `gateway_upstream_pool.py` 接入 canonical proxy path；流式首事件输出后固定 provider。机器可读状态以 `GET /capabilities` 为准。
+> 当前产品边界：Assistants / Threads 由 Gateway-owned SQLite 提供 assistants、threads、messages、runs、run steps、cancel 和 `submit_tool_outputs` 生命周期；Run 为同步编排，不宣称 Run SSE streaming。Web2API 已接入 `/v1/web2api`、`/api/web2api`、`/anthropic/v1/web2api`。生产多上游选择、熔断和非流式跨 profile 故障转移由 `gateway_upstream_pool.py` 接入 canonical proxy path；SSE 使用已选 profile，首事件前仅在该 profile 内重试，当前不跨 profile，首事件输出后也不重放。机器可读状态以 `GET /capabilities` 为准。
 
 ## 1. 系统定位
 
@@ -127,7 +129,7 @@ src/
 │   ├── OpenAI Chat ↔ OpenAI Responses
 │   └── 工具格式互转
 ├── gateway_proxy.py           # 上游 HTTP 客户端
-├── gateway_upstream_pool.py   # 生产多上游选择、熔断、恢复和故障转移
+├── gateway_upstream_pool.py   # 生产多上游选择、熔断、恢复和非流式故障转移
 ├── gateway_context.py         # 上下文压缩/记忆 ⭐
 │   ├── Token 估算
 │   ├── 消息压缩/摘要
@@ -146,20 +148,28 @@ src/
 ├── gateway_mcp.py             # MCP 协议支持
 ├── gateway_http_actions.py    # HTTP Action 支持
 ├── gateway_admin.py           # Admin UI 渲染
+├── gateway_admin_api.py       # revision-aware Config/stats/cache/status API
 ├── gateway_http_handler.py    # HTTP 入口处理
+├── gateway_http_auth.py       # 下游与 Admin 鉴权
+├── gateway_http_io.py         # 有界请求读取与响应写出
+├── gateway_http_security.py   # CORS、Origin 与公开监听安全约束
+├── gateway_admission.py       # 跨进程 SQLite 请求准入 lease
+├── gateway_request_admission.py # HTTP 请求准入上下文
+├── gateway_rate_limit.py      # 下游 key 共享限流
+├── gateway_logging.py         # 主 HTTP 请求/工具统计、请求日志和失败记录
 ├── gateway_cache.py           # 语义缓存 ⭐
 │   ├── LocalEmbeddingProvider (字符 trigram + 词频)
 │   ├── SemanticCache (余弦相似度匹配)
 │   └── ToolResultCache (确定性工具缓存)
-├── gateway_intelligence.py    # 智力提升 ⭐
-│   ├── 问题分析 (复杂度/领域/工具需求)
-│   ├── 反思机制 (反思提示生成)
-│   └── 质量评估 (完整性/相关性/清晰度)
+├── gateway_intelligence.py    # 请求前 Intelligence + 库级 helper ⭐
+│   ├── 已接线：问题分析 (复杂度/领域/工具需求)
+│   ├── 已接线：反思提示生成并注入同一次主回答
+│   └── 未接响应链：质量评估/二次反思 helper
 ├── gateway_llm.py             # 可插拔 Intelligence LLM provider registry
-├── gateway_stats.py           # Q&A 统计 ⭐
-│   ├── 请求/工具/缓存/质量统计
+├── gateway_stats.py           # 辅助 Q&A 统计库和 dashboard 数据源
+│   ├── 请求/工具/缓存/质量/upstream writer API
 │   ├── SQLite 持久化
-│   └── 仪表板/趋势/导出
+│   └── 仪表板/趋势/导出；主 HTTP 自动采集由 gateway_logging.py 负责
 ├── gateway_concurrency.py     # 兼容并发/连接池库；生产 profile 路由使用 gateway_upstream_pool
 │   ├── ConnectionPool (连接池)
 │   ├── LoadBalancer (负载均衡)
@@ -171,8 +181,10 @@ src/
 ├── gateway_web_config.py      # Web 配置 UI
 │   ├── Tab 式配置界面 (9 个标签页)
 │   └── 配置 Schema + 更新 API
-├── gateway_admin_api.py       # Config/stats/cache/upstream/intelligence Admin API
 ├── gateway_assistants.py      # Assistants/Threads/messages/runs/steps SQLite 生命周期
+├── gateway_persistence.py     # 语义缓存、工具缓存等持久化入口
+├── gateway_sqlite.py          # 共享 SQLite 初始化与安全设置
+├── gateway_maintenance.py     # 有界保留、清理和 incremental vacuum
 └── gateway_claude_compat.py   # Claude Code 兼容层
     ├── 工具定义 (Read/Write/Edit/Bash/Glob/Grep/WebFetch/WebSearch)
     └── 格式化工具 (tool_result/tool_use)
@@ -203,7 +215,7 @@ src/
         │
         ▼
 ┌───────────────────┐
-│ gateway_proxy     │  ← 向上游发起请求（含重试、profile pool 和安全故障转移）
+│ gateway_proxy     │  ← 向上游发起请求（单 profile 重试；非流式可跨 profile）
 └───────────────────┘
         │
    ┌────┴────┐
@@ -308,6 +320,8 @@ Token 估算 (body_token_estimate)
 }
 ```
 
+当前 production call site 位于非流式和流式 canonical orchestration 的上游请求之前。规则或 LLM provider 负责问题分析，并把增强 system prompt 与 reflection prompt 注入同一次主回答请求。`reflection_enabled` 不表示响应完成后会再调用一次 LLM；`assess_quality()`、`reflect_on_answer()`、`llm_assess_quality()` 和 `llm_reflect()` 目前属于库级 API/单元测试能力，尚未接入自动响应后处理。
+
 ### 统计配置
 
 ```json
@@ -318,6 +332,8 @@ Token 估算 (body_token_estimate)
   }
 }
 ```
+
+主 HTTP 请求、工具调用和失败日志由 `gateway_logging.py` 自动采集。`gateway_stats.py` 是独立的辅助统计库；`/api/stats/dashboard` 同时返回主 HTTP snapshot 和该库的 dashboard/trend/top 数据。辅助的 cache、quality、upstream writer API 已实现，但生产 HTTP 链不会自动填充所有辅助表，因此空的辅助指标不能解释为对应请求从未发生。
 
 ## 8. 下游兼容
 

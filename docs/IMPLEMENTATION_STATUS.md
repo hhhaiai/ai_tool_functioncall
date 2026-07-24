@@ -7,13 +7,14 @@
 - OpenAI Chat、OpenAI Responses、Anthropic Messages 是当前完整编排路径。
 - Assistants / Threads 已升级为按认证下游 client 隔离的 Gateway-owned SQLite 生命周期，支持 assistants、threads、messages、runs、run steps、cancel 和 `submit_tool_outputs`；Run 当前为同步编排，不宣称 SSE Run streaming。
 - Web2API 已接入 `/v1/web2api`、`/api/web2api`、`/anthropic/v1/web2api`，并纳入认证、ACL、限流、准入、日志、SSRF/redirect 重检和大小边界。
-- 多上游由 `gateway_upstream_pool.py` 接入 canonical proxy path，支持 round-robin、least-connections、random、熔断恢复和安全故障转移；流式开始输出后不会切换 provider。
-- `gateway_llm.py` 提供真实可插拔 intelligence provider registry；内置 `gateway_upstream` 复用 Gateway 上游凭据和 profile pool。默认 `use_llm=false`，非 strict 失败回退规则，strict 模式明确失败。
-- `/ui/config` 是 canonical 9-Tab Config Center；配置、schema、stats、cache、upstream pool 和 intelligence 状态 API 都使用 Admin Basic Auth，写操作另要求 same-origin 并使用 revision 乐观并发控制。
+- 多上游由 `gateway_upstream_pool.py` 接入 canonical proxy path，支持 round-robin、least-connections、random、熔断恢复，以及非流式 429/502/503/504/timeout 的跨 profile 故障转移。SSE 只在选中的 profile 内做首事件前有界重试，当前不跨 profile；首事件输出后不重放。
+- `gateway_llm.py` 提供真实可插拔 intelligence provider registry；内置 `gateway_upstream` 复用 Gateway 上游凭据和 profile pool。production 接线只做请求前问题分析和 prompt enhancement；响应后的自动质量评分、独立二次反思或答案重写尚未接线。默认 `use_llm=false`，非 strict 失败回退规则，strict 模式明确失败。
+- `/ui/config` 是 canonical 9-Tab Config Center；配置、schema、stats、cache、upstream pool 和 intelligence 状态 API 都使用 Admin Basic Auth，写操作另要求 same-origin 并使用 revision 乐观并发控制。状态 API 已实现，但 Config Center 页面当前不会自动加载或渲染它们。
 - 权威机器可读状态是 `GET /capabilities`；下方较早日期的历史记录用于追溯，不覆盖当前能力声明。
 - 当前机器可读公开面包含 24 条路径，Gateway registry 包含 67 个唯一 built-in tools。
-- 最终 clean-env CI 已通过 Ruff、17 个模块的 Mypy、Bandit、依赖一致性/漏洞审计、`1492 passed, 2 skipped`、两套 Compose 渲染和 Docker 构建/删除。官方 `mimo_gateway.sh verify` 五阶段、Agent Planner acceptance、容器运行 smoke 和隔离 mock-upstream E2E 均通过。
-- 本地 ignored 配置的真实上游 `/v1/models` 可用，但 `/v1/chat/completions` 由提供方返回 401；直接绕过 Gateway 请求得到相同结果。该项属于当前外部凭据失效，不是 Gateway 路由/协议实现缺口；取得有效凭据后仍应补跑 live chat 证明。
+- 最终 clean-env CI 已通过 Ruff、17 个模块的 Mypy、Bandit、依赖一致性/漏洞审计、`1492 passed, 2 skipped`、两套 Compose 渲染和 Docker 构建/删除。官方 `mimo_gateway.sh verify` 五阶段、容器运行 smoke 和隔离 mock-upstream E2E 均有通过记录。
+- 本轮重新执行 `agent_planner_acceptance.sh --full` 时，integration smoke 与 focused gate `92 passed`；随后脚本把 `GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN=0` 带入整个全量 pytest，导致两个验证默认值为 `true` 的 config-sync 测试失败，结果为 `1490 passed, 2 failed, 2 skipped`。这是验收脚本环境隔离问题，不能记作 full gate 通过；clean-env pytest 必须单独记录。
+- 2026-07-24 上一次本地 ignored 配置 live probe 中，真实上游 `/v1/models` 可用，但 `/v1/chat/completions` 由提供方返回 401；直接绕过 Gateway 请求得到相同结果。该证据只说明当时外部凭据失效，不用来替代 mock-upstream/public-surface 的 Gateway 实现证明；取得有效凭据后仍应补跑 live chat。
 
 ## 2026-07-14 服务器外挂 Function Call 验证
 
@@ -78,7 +79,7 @@ python3 tests/integration/server_gateway_external_smoke.py \
 
 ## 2026-06-26 Chat-only 上游原生工具协议适配状态
 
-当前已完成对真实上游 `http://47.85.40.209:8885` 的弱工具能力适配。该上游普通对话、Responses、Messages 和 stream 可用，但 native tools/function calls 实测不可用；Gateway 现在以 `adapter` 模式在外层合成真实协议级工具轮次，并让 Codex / Claude Code 在用户机器执行本地工具。
+当前已完成对当时真实测试上游（地址不在文档中保留）的弱工具能力适配。该上游普通对话、Responses、Messages 和 stream 在该日期的探针中可用，但 native tools/function calls 实测不可用；Gateway 现在以 `adapter` 模式在外层合成真实协议级工具轮次，并让 Codex / Claude Code 在用户机器执行本地工具。
 
 关键状态：
 - `.gateway_service.json`：本地 gitignored 运行配置，包含真实上游地址与加密后的上游密钥。
@@ -132,22 +133,23 @@ local mock smoke
 下游 (Codex/Claude Code/DeepSeek/OpenCode)
     ↓ HTTP
 Gateway Handler (gateway_http_handler.py)
-    ├─ 智力增强 (gateway_intelligence.py + gateway_llm.py) ← 规则/Provider
+    ├─ 请求前 Intelligence (gateway_intelligence.py + gateway_llm.py) ← 分析并增强 prompt
     ├─ 语义缓存 (gateway_cache.py)         ← 缓存命中加速
-    ├─ 统计记录 (gateway_stats.py)         ← Q&A 数据积累
+    ├─ 主统计记录 (gateway_logging.py)      ← HTTP/工具自动采集
+    ├─ 辅助统计库 (gateway_stats.py)        ← dashboard/trend/writer API
     ├─ 协议转换 (gateway_protocol.py)      ← Anthropic ↔ OpenAI ↔ Responses
     ├─ 工具编排 (gateway_tool_runtime.py)  ← gateway-owned 执行 / 用户侧工具下发
     ├─ 流式处理 (gateway_streaming.py)     ← SSE 流式响应
     ├─ 上下文管理 (gateway_context.py)     ← 无限上下文/记忆/扇出
     ├─ 请求准入 (gateway_admission.py)     ← 共享 SQLite lease 路径
-    ├─ 多上游池 (gateway_upstream_pool.py) ← 负载均衡、熔断、故障转移
+    ├─ 多上游池 (gateway_upstream_pool.py) ← 负载均衡、熔断、非流式故障转移
     ├─ Assistants (gateway_assistants.py)  ← SQLite 生命周期
     └─ Web2API (gateway_web2api.py)         ← 认证后的受限网页提取
     ↓ HTTP
 上游 API (OpenAI/Anthropic/自定义)
 ```
 
-## 已完成并集成功能
+## 当前能力与接线边界
 
 ### 1. 无限上下文 (Infinite Context) ✅
 
@@ -293,23 +295,26 @@ Gateway 本地执行策略（仅 gateway-owned/显式 opt-in 本地工具）:
 
 ---
 
-### 7. 智力提升 (Intelligence Enhancement) ✅
+### 7. 请求前 Intelligence Enhancement ✅；响应后处理未接线
 
 **实现模块**: `src/gateway_intelligence.py` + `src/gateway_llm.py`
 **集成位置**: 非流式与流式 canonical orchestration
 
-核心功能:
+已接 production orchestration:
 - 问题分析 (`_analyze_question`)
 - 复杂度检测 (语义信号评分: simple/moderate/complex)
 - 领域识别 (code/math/general/creative/factual)
 - 问题分解 (`_decompose_question`)
-- 反思机制 (`_generate_reflection`)
-- 回答质量评估 (`_assess_answer_quality`)
-- 增强系统提示构建
-- 自动注入到请求 body 中
+- 增强 system prompt 构建
+- reflection prompt 作为提示注入同一次主回答请求
 - 可插拔 provider registry；内置 `gateway_upstream` 复用真实上游池
 - provider 输入、输出、token、timeout、temperature 和结构化 JSON 边界
 - provider 失败时默认回退规则；`strict_mode=true` 时明确中止请求
+
+仅库级/单元测试，尚未接入 production 响应后链:
+- 回答质量评估 `assess_quality()` / `llm_assess_quality()`
+- 答案反思 `reflect_on_answer()` / `llm_reflect()`
+- 响应完成后的自动评分、独立二次 provider 调用和答案重写
 
 配置项:
 ```json
@@ -339,7 +344,7 @@ Gateway 本地执行策略（仅 gateway-owned/显式 opt-in 本地工具）:
 - 上游配置 (Base URL, API Key, 模型,协议、超时和限界)
 - 能力配置 (tools, function_calls, streaming, vision)
 - 上下文配置 (无限上下文参数)
-- 智力提升配置 (反思、分解、质量评估)
+- Intelligence 配置（请求前分析、分解和增强提示；质量/反思字段不代表已接响应后自动处理）
 - 并发配置 (连接池、多上游开关、负载均衡、熔断恢复)
 - 缓存、持久化、Assistants 保留配置
 - Web2API 并发、内容边界和安全开关
@@ -356,23 +361,23 @@ GET  /api/upstreams/status → 脱敏上游池状态
 GET  /api/intelligence/status → Provider 状态
 ```
 
+状态 API 是独立端点。当前 `/ui/config` 页面不 fetch 这些状态 API，只负责加载 schema/config 和提交 revision-aware 更新。
+
 ---
 
-### 9. 问答统计 (Q&A Statistics) ✅
+### 9. 主 HTTP 统计 + 辅助 Q&A Statistics ✅（边界明确）
 
-**实现模块**: `src/gateway_stats.py`
-**集成位置**: HTTP Handler 层 (每次请求记录)
+**实现模块**: `src/gateway_logging.py` + `src/gateway_stats.py`
+**集成位置**: HTTP Handler 和工具 runtime 自动写 `gateway_logging.py`；`gateway_stats.py` 为独立辅助库和 dashboard 数据源
 
-核心功能:
-- 请求统计 (成功率、响应时间、token 使用)
-- 工具调用统计 (使用频率、失败率、执行时间)
-- 缓存统计 (命中率、相似度)
-- 质量统计 (完整性、相关性、清晰度、准确性)
-- 上游统计 (各上游成功率、响应时间)
-- 综合仪表板 (`get_dashboard`)
-- 趋势分析 (`get_hourly_trends`)
-- Top 查询分析 (`get_top_paths`, `get_top_tools`)
-- CSV 导出功能
+真实接线:
+- 主请求 path/status 与工具 success/failure 自动写入 `gateway_logging.py` 的 SQLite/兼容统计后端
+- `/api/stats/dashboard` 返回主 HTTP snapshot、上游池状态，以及辅助 dashboard/trend/top 结构
+
+辅助库能力:
+- `gateway_stats.py` 提供请求、工具、缓存、质量和上游 writer API
+- 综合仪表板 (`get_dashboard`)、趋势 (`get_hourly_trends`)、Top 查询和 CSV 导出已实现
+- 当前生产 HTTP/Proxy 链不会自动调用所有辅助 writer，因此 cache/quality/upstream 辅助表可能为空；不能宣称“每个请求自动记录到全部 Q&A 表”
 
 API:
 ```
@@ -393,7 +398,8 @@ POST /api/cache/clear      → 清除内存与持久语义/工具缓存
 - 429/502/503/504/timeout 可按有界 attempts 跨 profile 故障转移
 - 400 等客户端错误不跨上游重试
 - 连续失败熔断并在 recovery cooldown 后恢复
-- 流式首事件输出后固定 provider，不拼接两个上游响应
+- 上述跨 profile 故障转移只适用于非流式 get/post/forward
+- SSE 在请求开始时选定一个 profile，首事件前只在该 profile 内重试；当前不跨 profile，首事件后不重放
 - `/api/upstreams/status` 和 `/capabilities` 返回 credential-redacted 状态
 - `ConcurrentRequestExecutor` - 并发请求执行
 
@@ -430,8 +436,9 @@ POST /api/cache/clear      → 清除内存与持久语义/工具缓存
 ### 环境变量
 ```bash
 # 上游 API 配置
-GATEWAY_UPSTREAM_URL=https://api.example.com
-GATEWAY_UPSTREAM_KEY=sk-xxx
+UPSTREAM_BASE_URL=https://api.example.com
+UPSTREAM_API_KEY=sk-xxx
+UPSTREAM_MODEL=example-model
 GATEWAY_UPSTREAM_PROTOCOL=openai_chat
 
 # 服务配置
@@ -461,9 +468,11 @@ GATEWAY_ADMIN_PASSWORD=your-admin-password
 # 开发环境
 python3 -m src.gateway_app --host 127.0.0.1 --port 8885
 
-# 生产环境 (多 worker)
-gunicorn src.gateway_app:app -w 4 -b 0.0.0.0:8885
+# 生产环境使用仓库 Compose/deploy contract（ThreadingHTTPServer，无 WSGI app）
+./scripts/deploy.sh production up
 ```
+
+完整 Compose、Nginx/TLS、持久卷、安全凭据和监控约束见 [`DEPLOYMENT.md`](DEPLOYMENT.md)。
 
 ---
 
@@ -476,16 +485,16 @@ gunicorn src.gateway_app:app -w 4 -b 0.0.0.0:8885
 | gateway_tool_runtime | test_gateway.py, test_tool_parallel.py | ✅ |
 | gateway_streaming | test_gateway.py | ✅ |
 | gateway_cache | test_semantic_cache.py | ✅ |
-| gateway_intelligence | test_intelligence.py | ✅ |
+| gateway_intelligence | test_intelligence.py, test_gateway_llm.py, production call-site review | ✅ 请求前接线；响应后 helper 仅库级 |
 | gateway_web2api | test_web2api.py | ✅ |
 | gateway_web_config | test_web_config.py | ✅ |
-| gateway_stats | test_stats.py, test_stats_logging.py | ✅ |
+| gateway_logging / gateway_stats | test_stats.py, test_stats_logging.py | ✅ 主/辅助边界如上 |
 | gateway_concurrency | test_concurrency.py | ✅ |
 | gateway_claude_compat | test_claude_compat.py | ✅ |
 | 边界条件 | test_edge_cases.py | ✅ |
 | 稳定性 | test_stability.py | ✅ |
 | 集成测试 | test_gateway_e2e.py | ✅ |
-| **发布门禁** | **`./scripts/agent_planner_acceptance.sh --full`，结果以最新运行输出为准** | ✅ |
+| **Agent Planner 验收** | **`./scripts/agent_planner_acceptance.sh --full` + clean-env pytest，结果必须分开记录** | ⚠️ 当前 `--full` 有 strict env 作用域冲突 |
 
 ---
 

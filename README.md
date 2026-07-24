@@ -50,34 +50,40 @@
 | HTTP API 入口、认证、ACL、错误映射 | ✅ 已实现 | `src/gateway_http_handler.py` |
 | 上游代理、连接复用、自动重试 | ✅ 已实现 | `src/gateway_proxy.py` |
 | 工具调用编排、多轮执行、文本 fallback | ✅ 已实现 | `src/gateway_tool_runtime.py` |
-| 内置 coding-agent 工具（60+） | ✅ 已实现 | `src/gateway_builtin_tools.py` |
+| 内置 coding-agent 工具（67 个唯一工具；含别名 178 个注册项） | ✅ 已实现 | `src/gateway_builtin_tools.py` |
 | MCP / HTTP Action 扩展 | ✅ 已实现 | `src/gateway_mcp.py`, `src/gateway_http_actions.py` |
 | 流式 SSE 编排 + 流式缓存 | ✅ 已实现 | `src/gateway_streaming.py` |
 | 上下文压缩、SQLite 记忆、fan-out | ✅ 已实现 | `src/gateway_context.py` |
 | 语义缓存（精确 + 相似匹配） | ✅ 已实现 | `src/gateway_cache.py` |
-| 智力提升（规则 + 可插拔 LLM provider） | ✅ 已接入非流式与流式编排 | `src/gateway_intelligence.py`, `src/gateway_llm.py` |
-| Q&A 统计（请求/工具/缓存/质量） | ✅ 已实现 | `src/gateway_stats.py` |
+| 请求前 Intelligence 分析（规则 + 可插拔 LLM provider） | ✅ 已接入非流式与流式编排；响应后质量评分/二次反思尚未接线 | `src/gateway_intelligence.py`, `src/gateway_llm.py` |
+| HTTP 请求/工具统计与辅助 Q&A 统计库 | ✅ 主链由 `gateway_logging.py` 采集；`gateway_stats.py` 为辅助数据源 | `src/gateway_logging.py`, `src/gateway_stats.py` |
 | Web 配置 UI（9 Tab） | ✅ 已实现 | `src/gateway_web_config.py` |
 | Assistants / Threads | ✅ Gateway-owned SQLite 生命周期、messages、runs、steps、tool-output resume、租户隔离 | `src/gateway_assistants.py` |
 | Web2API（网页转结构化 API） | ✅ 已接 `/v1/web2api`、`/api/web2api`、`/anthropic/v1/web2api` | `src/gateway_web2api.py` |
 | 单上游连接复用、重试、限界 | ✅ 已接入 | `src/gateway_proxy.py` |
-| 多上游负载均衡 / 故障转移 | ✅ 已接 canonical proxy path，含熔断与恢复 | `src/gateway_upstream_pool.py` |
+| 多上游负载均衡 / 故障转移 | ✅ 非流式 canonical path 支持跨 profile；SSE 不跨 profile | `src/gateway_upstream_pool.py`, `src/gateway_proxy.py` |
 | Claude Code 兼容层 | ✅ 已实现 | `src/gateway_claude_compat.py` |
 | Admin UI / Config API / cache、stats、provider 状态 | ✅ 已实现 | `src/gateway_admin.py`, `src/gateway_admin_api.py` |
 
-运行时能力以 `GET /capabilities` 为准。模块文件存在或单元测试通过，不代表该模块已经接入生产 HTTP 请求路径。
+运行时能力以 `GET /capabilities` 为准。模块文件存在或单元测试通过，不代表该模块已经接入生产 HTTP 请求路径。上述工具数字是 2026-07-24 对当前 registry 的运行时快照：67 个唯一 canonical 工具，178 个含别名 key。
 
 当前回归测试（以实际门禁输出为准）：
 
 ```bash
+# 快速全量回归
+python3 -m pytest -q
+
 # smoke-level Agent Planner / protocol / public-surface acceptance
 ./scripts/agent_planner_acceptance.sh
 
-# 发布前 full gate（包含全量 pytest）
+# Agent Planner full gate（已知环境隔离限制见运行指南）
 ./scripts/agent_planner_acceptance.sh --full
+
+# 完整 CI 门禁：静态检查、依赖审计、pytest、配置、Compose、Docker
+./scripts/ci_gate.sh
 ```
 
-最近一次本地完整 CI 验证（2026-07-24）：Ruff、17 个模块的 Mypy、Bandit、`pip check`、`pip-audit`、Compose、Docker build 和全量 pytest 均通过；pytest 为 `1492 passed, 2 skipped`。官方 `mimo_gateway.sh verify` 五阶段也完整通过，包括真实本地工具/两轮编排、安全边界、并发压力、Anthropic/Responses Skill 事件和本机 Claude/Codex CLI。生产/公网部署前仍必须配置非默认 Admin 凭证，并以部署环境自己的门禁输出为准。
+最近一次本地完整 CI 验证（2026-07-24）：Ruff、17 个模块的 Mypy、Bandit、`pip check`、`pip-audit`、Compose、Docker build 和 clean-env 全量 pytest 均通过；pytest 为 `1492 passed, 2 skipped`。官方 `mimo_gateway.sh verify` 五阶段也完整通过，包括真实本地工具/两轮编排、安全边界、并发压力、Anthropic/Responses Skill 事件和本机 Claude/Codex CLI。当前 `agent_planner_acceptance.sh --full` 的全量阶段存在一个已记录的 strict-mode 环境变量作用域冲突，smoke/focused 结果与 clean-env pytest 结果必须分开判断，详见运行指南。生产/公网部署前仍必须配置非默认 Admin 凭证，并以部署环境自己的门禁输出为准。
 
 本轮真实测试上游 / Mimo 兼容结论（2026-05-25，地址只保存在本地 ignored 配置或环境变量中）：
 
@@ -330,13 +336,13 @@ src/
 ├── gateway_protocol.py       # 三协议请求/响应/工具格式转换
 ├── gateway_proxy.py          # 上游 HTTP 客户端
 ├── gateway_tool_runtime.py   # 工具解析、规范化、多轮编排、直接调用
-├── gateway_builtin_tools.py  # 内置工具真实实现 (60+)
+├── gateway_builtin_tools.py  # 内置工具真实实现（67 unique / 178 including aliases）
 ├── gateway_streaming.py      # SSE 流式编排 + 流式缓存
 ├── gateway_context.py        # token 估算、压缩、记忆、fan-out
 ├── gateway_cache.py          # 语义缓存 (精确/相似匹配)
-├── gateway_intelligence.py   # 智力提升 (问题分析/反思/质量评估)
+├── gateway_intelligence.py   # 请求前问题分析/prompt enhancement；另含未接响应链的质量/反思 helper
 ├── gateway_llm.py            # 可插拔 LLM intelligence provider
-├── gateway_stats.py          # Q&A 统计 (SQLite 持久化)
+├── gateway_stats.py          # 辅助 Q&A 统计库与 dashboard 数据源
 ├── gateway_web_config.py     # Web 配置 UI (9 Tab)
 ├── gateway_admin_api.py      # revision-aware 配置、统计和缓存管理 API
 ├── gateway_web2api.py        # Web → 结构化 API
@@ -345,7 +351,7 @@ src/
 ├── gateway_claude_compat.py  # Claude Code 兼容层
 ├── gateway_mcp.py            # MCP client / tools/list / tools/call
 ├── gateway_http_actions.py   # HTTP Action executor
-├── gateway_logging.py        # SQLite / JSONL 日志、统计、失败记录
+├── gateway_logging.py        # 主 HTTP 请求/工具统计、SQLite / JSONL 日志、失败记录
 └── gateway_computer_use.py   # GUI / computer-use 辅助工具
 ```
 
@@ -355,18 +361,16 @@ src/
 
 | 文档 | 用途 |
 |---|---|
-| [`CLAUDE.md`](CLAUDE.md) | 项目进度、架构设计、已实现/待实现 |
-| [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) | 功能实现状态、集成位置、配置项 |
+| [`docs/README.md`](docs/README.md) | **统一文档中心**：当前入口、权威级别、全部文档分类和能力覆盖矩阵 |
+| [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) | 顶部为当前能力校准，后续为按日期实现记录 |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 上游/中游/下游定位、模块边界、请求流程 |
 | [`docs/RUNNING_AND_TESTING.md`](docs/RUNNING_AND_TESTING.md) | 部署、配置、启动、测试、API 验证 |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | 生产环境部署指南 |
-| [`docs/CURRENT_AUDIT.md`](docs/CURRENT_AUDIT.md) | 审计结论、风险点、已修复项 |
 | [`docs/gateway-admin-ui-config.md`](docs/gateway-admin-ui-config.md) | Admin UI、下游 key、能力配置 |
 | [`docs/gateway-infinite-context-memory.md`](docs/gateway-infinite-context-memory.md) | 长上下文、SQLite 记忆、fan-out |
-| [`docs/full-gateway-tool-runtime-marketplace.md`](docs/full-gateway-tool-runtime-marketplace.md) | Tool Runtime / Marketplace 方案 |
-| [`docs/coding-agent-builtin-tools-implementation.md`](docs/coding-agent-builtin-tools-implementation.md) | 内置 coding-agent 工具实现 |
-| [`docs/tool-format-compat-analysis.md`](docs/tool-format-compat-analysis.md) | 工具格式兼容分析 |
-| [`docs/native-tool-call-solution.md`](docs/native-tool-call-solution.md) | 原生工具调用方案 |
+| [`CLAUDE.md`](CLAUDE.md) | 历史开发进度日志；当前事实以上述入口和 `GET /capabilities` 为准 |
+
+带日期的审计、验收矩阵、`docs/progress/` 与 `docs/archive/` 属于历史证据。它们保留当时的路径和测试数字，不用于覆盖当前能力声明；完整分类见文档中心。
 
 ---
 
@@ -385,9 +389,10 @@ src/
 **原则：真实 API 地址只放本地配置文件或环境变量，绝不写入提交代码。**
 
 ```bash
-# 验证：提交代码中不应包含真实 IP
-git ls-files | xargs grep -l '47\.85\.40\.209' 2>/dev/null
-# 应无输出
+# 验证：除 intentional loopback 示例外，提交内容不应包含公网 IP URL
+git grep -nE 'https?://([0-9]{1,3}\.){3}[0-9]{1,3}' -- ':!docs/archive/**' \
+  | grep -v '127\.0\.0\.1'
+# 应无输出；命令因 grep 未匹配返回 1 属于预期
 ```
 
 ---
@@ -396,7 +401,7 @@ git ls-files | xargs grep -l '47\.85\.40\.209' 2>/dev/null
 
 - Gateway 不把假的 tool result 伪装成真实成功。
 - 真实测试上游 / Mimo 直连缺少 `/anthropic` 别名和 direct tools endpoint；`/v1/messages` forced probe 可返回 Anthropic `tool_use`，但 Codex `/v1/responses` function_call 未证实。因此 Claude Code/Codex 默认由本 Gateway 的 adapter/orchestrate 补齐协议；**用户机器工具（Read/LS/Glob/Grep/Write/Edit/Bash/Skill/GUI/local agent）默认下发给下游客户端执行**，Gateway 只执行 gateway-owned 工具（HTTP Action/MCP/网络/纯函数/记忆等）。
-- 文本 fallback 只是一种弱上游兼容方式；Gateway 会把弱上游输出的 `<function=...>` 转成下游原生 `tool_use/tool_calls/function_call`，用户侧工具不在 Gateway 服务机执行。只有显式设置 `gateway.execute_user_side_tools_in_gateway=true` 或 legacy `delegate_tools_to_downstream=false` 时，才启用旧的本机代理式执行。
+- 文本 fallback 只是一种弱上游兼容方式；Gateway 会把弱上游输出的 `<function=...>` 转成下游原生 `tool_use/tool_calls/function_call`，用户侧工具不在 Gateway 服务机执行。只有显式设置 `gateway.execute_user_side_tools_in_gateway=true` 时，才启用旧的本机代理式执行；legacy `delegate_tools_to_downstream=false` 本身不再授予服务端执行用户 workspace 工具的权限。
 - Gateway 是中游服务，不能把服务启动目录当作用户项目目录；项目级 `.traces`、SQLite 记忆隔离、Skills/插件解析都以当前请求解析出的下游项目根为准；需要触碰用户目录/终端/GUI 的动作必须由下游 Claude Code/Codex 在用户机器完成。
 - `workspace_root` / `gateway_workspace` / `projectDir` / `cwd` 等字段只作为 Gateway 内部路由信号；普通转发和 streaming passthrough 都会在上游请求前剥离，metadata JSON 字符串和 `metadata.user_id` 内嵌 JSON 里的同类字段也会清理。
 - `Skill`/`list_skills`/`read_skill`/`run_skill` 涉及用户项目 skills 时默认作为下游工具请求返回；Admin UI 仍可展示 Gateway 可见的全局/额外 skills。
@@ -410,9 +415,10 @@ git ls-files | xargs grep -l '47\.85\.40\.209' 2>/dev/null
 - 请求/响应日志和 Admin 配置展示会递归遮盖常见敏感字段（token、secret、password、cookie、API key、key hash 等），避免运维面泄漏凭据。
 - Admin 写操作会拒绝跨源浏览器 Origin/Referer 请求；无来源头的 CLI/脚本请求仍保持兼容。
 - `/ui/config` 及所有 `/api/config|stats|cache|upstreams|intelligence` 管理接口都要求 Admin Basic Auth；配置更新使用 revision 做乐观并发控制，密码占位符 `***` 或空值不会覆盖现有 secret。
-- 多上游只对可安全重试的 429/502/503/504/transport timeout 做有界故障转移；400 等客户端错误不会切换上游。SSE 一旦已经向下游输出首个事件，就不会切换 provider，以免拼接两个上游的响应。
+- 非流式多上游请求只对可安全重试的 429/502/503/504/transport timeout 做有界跨 profile 故障转移；400 等客户端错误不会切换上游。SSE 使用请求开始时选中的 profile，仅在首事件前对该 profile 做有界连接重试；当前不会跨 profile，首事件输出后也绝不重放。
 - Assistants Runs 是 Gateway-owned 持久同步生命周期：普通回答可完成 run，function call 可进入 `requires_action` 并由 `submit_tool_outputs` 恢复；当前不宣称 Assistants Run SSE streaming。
-- Intelligence 默认使用确定性规则。`intelligence.use_llm=true` 时使用注册 provider；默认非 strict 模式在 provider 失败时回退规则，`strict_mode=true` 则让请求明确失败。
+- Intelligence 当前接线点在请求发送上游之前：分析问题并把 system/reflection prompt 注入同一次主回答。`intelligence.use_llm=true` 时使用注册 provider；默认非 strict 模式在 provider 失败时回退规则，`strict_mode=true` 则让请求明确失败。`assess_quality()` / `reflect_on_answer()` 等 helper 有库级实现和单元测试，但尚未接入响应后的自动评分、二次 LLM 反思或答案重写链。
+- 主 HTTP 请求/工具统计由 `gateway_logging.py` 自动写入；`gateway_stats.py` 提供独立的请求、工具、缓存、质量和 upstream writer/query API，`/api/stats/dashboard` 会同时返回主 HTTP snapshot 与辅助 dashboard，但生产 HTTP 链当前不会自动填满所有辅助表。
 - HTTP POST 请求体有读取前上限，默认 64MB；可通过 `gateway.max_request_body_bytes` / `GATEWAY_MAX_REQUEST_BODY_BYTES` 调整，超限返回 413。
 - 请求/响应日志和 tool failure 内容会先遮盖敏感字段，再按 `gateway.max_log_payload_chars` / `GATEWAY_MAX_LOG_PAYLOAD_CHARS` 截断，避免 SQLite/JSONL 膨胀。
 - `gateway_app.py` 当前保留旧单体兼容导出层，新增实现应优先放入对应 `gateway_*` 模块。

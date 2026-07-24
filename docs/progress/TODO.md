@@ -1,6 +1,8 @@
 # 待完成工作
 
 > 最后更新: 2026-05-27
+>
+> 历史 backlog 快照：其中若干项目已在后续实现或被新的架构边界替代。它不再作为当前承诺或发布阻断清单；当前能力以 [`../IMPLEMENTATION_STATUS.md`](../IMPLEMENTATION_STATUS.md)、[`../README.md`](../README.md) 和 `GET /capabilities` 为准。
 
 ## 高优先级
 

@@ -1,8 +1,7 @@
 # Chat-only 上游补齐 Codex / Claude Code 工具能力方案
 
-> 最后更新: 2026-06-26
-> 当前验证上游: `http://47.85.40.209:8885`
-> 当前模型: `mimo-v2.5-pro`
+> 最后校准: 2026-07-24。本文保留 2026-06-26 弱上游适配证据；真实测试地址和密钥不写入文档，当前运行配置以 `.gateway_service.json` / 环境变量和 `GET /capabilities` 为准。
+> 当时验证模型: `mimo-v2.5-pro`
 
 ## 1. 目标
 
@@ -54,7 +53,7 @@
 ```json
 {
   "upstream": {
-    "base_url": "http://47.85.40.209:8885",
+    "base_url": "<YOUR_TEST_UPSTREAM_BASE_URL>",
     "model": "mimo-v2.5-pro",
     "protocol": "openai_chat",
     "tools_enabled": "adapter",
@@ -314,7 +313,7 @@ python3 tests/integration/project_scope_cli_smoke.py --require-claude --require-
 
 ### 7.3 真实上游适配烟测
 
-已对 `http://47.85.40.209:8885` 做临时端口烟测，结果：
+已对当时的真实测试上游（地址省略）做临时端口烟测，结果：
 
 ```json
 {

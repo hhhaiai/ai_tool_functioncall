@@ -2,6 +2,8 @@
 
 本文档涵盖从零开始部署、配置、启动和验证 `AI Tool FunctionCall Gateway` 的完整流程。
 
+> 最后校准：2026-07-24。文档导航与历史/当前资料边界见 [`文档中心`](README.md)。当前机器可读能力以 `GET /capabilities` 为准。
+
 **特性**：核心服务以 Python 实现，使用 `cryptography` 加密持久配置中的敏感值，并可选使用 Pillow/GUI 依赖；支持 macOS / Linux / Windows (WSL)。
 
 ---
@@ -249,18 +251,19 @@ curl http://127.0.0.1:8885/healthz
 | `gateway.concurrency_heartbeat_seconds` | 30 | 长请求刷新 lease 的间隔，运行时会限制为小于 TTL 的一半 |
 | `gateway.concurrency_queue_timeout_seconds` | 5.0 | 并发槽位排队等待时间；超时返回 429，并带 backend、active、limit 和 retry-after 详情 |
 
-管理面可观测性：
-
-- `GET /admin/metrics`：Prometheus 格式，包含请求、工具、上游总耗时、流式首事件延迟、共享 admission 和维护容量指标。
-- `GET /admin/traces.json?limit=100`：最近的有界内存 span，只记录归一化路由/协议/工具类别、结果、失败类型和耗时。
-- 所有正常 HTTP 响应带 `x-request-id`；请求、工具和上游 span 使用同一个请求上下文 ID。
-- 不把 prompt、工具参数、原始 URL、tenant/user、API key 或任意 MCP 名称写入指标标签。
 | `gateway.tool_execution_timeout_seconds` | 60.0 | 单次工具执行超时 |
 | `gateway.max_request_body_bytes` | 67108864 | HTTP POST 请求体读取前上限；超限返回 413，避免大请求先占用内存 |
 | `gateway.max_log_payload_chars` | 200000 | 单个 request/response 日志 payload 与 tool failure 内容截断上限；先遮盖敏感字段再截断 |
 | `gateway.text_tool_adapter_compact_token_limit` | 48000 | 弱上游文本工具适配前的压缩阈值上限；实际阈值动态计算为 `max(8000, min(upstream.max_input_tokens * 0.45, 此值))`；设为 0 可关闭 |
 | `gateway.local_planner_enabled` | true | 对分析/审查请求以及点名 `read/show/cat/open/查看/读取` 文件路径的请求，默认合成下游用户侧工具请求；只有 `execute_user_side_tools_in_gateway=true` 时才使用旧的 Gateway 本地读文件/目录/符号证据注入 |
 | `context.max_input_tokens` | 1048576 | Mimo 1M 上下文阈值；超过此值触发上下文压缩/扇出 |
+
+管理面可观测性：
+
+- `GET /admin/metrics`：Prometheus 格式，包含请求、工具、上游总耗时、流式首事件延迟、共享 admission 和维护容量指标。
+- `GET /admin/traces.json?limit=100`：最近的有界内存 span，只记录归一化路由/协议/工具类别、结果、失败类型和耗时。
+- 所有正常 HTTP 响应带 `x-request-id`；请求、工具和上游 span 使用同一个请求上下文 ID。
+- 不把 prompt、工具参数、原始 URL、tenant/user、API key 或任意 MCP 名称写入指标标签。
 
 ### 3.4 环境变量对照表
 
@@ -291,7 +294,7 @@ curl http://127.0.0.1:8885/healthz
 | `GATEWAY_CLIENT_CONTEXT_WINDOW` | gateway.client_context_window | Claude Code/Codex 客户端上下文窗口，Mimo 模板为 `1048576` |
 | `GATEWAY_ASSISTANTS_DB_PATH` / `GATEWAY_ASSISTANTS_RETENTION_DAYS` / `GATEWAY_ASSISTANTS_MAX_ROWS` | assistants.* | Gateway-owned Assistants 数据库和容量治理；Compose 默认数据库位于持久卷 `/app/data/runtime/assistants.sqlite3` |
 | `GATEWAY_MULTI_UPSTREAM_ENABLED` / `GATEWAY_CONCURRENCY_STRATEGY` | concurrency.* | 多 profile 负载均衡显式开关和策略；默认关闭、策略为 round robin |
-| `GATEWAY_INTELLIGENCE_USE_LLM` / `GATEWAY_INTELLIGENCE_PROVIDER` / `GATEWAY_INTELLIGENCE_STRICT_MODE` | intelligence.* | LLM intelligence provider；默认关闭且 provider 失败时回退规则，strict 模式明确失败 |
+| `GATEWAY_INTELLIGENCE_USE_LLM` / `GATEWAY_INTELLIGENCE_PROVIDER` / `GATEWAY_INTELLIGENCE_STRICT_MODE` | intelligence.* | 请求前问题分析 provider；默认关闭且 provider 失败时回退规则，strict 模式明确失败；当前不触发响应后的自动质量评分或二次反思 |
 | `GATEWAY_WEB2API_*` | web2api.* | Web2API 并发、超时、内容/缓存上限和安全开关；私网、regex、raw HTML 默认均关闭 |
 | `GATEWAY_SANDBOX_STARTUP_TIMEOUT` | sandbox worker startup | sandbox 策略、资源限制和 OS 隔离初始化上限，默认 5 秒；该窗口与用户命令的 `timeout` / exec `read_timeout` 分开计时 |
 
@@ -343,10 +346,10 @@ GATEWAY_START_METHOD=launchd ./scripts/mimo_gateway.sh start
 ./scripts/mimo_gateway.sh stop
 
 # 重启服务
-./scripts/mimo_gateway.sh start
+./scripts/mimo_gateway.sh restart
 
 # 查看日志
-tail -f .gateway_runtime/gateway-8885.log
+./scripts/mimo_gateway.sh logs
 ```
 
 ### 4.3 自定义端口
@@ -440,23 +443,61 @@ curl -H 'Authorization: Bearer your-gateway-api-key' \
   http://127.0.0.1:8885/v1/web2api
 ```
 
+Assistants / Threads 最小生命周期示例：
+
+```bash
+# 创建 Assistant
+curl -H 'Authorization: Bearer your-gateway-api-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"mimo-v2.5-pro","name":"gateway-demo","instructions":"Answer briefly."}' \
+  http://127.0.0.1:8885/v1/assistants
+
+# 创建 Thread；从响应中保存 thread id
+curl -H 'Authorization: Bearer your-gateway-api-key' \
+  -H 'Content-Type: application/json' -d '{}' \
+  http://127.0.0.1:8885/v1/threads
+
+# 向 Thread 添加消息，然后以 assistant_id 创建同步 Run
+curl -H 'Authorization: Bearer your-gateway-api-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"role":"user","content":"Reply with OK."}' \
+  http://127.0.0.1:8885/v1/threads/<thread-id>/messages
+curl -H 'Authorization: Bearer your-gateway-api-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"assistant_id":"<assistant-id>"}' \
+  http://127.0.0.1:8885/v1/threads/<thread-id>/runs
+```
+
 `/v1/web2api`、`/api/web2api` 和 `/anthropic/v1/web2api` 都已接入生产 Handler，并共享下游认证、ACL、限流、请求准入、日志、SSRF/DNS/redirect 重检、内容类型和响应大小边界。`allow_private_network`、正则提取和 raw HTML 返回都只能由管理员配置显式开启。
 
 所有 `/api/config`、`/api/stats`、`/api/cache`、`/api/upstreams`、`/api/intelligence` 管理接口都要求 Admin Basic Auth。浏览器发起的 POST 还必须满足 same-origin 检查；无 Origin/Referer 的受信 CLI 请求保持可用。配置写入只接受 schema 中的可编辑字段，使用 revision 防止覆盖并发修改，并在保存后定向 reload 缓存、上游池、Web2API 或 Assistants store。
 
 Assistants / Threads 已提供持久 Gateway-owned 生命周期，包括 assistants CRUD/list、threads、messages、runs、cancel、`submit_tool_outputs` 和 run steps。Run 当前是同步编排：普通答案完成 run，工具调用进入 `requires_action` 后可提交 outputs 继续；不要把它配置成或宣传为 Assistants Run SSE streaming。
 
-多上游只在请求尚未产生下游流事件时执行安全故障转移。非流式 429/502/503/504/timeout 可按配置切换 profile；400 等客户端错误不会跨上游重试；流式一旦输出事件就固定当前 provider。
+非流式 429/502/503/504/timeout 可按配置跨 profile 故障转移；400 等客户端错误不会切换 profile。SSE 使用请求开始时选中的 profile，首事件前的 429/502/503/504/transport failure 只在该 profile 内做有界连接重试；当前没有跨 profile SSE failover，首事件输出后也不会重放。
+
+Intelligence 的 production 接线位于非流式和流式请求发送上游之前：规则或已注册 LLM provider 分析问题，并把 system/reflection prompt 注入同一次主回答。它不会在回答返回后自动调用质量评分、二次 LLM reflection 或答案重写；这些 helper 目前只有库级实现和单元测试。
 
 ### 5.5 运行测试套件
 
 ```bash
-# 运行全部测试
+# 快速全量回归
 python3 -m pytest -q
 
-# 运行集成测试
-python3 tests/integration/smoke_gateway_tools.py
+# Agent Planner / protocol / public-surface smoke
+./scripts/agent_planner_acceptance.sh
+
+# Agent Planner full gate（smoke、focused tests 和全量 pytest）
+./scripts/agent_planner_acceptance.sh --full
+
+# 完整 CI：compile/config、Ruff、Mypy、Bandit、依赖审计、pytest、
+# git/secret guard、Compose，以及 Docker 可用时的镜像构建
+./scripts/ci_gate.sh
 ```
+
+2026-07-24 最近一次 clean-env 全量 pytest 结果为 `1492 passed, 2 skipped`。历史审计文档中的较小数字是当时快照，不是当前回归基线。
+
+当前 `agent_planner_acceptance.sh --full` 有一个验证脚本环境隔离限制：脚本以 `GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN=0` 启动整个 pytest 进程，而 `tests/test_config_sync.py` 会验证仓库默认值为 `true`，因此 smoke 与 focused gate 可通过，但脚本内全量阶段固定会出现 2 个配置同步断言失败。该失败不是 Gateway 请求链回归；在修复脚本变量作用域前，发布验收应同时单独运行 clean-env `python3 -m pytest -q`，并分别记录两个结果，不能把 `--full` 的非零退出码写成通过。
 
 ### 5.6 当前稳定性 smoke（临时端口）
 
@@ -517,7 +558,7 @@ GATEWAY_ADMIN_PASSWORD=admin \
 
 这个 mock 提供 `/v1/models`、`/v1/chat/completions`、`/v1/responses`、`/v1/messages`，并刻意让 `/anthropic/*`、`/v1/tools/call`、`/v1/functions/call` 返回 404，用来复现“Mimo 类弱上游 + Gateway adapter/orchestrate 补齐工具能力”的接入形态。
 
-### 5.6 当前 Mimo 上游 + Gateway adapter 复验记录
+### 5.7 当前 Mimo 上游 + Gateway adapter 复验记录
 
 2026-05-25 的结论是：真实测试 Mimo OpenAI-compatible 上游可用（地址只在本地 ignored 配置/环境变量中保存）；它支持 `/v1/chat/completions`、`/v1/responses`、`/v1/messages`，并且 `/v1/messages` forced tool_choice 探针可返回 Anthropic `tool_use`。但它没有 `/anthropic` 兼容别名、没有 direct tools/functions runtime endpoint，且 `/v1/responses` forced tool probe 未返回 Codex 需要的 `function_call`。为了同时稳定支持 Claude Code + Codex，不要让客户端直连该上游；应让客户端连接本 Gateway：
 
@@ -694,28 +735,22 @@ sudo systemctl start gateway
 sudo systemctl status gateway
 ```
 
-### 7.3 Docker 部署
+### 7.3 Docker / Compose 部署
 
-```dockerfile
-FROM python:3.11-slim
-
-WORKDIR /app
-COPY . .
-
-RUN cp gateway.config.json .gateway_service.json
-
-EXPOSE 8885
-
-CMD ["python3", "src/toolcall_gateway.py", "--host", "0.0.0.0", "--port", "8885"]
-# Non-loopback container listeners require GATEWAY_PUBLIC_EXPOSURE=external
-# with a non-default Admin password and at least one downstream API key, unless
-# a loopback-only publication explicitly declares the private contract.
-```
+仓库的 Compose 文件已经声明持久卷、只读生产容器、健康检查、loopback 端口发布和完整运行时环境，不要用手写 `docker run` 绕过这些约束。
 
 ```bash
-docker build -t gateway .
-docker run -d -p 8885:8885 -v ./config:/app/.gateway_service.json gateway
+# 开发环境：宿主机只发布 127.0.0.1:8885
+./scripts/deploy.sh development up
+
+# 生产环境：先在 .env 中设置上游、非默认 Admin 密码和 downstream key
+./scripts/deploy.sh production up
+
+./scripts/deploy.sh production status
+./scripts/deploy.sh production logs
 ```
+
+生产 TLS、Nginx、备份、监控和外部 function-call smoke 见 [`DEPLOYMENT.md`](DEPLOYMENT.md)。
 
 ### 7.4 Nginx 反向代理
 
@@ -734,7 +769,7 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
         
-        # WebSocket 支持（SSE 流式）
+        # SSE 流式响应
         proxy_http_version 1.1;
         proxy_set_header Connection "";
         proxy_buffering off;
@@ -834,6 +869,8 @@ ai_tool_functioncall/
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/healthz` | GET | 健康检查 |
+| `/livez` / `/readyz` | GET | 进程存活 / 初始化就绪检查 |
+| `/capabilities` | GET | 当前公开路径、工具归属和安全边界的机器可读声明 |
 | `/ui` | GET | Admin UI |
 | `/client-config` | GET | 下游客户端配置片段 |
 | `/client-config.json` | GET | 下游客户端配置片段（JSON 格式） |
@@ -851,13 +888,16 @@ ai_tool_functioncall/
 | `/tools/call` | POST | 直接工具调用兼容路径（无 `/v1` 前缀） |
 | `/v1/web2api` / `/api/web2api` / `/anthropic/v1/web2api` | POST | 下游鉴权后的 Web2API |
 | `/v1/assistants` / `/v1/assistants/{id}` | GET/POST/DELETE | Assistant 生命周期 |
+| `/v1/threads` / `/v1/threads/{id}` | GET/POST/DELETE | Thread 生命周期 |
 | `/v1/threads/{thread_id}/messages` | GET/POST | Thread message 生命周期 |
 | `/v1/threads/{thread_id}/runs` | GET/POST | 同步 Run 生命周期及 tool-output resume 子路由 |
 | `/ui/config` | GET | Admin Config Center |
 | `/api/config` / `/api/config/schema` | GET | 脱敏配置、revision、schema |
 | `/api/config` / `/api/config/update` | POST | revision-aware 配置更新 |
+| `/api/stats/dashboard` / `/api/cache/stats` | GET | 主 HTTP snapshot + 辅助 dashboard / 内存与持久缓存状态 |
 | `/api/cache/clear` | POST | 清除内存和持久缓存 |
 | `/api/upstreams/status` / `/api/intelligence/status` | GET | 脱敏运行状态 |
+| `/admin/metrics` / `/admin/traces.json` | GET | Prometheus 指标 / 有界内存 trace（Admin Basic Auth） |
 
 ### C. 支持的工具
 

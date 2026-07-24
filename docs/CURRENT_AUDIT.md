@@ -1,6 +1,6 @@
 # 当前审计结论（2026-06-19）
 
-本文件记录本轮对 `ai_tool_functioncall` 当前工作区的结构审计、风险点核验和回归修复结果。
+> 历史快照：本文件只记录 2026-06-19 当时的结构审计、风险点和回归结果。文中的 `886 passed`、测试数量和“当前”措辞均按该日期理解；现行状态见 [`README.md`](../README.md)、[`文档中心`](README.md) 和 [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) 顶部校准。
 
 ## 2026-06-19 增量审计结论
 

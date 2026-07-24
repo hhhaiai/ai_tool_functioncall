@@ -1,5 +1,7 @@
 # Gateway Admin UI、配置、下游 Key 与请求留存
 
+> 最后校准：2026-07-24。当前管理面包含传统运维 Control Center `/ui` 与 schema-driven Config Center `/ui/config`；完整文档导航见 [`文档中心`](README.md)。
+
 ## 1. 当前实现
 
 当前 Gateway 仍是 Python 实现，入口：
@@ -11,7 +13,8 @@
 管理 UI：
 
 ```text
-http://127.0.0.1:8885/ui
+http://127.0.0.1:8885/ui         # Gateway Control Center
+http://127.0.0.1:8885/ui/config  # 9-Tab Config Center
 ```
 
 默认管理员：
@@ -28,6 +31,17 @@ password: admin（开发/测试用默认值，生产环境必须通过环境变�
 ```
 
 > **重要**：生产环境必须设置 `GATEWAY_ADMIN_PASSWORD`（管理员密码）和 `GATEWAY_DOWNSTREAM_KEY`（下游 API Key）。开发/测试环境可使用默认值 `admin/admin`，但必须在上线前通过环境变量修改。
+
+两个管理入口共享 Admin Basic Auth，但职责不同：
+
+- `/ui` 面向运行运维，展示上游、工具、MCP、HTTP Actions、Skills、请求、失败、存储和 Agent Runtime 状态，并保留传统表单写接口。
+- `/ui/config` 面向 canonical 运行配置，9 个标签页依次覆盖 upstream、capabilities、context、intelligence、concurrency、cache、tools、web2api 和 security。
+- `GET /api/config` 返回脱敏配置和 revision；`GET /api/config/schema` 返回可编辑 schema。
+- `POST /api/config` 与 `POST /api/config/update` 使用 revision 乐观并发控制，只接受 schema 中的字段，并在保存后定向刷新缓存、上游池、Web2API 或 Assistants store。Intelligence 每次请求动态读取配置，不需要 reset hook。
+- `/api/stats/dashboard`、`/api/cache/stats`、`/api/upstreams/status`、`/api/intelligence/status` 是独立、受 Basic Auth 保护的状态 API；当前 Config Center 页面只加载配置/schema 并提交更新，不会自动请求或渲染这些状态。
+- 浏览器写请求还必须通过 same-origin 校验；CLI 可在不发送 Origin/Referer 的情况下使用 Basic Auth 调用。
+
+当前页面边界：`/ui/config` 底部模板仍包含 `/ui/config/client` 和 `/stats` 两个未注册快捷链接；在修复页面前，请直接使用已实现的 `/client-config` 与 `/api/stats/dashboard`。这不影响 Config API 和状态 API 本身。
 
 ---
 
@@ -46,6 +60,8 @@ GATEWAY_CONFIG_PATH=/path/to/gateway-config.json
 ```
 
 UI 支持配置：
+
+以下列表同时覆盖传统 `/ui` 表单和 `/ui/config` schema；并非每一项都在两个页面重复出现。
 
 - 多个上游 API profile：base URL / API key / model / protocol
 - protocol：`openai_chat` / `openai_responses` / `anthropic_messages`
@@ -69,7 +85,7 @@ UI 支持配置：
 - 是否记录未支持/失败 tools 到 SQLite `gateway_log.sqlite3`
 - 是否启用文本工具调用兜底：当上游没有返回原生 `tool_calls` / `tool_use`，但输出 `<function=Tool>` / `<parameter=name>` 标记时，Gateway 会解析并按工具归属处理；gateway-owned 工具执行并回填，用户侧工具返回下游原生 tool request。
 - 无限上下文/context router：启用、fan-out、max input tokens、chunk tokens、max chunks、max workers；`fanout_max_chunks=0` 表示按内容完整切片、不人为截断
-- 分流综合后的质量审查：可要求上游在综合后再进行检查、反思和调整，输出最终结论
+- Intelligence 请求前分析：规则或 LLM provider 分析问题，并把增强 system/reflection prompt 注入同一次主回答；当前不会在响应后自动评分、发起独立二次反思或重写答案
 - 本地 MCP / connector catalog JSON
 - HTTP Actions JSON
 - Admin 数字字段解析契约：上游/gateway/context/client-config 中的数字项会先按提交值解析；字段缺失或空字符串时保留已有配置；已有配置也不存在时才使用默认值；非法数字返回结构化 400 且不保存任何本次变更。
@@ -90,7 +106,7 @@ UI 支持配置：
 10. `/admin/upstream-profile` 保存单个 profile 时复用同一套上游数字解析；非法数字同样返回 400，不新增/覆盖 profile。
 11. 所有数字解析都走 `gateway_config._admin_form_int()` / `_admin_form_float()`：提交值优先，缺失/空值保留旧配置，再 fallback 到默认值。
 12. 只有全部字段解析成功后才调用 `save_config(cfg)`；因此非法数字不会产生“部分字段已写入”的配置污染。
-13. `gateway.max_tool_rounds` 保存后会被非流式 `run_tool_orchestration()` 和流式 `run_streaming_orchestration()` 使用；优先级是 `GATEWAY_MAX_TOOL_ROUNDS` 环境变量 > `gateway.max_tool_rounds` 配置 > 默认 `5`。
+13. `gateway.max_tool_rounds` 保存后会被非流式 `run_tool_orchestration()` 和流式 `run_streaming_orchestration()` 使用；优先级是 `GATEWAY_MAX_TOOL_ROUNDS` 环境变量 > `gateway.max_tool_rounds` 配置 > 默认 `10`。
 14. `gateway.max_concurrent_requests` / `concurrency_queue_timeout_seconds` 保存后会被 HTTP API 入口统一执行；`/v1/*`、direct tools、token count 和 `/v1/models` 都会先获取并发槽位，超过上限返回结构化 429，并在请求完成或异常时释放槽位。
 
 配置片段示例：
@@ -235,7 +251,7 @@ UI 支持添加多个下游 key，每个 key 记录：
 gateway_log.sqlite3
 ```
 
-当前默认使用 SQLite + WAL 存储请求、失败 tool 和统计，避免高频请求下每次 append JSONL / rewrite JSON 造成 IO 瓶颈。旧文件 `.gateway_requests.jsonl`、`.gateway_tool_failures.jsonl`、`.gateway_stats.json` 只作为历史导入和兼容读取，不再默认写入。
+当前默认使用 SQLite + WAL 存储请求、失败 tool 和主 HTTP/工具统计，避免高频请求下每次 append JSONL / rewrite JSON 造成 IO 瓶颈。旧文件 `.gateway_requests.jsonl`、`.gateway_tool_failures.jsonl`、`.gateway_stats.json` 只作为历史导入和兼容读取，不再默认写入。
 
 请求记录包含：
 
@@ -271,7 +287,7 @@ secret
 
 ## 5. 调用频次与失败记录
 
-统计存储：
+主 HTTP/工具统计存储：
 
 ```text
 gateway_log.sqlite3 / tool_stats / request_stats*
@@ -299,6 +315,8 @@ gateway_log.sqlite3 / tool_failures
 - `timeout`
 
 UI 会展示最近失败，作为后续去市场搜索 MCP/OpenAPI/action/plugin 支持的入口。
+
+`/api/stats/dashboard` 同时返回 `gateway_logging.py` 的主 HTTP snapshot，以及 `gateway_stats.py` 的辅助 dashboard、趋势和 top 数据。后者提供 request/tool/cache/quality/upstream 的 writer API，但当前生产 HTTP Handler 不会自动调用所有 writer；因此 cache、quality 或 upstream 辅助表可能为空，不能把它们描述成“每个请求都会写入”的主统计链。
 
 ---
 
@@ -442,7 +460,7 @@ HTTP Action 是当前已落地的第二类真实 executor。它适合把内部�
 - 请求和响应留存，方便复现和分析。
 
 
-### 2.8 workspace_root 优先级
+### 8.1 workspace_root 优先级
 
 工具读写根目录按以下顺序解析：
 

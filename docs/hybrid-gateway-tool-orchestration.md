@@ -1,5 +1,7 @@
 # Hybrid Tool Call Gateway：客户端工具 + Gateway 工具的真实编排方案
 
+> 历史设计快照：本文描述的是实现前的 native-only/MVP 方案，其中 `hybrid_auto`、默认 5 轮、“不解析文本工具调用”和“暂不实现 streaming”等内容不再代表当前实现。现行默认是 `tools_enabled=adapter` + `tool_mode=orchestrate`、默认 10 轮，并支持受控文本 adapter 与流式编排；请从 [`README.md`](../README.md)、[`文档中心`](README.md) 和 [`ARCHITECTURE.md`](ARCHITECTURE.md) 开始阅读。
+
 ## 1. 目标
 
 本方案用于实现一套稳定、真实、非 prompt-fake 的 API tools / function-call 中间层。
