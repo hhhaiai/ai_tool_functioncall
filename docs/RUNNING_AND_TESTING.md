@@ -495,9 +495,11 @@ python3 -m pytest -q
 ./scripts/ci_gate.sh
 ```
 
-2026-07-24 最近一次 clean-env 全量 pytest 结果为 `1492 passed, 2 skipped`。历史审计文档中的较小数字是当时快照，不是当前回归基线。
+2026-07-28 最近一次 `agent_planner_acceptance.sh --full` 在同一证据窗口完整通过：integration smoke 全部通过、focused gate `92 passed`、clean-env 全量 pytest `1495 passed, 2 skipped`，最终输出 `Agent Planner acceptance gate: PASS`。历史审计文档中的较小数字是当时快照，不是当前回归基线。
 
-当前 `agent_planner_acceptance.sh --full` 有一个验证脚本环境隔离限制：脚本以 `GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN=0` 启动整个 pytest 进程，而 `tests/test_config_sync.py` 会验证仓库默认值为 `true`，因此 smoke 与 focused gate 可通过，但脚本内全量阶段固定会出现 2 个配置同步断言失败。该失败不是 Gateway 请求链回归；在修复脚本变量作用域前，发布验收应同时单独运行 clean-env `python3 -m pytest -q`，并分别记录两个结果，不能把 `--full` 的非零退出码写成通过。
+full gate 的全量 pytest 子进程会先 `unset GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN`，避免 smoke/模式专用环境覆盖污染验证仓库默认值的 config-sync 用例。回归测试会用 fake `python3` 实际执行脚本并确认最后一条 `-m pytest -ra tests` 调用看不到该变量。两个 skip 是未设置 `TEST_UPSTREAM_URL` 的外部上游 E2E；它们不证明任何外部 provider 当前可用。
+
+同日 `./scripts/ci_gate.sh` 也在安装 `requirements-dev.txt` 的隔离环境中完整通过：compile/config、Ruff、17 个模块 Mypy、Bandit、`pip check`、`pip-audit`（无已知漏洞）、pytest、Git/secret guard、development/production Compose 渲染和 Docker 镜像构建/删除全部成功。开发依赖包含 Playwright；GitHub CI 显式安装 Chromium，并设置 `GATEWAY_REQUIRE_BROWSER_TESTS=1`，因此缺少 Playwright/Chromium 会直接失败而不是 skip。浏览器回归会真实打开 Config Center，验证四个状态请求、正常/降级/HTTP 错误/无效 JSON、刷新按钮和两个导航入口。仓库已跟踪两个门禁脚本的 executable bit，因此文档中的 `./scripts/...` 调用在新 checkout 中可直接执行。
 
 ### 5.6 当前稳定性 smoke（临时端口）
 

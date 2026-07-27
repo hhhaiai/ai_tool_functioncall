@@ -615,26 +615,83 @@ def render_web_config_ui(
         .btn-danger:hover {{
             background: #dc2626;
         }}
-        .status-bar {{
-            display: flex;
-            gap: 20px;
+        .runtime-status {{
+            margin-bottom: 20px;
             margin-top: 20px;
-            padding: 15px;
-            background: #f0fdf4;
-            border-radius: 8px;
-            border: 1px solid #bbf7d0;
+            padding: 20px;
+            background: #fff;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
         }}
-        .status-item {{
+        .runtime-status-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 16px;
+            margin-bottom: 16px;
+        }}
+        .runtime-status-header p {{
+            color: #666;
+            font-size: 13px;
+            margin-top: 3px;
+        }}
+        .runtime-status-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 12px;
+        }}
+        .status-card {{
+            border: 1px solid #e5e7eb;
+            border-radius: 10px;
+            padding: 14px;
+            background: #fafafa;
+            min-width: 0;
+        }}
+        .status-card-title {{
             display: flex;
             align-items: center;
             gap: 8px;
-            font-size: 14px;
+        }}
+        .status-summary {{
+            color: #555;
+            font-size: 13px;
+            margin-top: 8px;
         }}
         .status-dot {{
             width: 8px;
             height: 8px;
             border-radius: 50%;
+            background: #9ca3af;
+            flex-shrink: 0;
+        }}
+        .status-dot.status-ok {{
             background: #22c55e;
+        }}
+        .status-dot.status-degraded {{
+            background: #f59e0b;
+        }}
+        .status-dot.status-error {{
+            background: #ef4444;
+        }}
+        .status-card details {{
+            margin-top: 10px;
+        }}
+        .status-card summary {{
+            color: #2563eb;
+            cursor: pointer;
+            font-size: 12px;
+        }}
+        .status-payload {{
+            margin-top: 8px;
+            max-height: 220px;
+            overflow: auto;
+            padding: 10px;
+            border-radius: 8px;
+            background: #111827;
+            color: #e5e7eb;
+            font-size: 11px;
+            white-space: pre-wrap;
+            word-break: break-word;
         }}
         .nav-links {{
             margin-top: 20px;
@@ -658,6 +715,38 @@ def render_web_config_ui(
             <p>管理上游连接、能力配置、上下文管理、智能增强等设置</p>
         </header>
 
+        <section class="runtime-status" aria-labelledby="runtime-status-title">
+            <div class="runtime-status-header">
+                <div>
+                    <h2 id="runtime-status-title">运行状态</h2>
+                    <p>页面会从受保护的管理 API 实时读取统计、缓存、上游池和智力 Provider 状态。</p>
+                </div>
+                <button type="button" class="btn btn-secondary" id="refresh-status">刷新状态</button>
+            </div>
+            <div class="runtime-status-grid">
+                <article class="status-card" data-status-endpoint="/api/stats/dashboard">
+                    <div class="status-card-title"><span class="status-dot"></span><strong>请求统计</strong></div>
+                    <p class="status-summary">等待加载</p>
+                    <details><summary>查看原始状态</summary><pre class="status-payload">{{}}</pre></details>
+                </article>
+                <article class="status-card" data-status-endpoint="/api/cache/stats">
+                    <div class="status-card-title"><span class="status-dot"></span><strong>缓存</strong></div>
+                    <p class="status-summary">等待加载</p>
+                    <details><summary>查看原始状态</summary><pre class="status-payload">{{}}</pre></details>
+                </article>
+                <article class="status-card" data-status-endpoint="/api/upstreams/status">
+                    <div class="status-card-title"><span class="status-dot"></span><strong>上游池</strong></div>
+                    <p class="status-summary">等待加载</p>
+                    <details><summary>查看原始状态</summary><pre class="status-payload">{{}}</pre></details>
+                </article>
+                <article class="status-card" data-status-endpoint="/api/intelligence/status">
+                    <div class="status-card-title"><span class="status-dot"></span><strong>智力 Provider</strong></div>
+                    <p class="status-summary">等待加载</p>
+                    <details><summary>查看原始状态</summary><pre class="status-payload">{{}}</pre></details>
+                </article>
+            </div>
+        </section>
+
         <div class="tabs-container">
             <div class="tabs-nav">
                 {tab_nav}
@@ -678,13 +767,214 @@ def render_web_config_ui(
 
         <div class="nav-links">
             <a href="/ui">返回 Admin UI</a>
-            <a href="/ui/config/client">客户端配置</a>
-            <a href="/stats">统计信息</a>
+            <a href="/client-config">客户端配置</a>
+            <a href="/api/stats/dashboard">统计信息 JSON</a>
         </div>
     </div>
 
     <script>
         let configRevision = {revision_json};
+
+        function isRecord(value) {{
+            return value !== null && typeof value === 'object' && !Array.isArray(value);
+        }}
+
+        function isFiniteNumber(value) {{
+            return typeof value === 'number' && Number.isFinite(value);
+        }}
+
+        function isNonNegativeInteger(value) {{
+            return Number.isInteger(value) && value >= 0;
+        }}
+
+        function hasValidStatsPayload(payload) {{
+            const http = payload.http;
+            const dashboard = payload.dashboard;
+            return isRecord(http)
+                && isRecord(dashboard)
+                && isFiniteNumber(http.total_requests)
+                && isFiniteNumber(dashboard.timestamp)
+                && isRecord(dashboard.requests)
+                && isRecord(dashboard.tools);
+        }}
+
+        function isValidUpstreamProfile(profile) {{
+            return isRecord(profile)
+                && typeof profile.healthy === 'boolean'
+                && isNonNegativeInteger(profile.success_count)
+                && isNonNegativeInteger(profile.consecutive_failures);
+        }}
+
+        function hasValidPersistenceStats(payload) {{
+            const persistent = payload.cache?.persistence;
+            return isRecord(persistent)
+                && typeof persistent.db_path === 'string'
+                && persistent.db_path.length > 0
+                && isNonNegativeInteger(persistent.semantic_cache_entries)
+                && isNonNegativeInteger(persistent.tool_cache_entries)
+                && isNonNegativeInteger(persistent.memories);
+        }}
+
+        function hasValidIntelligenceStatus(payload) {{
+            const intelligence = payload.intelligence;
+            const runtime = intelligence?.runtime;
+            return isRecord(intelligence)
+                && (intelligence.mode === 'rules' || intelligence.mode === 'llm')
+                && typeof intelligence.provider === 'string'
+                && intelligence.provider.length > 0
+                && typeof intelligence.provider_registered === 'boolean'
+                && typeof intelligence.strict_mode === 'boolean'
+                && typeof intelligence.upstream_configured === 'boolean'
+                && isRecord(runtime)
+                && isNonNegativeInteger(runtime.calls)
+                && isNonNegativeInteger(runtime.successes)
+                && isNonNegativeInteger(runtime.failures)
+                && typeof runtime.last_error_type === 'string';
+        }}
+
+        function summarizeStatus(endpoint, payload) {{
+            if (endpoint === '/api/stats/dashboard') {{
+                if (!hasValidStatsPayload(payload)) {{
+                    return '统计状态不可用';
+                }}
+                const total = payload.http?.total_requests ?? payload.http?.requests?.total ?? 0;
+                return 'HTTP 请求总数：' + total;
+            }}
+            if (endpoint === '/api/cache/stats') {{
+                if (!hasValidPersistenceStats(payload)) {{
+                    return '持久化状态不可用';
+                }}
+                const persistent = payload.cache.persistence;
+                const semantic = persistent.semantic_cache_entries ?? 0;
+                const tools = persistent.tool_cache_entries ?? 0;
+                const memories = persistent.memories ?? 0;
+                return '持久化：语义 ' + semantic + '，工具 ' + tools + '，记忆 ' + memories;
+            }}
+            if (endpoint === '/api/upstreams/status') {{
+                const pool = payload.upstream_pool || {{}};
+                const profiles = Array.isArray(pool.profiles) ? pool.profiles : [];
+                const validProfiles = profiles.filter(isValidUpstreamProfile);
+                const invalid = profiles.length - validProfiles.length;
+                const available = validProfiles.filter(profile => profile.healthy === true).length;
+                const successes = validProfiles.reduce(
+                    (total, profile) => total + profile.success_count,
+                    0,
+                );
+                const failing = validProfiles.filter(
+                    profile => profile.consecutive_failures > 0,
+                ).length;
+                const invalidDetail = invalid > 0 ? '，无效状态 ' + invalid + ' 个' : '';
+                return '配置 ' + profiles.length + ' 个上游，断路器可用 ' + available + ' 个，成功调用 ' + successes + ' 次，连续失败 ' + failing + ' 个' + invalidDetail;
+            }}
+            if (endpoint === '/api/intelligence/status') {{
+                if (!hasValidIntelligenceStatus(payload)) {{
+                    return 'Provider 状态不可用';
+                }}
+                const intelligence = payload.intelligence || {{}};
+                let detail = '';
+                if (intelligence.mode === 'llm' && !intelligence.provider_registered) {{
+                    detail = '；Provider 未注册';
+                }} else if (
+                    intelligence.mode === 'llm'
+                    && intelligence.provider === 'gateway_upstream'
+                    && !intelligence.upstream_configured
+                ) {{
+                    detail = '；上游未配置';
+                }} else if (intelligence.mode === 'llm' && intelligence.runtime?.last_error_type) {{
+                    detail = '；最近错误：' + intelligence.runtime.last_error_type;
+                }}
+                return '模式：' + (intelligence.mode || 'unknown') + '；Provider：' + (intelligence.provider || 'unknown') + detail;
+            }}
+            return '状态已加载';
+        }}
+
+        function classifyStatus(endpoint, payload) {{
+            if (endpoint === '/api/stats/dashboard') {{
+                return hasValidStatsPayload(payload) ? 'ok' : 'degraded';
+            }}
+            if (endpoint === '/api/cache/stats') {{
+                return hasValidPersistenceStats(payload) ? 'ok' : 'degraded';
+            }}
+            if (endpoint === '/api/upstreams/status') {{
+                const profiles = Array.isArray(payload.upstream_pool?.profiles)
+                    ? payload.upstream_pool.profiles
+                    : [];
+                const allProfilesValid = profiles.length > 0
+                    && profiles.every(isValidUpstreamProfile);
+                const verifiedAvailable = profiles.some(
+                    profile => isValidUpstreamProfile(profile)
+                        && profile.healthy === true
+                        && profile.success_count > 0
+                        && profile.consecutive_failures === 0,
+                );
+                return allProfilesValid && verifiedAvailable ? 'ok' : 'degraded';
+            }}
+            if (endpoint === '/api/intelligence/status') {{
+                if (!hasValidIntelligenceStatus(payload)) {{
+                    return 'degraded';
+                }}
+                const intelligence = payload.intelligence || {{}};
+                if (intelligence.mode !== 'llm') {{
+                    return intelligence.mode === 'rules' ? 'ok' : 'degraded';
+                }}
+                if (!intelligence.provider_registered) {{
+                    return 'degraded';
+                }}
+                if (
+                    intelligence.provider === 'gateway_upstream'
+                    && !intelligence.upstream_configured
+                ) {{
+                    return 'degraded';
+                }}
+                if (intelligence.runtime?.last_error_type) {{
+                    return 'degraded';
+                }}
+                return 'ok';
+            }}
+            return 'degraded';
+        }}
+
+        async function loadStatusCards() {{
+            const cards = Array.from(document.querySelectorAll('[data-status-endpoint]'));
+            await Promise.all(cards.map(async card => {{
+                const endpoint = card.getAttribute('data-status-endpoint');
+                const dot = card.querySelector('.status-dot');
+                const summary = card.querySelector('.status-summary');
+                const payloadNode = card.querySelector('.status-payload');
+                dot.classList.remove('status-ok', 'status-degraded', 'status-error');
+                summary.textContent = '加载中…';
+                try {{
+                    const response = await fetch(endpoint, {{
+                        headers: {{ 'Accept': 'application/json' }},
+                        credentials: 'same-origin',
+                        cache: 'no-store',
+                    }});
+                    let payload;
+                    try {{
+                        payload = await response.json();
+                    }} catch (_error) {{
+                        throw new Error('响应不是有效 JSON');
+                    }}
+                    if (!payload || Array.isArray(payload) || typeof payload !== 'object') {{
+                        throw new Error('响应 JSON 必须是对象');
+                    }}
+                    if (!response.ok) {{
+                        throw new Error(payload.error?.message || ('HTTP ' + response.status));
+                    }}
+                    dot.classList.add('status-' + classifyStatus(endpoint, payload));
+                    summary.textContent = summarizeStatus(endpoint, payload);
+                    payloadNode.textContent = JSON.stringify(payload, null, 2);
+                }} catch (error) {{
+                    dot.classList.add('status-error');
+                    summary.textContent = '加载失败：' + error.message;
+                    payloadNode.textContent = JSON.stringify({{ error: error.message }}, null, 2);
+                }}
+            }}));
+        }}
+
+        document.getElementById('refresh-status').addEventListener('click', loadStatusCards);
+        loadStatusCards();
+
         // Tab switching
         document.querySelectorAll('.tab-btn').forEach(btn => {{
             btn.addEventListener('click', () => {{

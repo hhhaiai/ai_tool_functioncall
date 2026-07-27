@@ -1,19 +1,19 @@
 # Gateway 实现状态文档
 
-> 最后更新: 2026-07-24
+> 最后更新: 2026-07-28
 
-## 2026-07-24 当前能力校准
+## 2026-07-28 当前能力校准
 
 - OpenAI Chat、OpenAI Responses、Anthropic Messages 是当前完整编排路径。
 - Assistants / Threads 已升级为按认证下游 client 隔离的 Gateway-owned SQLite 生命周期，支持 assistants、threads、messages、runs、run steps、cancel 和 `submit_tool_outputs`；Run 当前为同步编排，不宣称 SSE Run streaming。
 - Web2API 已接入 `/v1/web2api`、`/api/web2api`、`/anthropic/v1/web2api`，并纳入认证、ACL、限流、准入、日志、SSRF/redirect 重检和大小边界。
 - 多上游由 `gateway_upstream_pool.py` 接入 canonical proxy path，支持 round-robin、least-connections、random、熔断恢复，以及非流式 429/502/503/504/timeout 的跨 profile 故障转移。SSE 只在选中的 profile 内做首事件前有界重试，当前不跨 profile；首事件输出后不重放。
 - `gateway_llm.py` 提供真实可插拔 intelligence provider registry；内置 `gateway_upstream` 复用 Gateway 上游凭据和 profile pool。production 接线只做请求前问题分析和 prompt enhancement；响应后的自动质量评分、独立二次反思或答案重写尚未接线。默认 `use_llm=false`，非 strict 失败回退规则，strict 模式明确失败。
-- `/ui/config` 是 canonical 9-Tab Config Center；配置、schema、stats、cache、upstream pool 和 intelligence 状态 API 都使用 Admin Basic Auth，写操作另要求 same-origin 并使用 revision 乐观并发控制。状态 API 已实现，但 Config Center 页面当前不会自动加载或渲染它们。
+- `/ui/config` 是 canonical 9-Tab Config Center；配置、schema、stats、cache、upstream pool 和 intelligence 状态 API 都使用 Admin Basic Auth，写操作另要求 same-origin 并使用 revision 乐观并发控制。页面会自动加载并渲染四个状态 API：满足字段与运行条件时显示正常，状态不完整、上游未有成功调用/全部不可用/存在连续失败、Provider 未注册或最近失败时显示降级，HTTP/JSON 加载失败时显示错误；原始 JSON 可展开查看。
 - 权威机器可读状态是 `GET /capabilities`；下方较早日期的历史记录用于追溯，不覆盖当前能力声明。
 - 当前机器可读公开面包含 24 条路径，Gateway registry 包含 67 个唯一 built-in tools。
-- 最终 clean-env CI 已通过 Ruff、17 个模块的 Mypy、Bandit、依赖一致性/漏洞审计、`1492 passed, 2 skipped`、两套 Compose 渲染和 Docker 构建/删除。官方 `mimo_gateway.sh verify` 五阶段、容器运行 smoke 和隔离 mock-upstream E2E 均有通过记录。
-- 本轮重新执行 `agent_planner_acceptance.sh --full` 时，integration smoke 与 focused gate `92 passed`；随后脚本把 `GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN=0` 带入整个全量 pytest，导致两个验证默认值为 `true` 的 config-sync 测试失败，结果为 `1490 passed, 2 failed, 2 skipped`。这是验收脚本环境隔离问题，不能记作 full gate 通过；clean-env pytest 必须单独记录。
+- 2026-07-28 `agent_planner_acceptance.sh --full` 已完整 PASS：integration smoke 全部通过、focused gate `92 passed`、clean-env 全量 pytest `1495 passed, 2 skipped`。两个 skip 是未配置 `TEST_UPSTREAM_URL` 的外部上游用例。
+- full gate 已移除 strict-mode 环境污染：全量 pytest 子进程会先 `unset GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN`，并有脚本级回归测试固定这一行为。2026-07-28 完整 CI 已通过 compile/config、Ruff、17 个模块 Mypy、Bandit、依赖检查/审计、pytest、Git/secret guard、两套 Compose 和 Docker build/remove；GitHub CI 显式安装 Chromium，缺少 Playwright/Chromium 时浏览器门禁失败；`mimo_gateway.sh verify` 的最近设备/CLI 级记录仍来自 2026-07-24。
 - 2026-07-24 上一次本地 ignored 配置 live probe 中，真实上游 `/v1/models` 可用，但 `/v1/chat/completions` 由提供方返回 401；直接绕过 Gateway 请求得到相同结果。该证据只说明当时外部凭据失效，不用来替代 mock-upstream/public-surface 的 Gateway 实现证明；取得有效凭据后仍应补跑 live chat。
 
 ## 2026-07-14 服务器外挂 Function Call 验证
@@ -494,7 +494,7 @@ python3 -m src.gateway_app --host 127.0.0.1 --port 8885
 | 边界条件 | test_edge_cases.py | ✅ |
 | 稳定性 | test_stability.py | ✅ |
 | 集成测试 | test_gateway_e2e.py | ✅ |
-| **Agent Planner 验收** | **`./scripts/agent_planner_acceptance.sh --full` + clean-env pytest，结果必须分开记录** | ⚠️ 当前 `--full` 有 strict env 作用域冲突 |
+| **Agent Planner 验收** | **`./scripts/agent_planner_acceptance.sh --full`** | ✅ smoke + focused `92 passed` + full `1495 passed, 2 skipped`，gate PASS（2026-07-28） |
 
 ---
 

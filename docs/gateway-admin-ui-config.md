@@ -1,6 +1,6 @@
 # Gateway Admin UI、配置、下游 Key 与请求留存
 
-> 最后校准：2026-07-24。当前管理面包含传统运维 Control Center `/ui` 与 schema-driven Config Center `/ui/config`；完整文档导航见 [`文档中心`](README.md)。
+> 最后校准：2026-07-28。当前管理面包含传统运维 Control Center `/ui` 与 schema-driven Config Center `/ui/config`；完整文档导航见 [`文档中心`](README.md)。
 
 ## 1. 当前实现
 
@@ -38,10 +38,11 @@ password: admin（开发/测试用默认值，生产环境必须通过环境变�
 - `/ui/config` 面向 canonical 运行配置，9 个标签页依次覆盖 upstream、capabilities、context、intelligence、concurrency、cache、tools、web2api 和 security。
 - `GET /api/config` 返回脱敏配置和 revision；`GET /api/config/schema` 返回可编辑 schema。
 - `POST /api/config` 与 `POST /api/config/update` 使用 revision 乐观并发控制，只接受 schema 中的字段，并在保存后定向刷新缓存、上游池、Web2API 或 Assistants store。Intelligence 每次请求动态读取配置，不需要 reset hook。
-- `/api/stats/dashboard`、`/api/cache/stats`、`/api/upstreams/status`、`/api/intelligence/status` 是独立、受 Basic Auth 保护的状态 API；当前 Config Center 页面只加载配置/schema 并提交更新，不会自动请求或渲染这些状态。
+- `/api/stats/dashboard`、`/api/cache/stats`、`/api/upstreams/status`、`/api/intelligence/status` 是独立、受 Basic Auth 保护的状态 API；Config Center 页面会在打开和点击“刷新状态”时并行请求它们，显示摘要、三态指示和可展开的原始 JSON。
+- 绿色表示响应满足字段契约且具备当前可证明的正常条件；黄色表示 API 可访问但状态不完整、上游未有成功调用/全部不可用/存在连续失败、Provider 未注册或最近失败；红色表示 HTTP 失败、无效 JSON 或非对象 JSON。上游 `healthy` 字段仅代表熔断器当前未打开，页面要求已有成功调用且当前连续失败为 0，才会把 profile 计入已验证可用。
 - 浏览器写请求还必须通过 same-origin 校验；CLI 可在不发送 Origin/Referer 的情况下使用 Basic Auth 调用。
 
-当前页面边界：`/ui/config` 底部模板仍包含 `/ui/config/client` 和 `/stats` 两个未注册快捷链接；在修复页面前，请直接使用已实现的 `/client-config` 与 `/api/stats/dashboard`。这不影响 Config API 和状态 API 本身。
+页面底部快捷入口使用已注册的 `/client-config` 与 `/api/stats/dashboard`；旧的 `/ui/config/client` 和 `/stats` 不再由页面生成。
 
 ---
 

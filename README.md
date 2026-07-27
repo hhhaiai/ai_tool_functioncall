@@ -57,7 +57,7 @@
 | 语义缓存（精确 + 相似匹配） | ✅ 已实现 | `src/gateway_cache.py` |
 | 请求前 Intelligence 分析（规则 + 可插拔 LLM provider） | ✅ 已接入非流式与流式编排；响应后质量评分/二次反思尚未接线 | `src/gateway_intelligence.py`, `src/gateway_llm.py` |
 | HTTP 请求/工具统计与辅助 Q&A 统计库 | ✅ 主链由 `gateway_logging.py` 采集；`gateway_stats.py` 为辅助数据源 | `src/gateway_logging.py`, `src/gateway_stats.py` |
-| Web 配置 UI（9 Tab） | ✅ 已实现 | `src/gateway_web_config.py` |
+| Web 配置 UI（9 Tab + 实时状态卡） | ✅ 已实现；自动读取 stats/cache/upstream/intelligence 状态 | `src/gateway_web_config.py` |
 | Assistants / Threads | ✅ Gateway-owned SQLite 生命周期、messages、runs、steps、tool-output resume、租户隔离 | `src/gateway_assistants.py` |
 | Web2API（网页转结构化 API） | ✅ 已接 `/v1/web2api`、`/api/web2api`、`/anthropic/v1/web2api` | `src/gateway_web2api.py` |
 | 单上游连接复用、重试、限界 | ✅ 已接入 | `src/gateway_proxy.py` |
@@ -65,7 +65,7 @@
 | Claude Code 兼容层 | ✅ 已实现 | `src/gateway_claude_compat.py` |
 | Admin UI / Config API / cache、stats、provider 状态 | ✅ 已实现 | `src/gateway_admin.py`, `src/gateway_admin_api.py` |
 
-运行时能力以 `GET /capabilities` 为准。模块文件存在或单元测试通过，不代表该模块已经接入生产 HTTP 请求路径。上述工具数字是 2026-07-24 对当前 registry 的运行时快照：67 个唯一 canonical 工具，178 个含别名 key。
+运行时能力以 `GET /capabilities` 为准。模块文件存在或单元测试通过，不代表该模块已经接入生产 HTTP 请求路径。上述工具数字是 2026-07-28 对当前 registry 的运行时快照：67 个唯一 canonical 工具，178 个含别名 key。
 
 当前回归测试（以实际门禁输出为准）：
 
@@ -76,14 +76,14 @@ python3 -m pytest -q
 # smoke-level Agent Planner / protocol / public-surface acceptance
 ./scripts/agent_planner_acceptance.sh
 
-# Agent Planner full gate（已知环境隔离限制见运行指南）
+# Agent Planner full gate（smoke、focused tests、clean-env 全量 pytest）
 ./scripts/agent_planner_acceptance.sh --full
 
 # 完整 CI 门禁：静态检查、依赖审计、pytest、配置、Compose、Docker
 ./scripts/ci_gate.sh
 ```
 
-最近一次本地完整 CI 验证（2026-07-24）：Ruff、17 个模块的 Mypy、Bandit、`pip check`、`pip-audit`、Compose、Docker build 和 clean-env 全量 pytest 均通过；pytest 为 `1492 passed, 2 skipped`。官方 `mimo_gateway.sh verify` 五阶段也完整通过，包括真实本地工具/两轮编排、安全边界、并发压力、Anthropic/Responses Skill 事件和本机 Claude/Codex CLI。当前 `agent_planner_acceptance.sh --full` 的全量阶段存在一个已记录的 strict-mode 环境变量作用域冲突，smoke/focused 结果与 clean-env pytest 结果必须分开判断，详见运行指南。生产/公网部署前仍必须配置非默认 Admin 凭证，并以部署环境自己的门禁输出为准。
+最近一次 Agent Planner 完整验收（2026-07-28）已通过：全部 integration smoke、focused gate `92 passed`、clean-env 全量 pytest `1495 passed, 2 skipped`，最终输出 `Agent Planner acceptance gate: PASS`。脚本会在全量阶段移除 `GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN` 覆盖，不再污染仓库默认值测试；两个 skip 是未设置 `TEST_UPSTREAM_URL` 的外部上游用例。同日完整 CI 也通过：compile/config、Ruff、17 个模块的 Mypy、Bandit、`pip check`、`pip-audit`（无已知漏洞）、pytest、Git/secret guard、两套 Compose 渲染和 Docker 镜像构建/删除均成功。GitHub CI 会显式安装 Chromium，并要求 Config Center 的 Playwright 浏览器回归真实执行；缺少 Playwright 或 Chromium 会使门禁失败。生产/公网部署前仍必须配置非默认 Admin 凭证，并以部署环境自己的门禁输出为准。
 
 本轮真实测试上游 / Mimo 兼容结论（2026-05-25，地址只保存在本地 ignored 配置或环境变量中）：
 

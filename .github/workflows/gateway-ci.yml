@@ -32,8 +32,12 @@ jobs:
             requirements-dev.txt
       - name: Install dependencies
         run: python -m pip install --upgrade pip && python -m pip install -r requirements-dev.txt
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
       - name: Validate changed-line whitespace
         if: github.event_name == 'pull_request'
         run: git diff --check "${{ github.event.pull_request.base.sha }}...${{ github.sha }}"
       - name: Run static, security, dependency, test, and deployment gates
         run: ./scripts/ci_gate.sh
+        env:
+          GATEWAY_REQUIRE_BROWSER_TESTS: "1"

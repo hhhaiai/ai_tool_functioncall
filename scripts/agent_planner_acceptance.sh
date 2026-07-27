@@ -113,10 +113,10 @@ fi
 
 if [[ "$FULL" == "1" ]]; then
   printf '
-==> GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN=0 python3 -m pytest -ra tests
+==> clean-env python3 -m pytest -ra tests
 '
 (
-  export GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN=0
+  unset GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN
   python3 -m pytest -ra tests
 )
 fi

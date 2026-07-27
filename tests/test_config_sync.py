@@ -6,6 +6,7 @@ silently overwrite those edits.  These tests pin the corrected behavior.
 """
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -168,6 +169,45 @@ class SyncActiveUpstreamTests(unittest.TestCase):
             self.assertIn("GATEWAY_RUNTIME_CLEANUP_DRY_RUN=${GATEWAY_RUNTIME_CLEANUP_DRY_RUN:-1}", compose)
             self.assertIn("GATEWAY_CONTEXT_MAX_INPUT_TOKENS=${GATEWAY_CONTEXT_MAX_INPUT_TOKENS:-1048576}", compose)
             self.assertIn("GATEWAY_CONTEXT_FANOUT_CHUNK_TOKENS=${GATEWAY_CONTEXT_FANOUT_CHUNK_TOKENS:-120000}", compose)
+
+    def test_agent_planner_full_gate_removes_mode_override_before_full_pytest(self):
+        root = Path(__file__).resolve().parent.parent
+        script = root / "scripts" / "agent_planner_acceptance.sh"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_python = Path(temp_dir) / "python3"
+            log_path = Path(temp_dir) / "python-calls.log"
+            fake_python.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s|%s\\n' \"${GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN-<unset>}\" \"$*\" >> \"$ACCEPTANCE_LOG\"\n",
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{temp_dir}:{env.get('PATH', '')}"
+            env["ACCEPTANCE_LOG"] = str(log_path)
+            env["GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN"] = "0"
+
+            try:
+                result = subprocess.run(
+                    ["bash", str(script), "--full"],
+                    cwd=root,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=30,
+                )
+            except subprocess.TimeoutExpired as exc:
+                self.fail(
+                    "Agent Planner acceptance regression timed out; "
+                    f"stdout={exc.stdout!r}; stderr={exc.stderr!r}"
+                )
+            calls = log_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(calls)
+        self.assertEqual(calls[-1], "<unset>|-m pytest -ra tests")
+        self.assertIn("Agent Planner acceptance gate: PASS", result.stdout)
 
     def test_integrated_feature_defaults_match_json_yaml_env_and_compose(self):
         root = Path(__file__).resolve().parent.parent

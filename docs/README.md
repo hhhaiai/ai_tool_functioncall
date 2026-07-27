@@ -1,6 +1,6 @@
 # 文档中心
 
-> 最后校准：2026-07-24。本文档是仓库内文档的统一入口，用来区分当前事实、专题说明、历史验收记录和工作日志。运行时能力始终以 `GET /capabilities` 和当前代码为准。
+> 最后校准：2026-07-28。本文档是仓库内文档的统一入口，用来区分当前事实、专题说明、历史验收记录和工作日志。运行时能力始终以 `GET /capabilities` 和当前代码为准。
 
 ## 先读哪些文档
 
@@ -28,8 +28,9 @@
 - 公开能力 registry 为 24 条路径；兼容别名会规范化到 canonical 路径。
 - Config Center 为 9 个标签页。
 - Gateway built-in registry 为 67 个唯一工具、178 个含别名注册项。
-- 2026-07-24 全量 pytest 结果为 `1492 passed, 2 skipped`。
-- 发布级门禁入口为 `./scripts/ci_gate.sh`；Agent Planner smoke/focused 验收入口为 `./scripts/agent_planner_acceptance.sh`。`--full` 当前存在 strict-mode 环境变量作用域冲突，必须与 clean-env `python3 -m pytest -q` 分开记录，见运行指南。
+- 2026-07-28 `./scripts/agent_planner_acceptance.sh --full` 结果为：integration smoke 全部通过、focused gate `92 passed`、clean-env 全量 pytest `1495 passed, 2 skipped`、最终 gate PASS。
+- 2026-07-28 `./scripts/ci_gate.sh` 完整通过：compile/config、Ruff、17 模块 Mypy、Bandit、依赖检查/审计、pytest、Git/secret guard、两套 Compose 和 Docker build/remove 均成功。
+- 发布级门禁入口为 `./scripts/ci_gate.sh`；Agent Planner smoke/focused 验收入口为 `./scripts/agent_planner_acceptance.sh`，`--full` 会在 smoke 后以无 mode 覆盖的环境运行全量 pytest。
 
 ## 实现真实性矩阵
 
@@ -42,7 +43,7 @@
 | Web2API | 3 条公开 POST 路径 → 真实 HTTP fetch / HTML extraction | SSRF/DNS/redirect、类型、大小、timeout | 本地真实 HTTP server integration + public-surface smoke | 已接生产 HTTP |
 | 多上游 | profile pool → proxy | 非流式 retryable error 跨 profile；400 不切换；熔断/恢复 | 多个本地 upstream 的 failover 测试 | 非流式已实现；SSE 只在已选 profile 内首事件前重试 |
 | Intelligence | 非流式/流式 orchestration 的上游请求前分析 → system/reflection prompt enhancement | provider fallback；strict mode 明确失败 | production call-site + provider/单元测试 | 已接请求前链；响应后自动评分/二次反思未接线 |
-| Config/Admin API | Basic Auth 路由 → schema-bound update → revision 原子保存 → 定向 runtime reset | same-origin、revision conflict、未知字段、非法值 | live HTTP integration | API 已实现；Config Center 不自动渲染状态 API |
+| Config/Admin API | Basic Auth 路由 → schema-bound update → revision 原子保存 → 定向 runtime reset；Config Center 自动读取四个状态 API | same-origin、revision conflict、未知字段、非法值；不完整运行状态显示降级，HTTP/JSON 加载错误显示失败 | live HTTP integration + 强制 Playwright/Chromium 浏览器回归 | API 与页面状态卡均已实现 |
 | Rate limit / admission | 所有公开入口 → SQLite token bucket / lease | 429、memory degraded fallback 或 fail closed | 两个真实 Gateway 进程共享状态测试 | 已接所有公开入口 |
 | Persistence / maintenance | app 初始化/后台维护 → SQLite cache、retention、bounded cleanup、vacuum | 组件失败进入 metrics/admin 状态 | persistence/maintenance integration | 已实现 |
 | Sandbox / process | 工具 runtime → 隔离 worker/process group/session scope | setup fail、timeout、cancel、输出上限 | OS 隔离、子进程清理和多 tenant/workspace 测试 | 已实现 |
@@ -50,8 +51,9 @@
 
 ### 已知验证与界面边界
 
-- `agent_planner_acceptance.sh --full` 当前把 `GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN=0` 带入整个 pytest 进程，与两个验证默认值为 `true` 的 config-sync 测试冲突；smoke/focused 可以通过，但该命令现状不能标为全绿。发布时另跑 clean-env 全量 pytest。
-- Config Center 当前只编辑 schema/config；状态 API 需要直接调用。页面底部 `/ui/config/client` 与 `/stats` 快捷链接尚未注册，实际入口是 `/client-config` 与 `/api/stats/dashboard`。
+- `agent_planner_acceptance.sh --full` 已修复 strict-mode 环境污染：full pytest 子进程会先移除 `GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN`。2026-07-28 同一证据窗口中命令整体 PASS。
+- Config Center 会自动加载 `/api/stats/dashboard`、`/api/cache/stats`、`/api/upstreams/status`、`/api/intelligence/status`，并保留原始 JSON 展开视图。绿色只用于满足状态契约的正常数据；缺字段、未有成功上游调用、全部上游不可用、上游存在连续失败、Provider 未注册或最近失败显示黄色降级；HTTP、无效 JSON 或非对象 JSON 显示红色加载失败。底部入口使用已注册的 `/client-config` 和 `/api/stats/dashboard`。
+- GitHub CI 显式执行 `python -m playwright install --with-deps chromium`，并通过 `GATEWAY_REQUIRE_BROWSER_TESTS=1` 禁止浏览器回归静默 skip。
 - 仓库 mock-upstream/public-surface smoke 能证明 Gateway 路由、协议和副作用。只有配置 `TEST_UPSTREAM_URL` 后运行的 live E2E 才能证明某个外部供应商在当时凭据和网络条件下可用；两类证据不混写。
 
 ## 当前操作与参考文档
@@ -90,7 +92,7 @@
 
 | 文档 | 快照日期/用途 |
 |---|---|
-| [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) | 2026-07-24 顶部为当前摘要，后续为按日期增量日志 |
+| [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) | 2026-07-28 顶部为当前摘要，后续为按日期增量日志 |
 | [`CURRENT_FILE_CLASS_AUDIT_2026-07-05.md`](CURRENT_FILE_CLASS_AUDIT_2026-07-05.md) | 2026-07-05 逐文件/逐类审计 |
 | [`CURRENT_AUDIT.md`](CURRENT_AUDIT.md) | 2026-06-19 结构与安全审计快照 |
 | [`CLASS_ARCHITECTURE_ANALYSIS.md`](CLASS_ARCHITECTURE_ANALYSIS.md) | 2026-06-17 类架构快照 |

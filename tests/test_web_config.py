@@ -253,6 +253,33 @@ class TestRenderWebConfigUI:
         assert "<script>" in html
         assert "tab-btn" in html
 
+    def test_renders_live_status_cards_and_registered_navigation(self):
+        html = render_web_config_ui()
+        for endpoint in (
+            "/api/stats/dashboard",
+            "/api/cache/stats",
+            "/api/upstreams/status",
+            "/api/intelligence/status",
+        ):
+            assert f'data-status-endpoint="{endpoint}"' in html
+        assert "loadStatusCards()" in html
+        assert "classifyStatus(endpoint, payload)" in html
+        assert "hasValidStatsPayload(payload)" in html
+        assert "isValidUpstreamProfile(profile)" in html
+        assert "hasValidPersistenceStats(payload)" in html
+        assert "hasValidIntelligenceStatus(payload)" in html
+        assert "status-degraded" in html
+        assert "成功调用" in html
+        assert "连续失败" in html
+        assert "无效状态" in html
+        assert "统计状态不可用" in html
+        assert "最近错误：" in html
+        assert "响应不是有效 JSON" in html
+        assert 'href="/client-config"' in html
+        assert 'href="/api/stats/dashboard"' in html
+        assert 'href="/ui/config/client"' not in html
+        assert 'href="/stats"' not in html
+
 
 class TestHandleConfigGet:
     def test_returns_html(self):
