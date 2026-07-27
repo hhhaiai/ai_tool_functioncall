@@ -5,6 +5,7 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 import sys
@@ -180,7 +181,7 @@ class TestCachePersistence(unittest.TestCase):
         cleared = clear_persistent_caches(strict=True)
 
         self.assertEqual(cleared, {"semantic": 1, "tools": 1})
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             semantic_count = conn.execute("SELECT COUNT(*) FROM semantic_cache").fetchone()[0]
             tool_count = conn.execute("SELECT COUNT(*) FROM tool_cache").fetchone()[0]
         self.assertEqual((semantic_count, tool_count), (0, 0))
@@ -189,7 +190,7 @@ class TestCachePersistence(unittest.TestCase):
         close_persistence()
         if os.path.exists(self.db_path):
             os.remove(self.db_path)
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY, applied_at REAL NOT NULL)")
             conn.executemany(
                 "INSERT INTO schema_version(version, applied_at) VALUES (?, ?)",
@@ -222,7 +223,7 @@ class TestCachePersistence(unittest.TestCase):
             )
 
         init_persistence(PersistenceConfig(enabled=True, db_path=self.db_path))
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(tool_cache)")}
             count = conn.execute("SELECT COUNT(*) FROM tool_cache").fetchone()[0]
             version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
