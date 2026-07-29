@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import ast
+import glob
 import re
+import shlex
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -115,3 +117,21 @@ def test_all_project_docs_are_reachable_from_the_docs_index() -> None:
     expected = set(docs_root.rglob("*.md"))
     unreachable = sorted(str(path.relative_to(ROOT)) for path in expected - visited)
     assert not unreachable, "docs missing from docs/README.md navigation:\n" + "\n".join(unreachable)
+
+
+def test_dockerfile_copy_sources_exist() -> None:
+    missing: list[str] = []
+
+    for line_number, raw_line in enumerate(
+        (ROOT / "Dockerfile").read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        line = raw_line.strip()
+        if not line.startswith("COPY ") or "--from=" in line:
+            continue
+        tokens = [token for token in shlex.split(line[5:]) if not token.startswith("--")]
+        for source in tokens[:-1]:
+            matches = glob.glob(str(ROOT / source))
+            if not matches:
+                missing.append(f"Dockerfile:{line_number} -> {source}")
+
+    assert not missing, "Docker COPY sources missing from the build context:\n" + "\n".join(missing)

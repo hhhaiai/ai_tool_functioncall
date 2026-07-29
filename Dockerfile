@@ -23,7 +23,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application source
 COPY src/ src/
 COPY scripts/ scripts/
-COPY config/ config/
 COPY gateway.config.json gateway.config.yaml ./
 COPY mcp_defaults.yaml ./
 
