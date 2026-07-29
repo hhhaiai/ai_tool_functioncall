@@ -1,6 +1,6 @@
 # Gateway Deployment Guide
 
-> Last calibrated: 2026-07-24. See the [`documentation center`](README.md) for source-of-truth order and the distinction between current guides and historical audit snapshots.
+> Last calibrated: 2026-07-29. See the [`documentation center`](README.md) for source-of-truth order and the distinction between current guides and historical audit snapshots.
 
 ## Quick Start (Development)
 

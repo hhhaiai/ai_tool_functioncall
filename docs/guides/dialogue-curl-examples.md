@@ -1,5 +1,7 @@
 # 不同对话 API 的 curl 调用形态
 
+> 最后校准：2026-07-29。示例使用占位变量；公开路径以 `GET /capabilities` 为准，外部 Provider 原生工具兼容需单独 live 验证。
+
 > 目标：先把常见对话接口梳理清楚，再决定如何在“不一定原生支持 tools/function call”的上游 API 之上补一层工具能力。
 
 ## 1. OpenAI Chat Completions：`POST /v1/chat/completions`

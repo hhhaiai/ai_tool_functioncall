@@ -2,36 +2,32 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.mypy_cache/
 .pytest_cache/
 .ruff_cache/
 .omx/
 .learnings/
+
 # macOS
 .DS_Store
 
-# Gateway runtime artifacts (generated locally; keep request history out of git)
+# Gateway runtime artifacts and request history
 .gateway_*.json
 .gateway_requests.jsonl
 .gateway_tool_failures.jsonl
-gateway_log.sqlite3
-gateway_log.sqlite3-*
 .gateway_runtime/
 .gateway_smoke/
 .gateway_smoke_external_project/
-
-# Local config (contains secrets)
-.gateway_service.json
-.gateway_local.json
+gateway_log.sqlite3*
+.traces/
+case.txt
+.case.txt
 
 # Ad-hoc local logs
 /tmp/gateway-*.log
 /tmp/ai_tool_functioncall_*.log
-.gateway_service.json
-case.txt
-.omx/
-.case.txt
-.traces/
-# Environment/secrets (keep .env.example tracked)
+
+# Environment and secrets; keep the documented template tracked
 .env
 .env.local
 .env.*
@@ -39,5 +35,6 @@ case.txt
 *.pem
 *.key
 nginx/ssl/
+
+# Local workspaces mounted or generated for tool execution
 workspace/
-.case.txt

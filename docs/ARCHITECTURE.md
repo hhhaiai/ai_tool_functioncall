@@ -1,6 +1,6 @@
 # Gateway 架构文档
 
-> 最后校准：2026-07-24。文档导航和历史资料边界见 [`文档中心`](README.md)；机器可读运行时能力以 `GET /capabilities` 为准。
+> 最后校准：2026-07-29。文档导航和历史资料边界见 [`文档中心`](README.md)；机器可读运行时能力以 `GET /capabilities` 为准。
 
 > 真实测试上游 / Mimo 作为上游时默认按 **Gateway adapter** 处理：`tools_enabled=adapter`，`supports_tools=false`，`supports_function_calls=false`。真实地址只放本地 `.gateway_service.json`、`.env` 或运行时环境变量，不写入提交代码。当前探针显示 `/v1/messages` 在 forced tool_choice 下可返回 Anthropic `tool_use`，但上游直连没有 `/anthropic` 别名、没有 `/v1/tools/call` / `/v1/functions/call`，且 `/v1/responses` forced tool probe 未返回 Codex 需要的 `function_call`。因此 Claude Code/Codex 不直连该上游执行工具，而是连接 Gateway：Gateway-owned 工具（HTTP Action/MCP/WebFetch/WebSearch/calculator/Memory 等）由 Gateway 真执行；用户侧机器工具（Read/LS/Bash/Skill/GUI/local agent 等）由 Gateway 转成下游原生 tool request，让客户端在用户机器执行后回传结果。Mimo 上下文按 `1048576` tokens（1M）配置。
 

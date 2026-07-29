@@ -2,7 +2,7 @@
 
 更新时间：2026-07-07
 
-> 历史验收快照：矩阵保留 2026-07-07 当时的 21 条公开路径和 `1053 passed, 2 skipped` 证据。当前 registry 为 24 条路径，2026-07-24 全量 pytest 为 `1492 passed, 2 skipped`；现行入口见 [`文档中心`](README.md) 与 [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) 顶部校准。
+> 历史验收快照：矩阵保留 2026-07-07 当时的 21 条公开路径和 `1053 passed, 2 skipped` 证据。当前 registry 为 24 条路径，2026-07-24 全量 pytest 为 `1492 passed, 2 skipped`；现行入口见 [`文档中心`](../../README.md) 与 [`IMPLEMENTATION_STATUS.md`](../../IMPLEMENTATION_STATUS.md) 顶部校准。
 
 目的：把用户目标“真正实现 Agent Planner 方式；每一个沟通严格匹配 Agent Planner；每一个功能都支持；分析对话历史；实现所有功能”拆成可验证 requirement，避免把局部 smoke、单个 live 请求、或静态配置误当作全局完成。
 

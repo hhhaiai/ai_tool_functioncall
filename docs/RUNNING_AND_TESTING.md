@@ -2,7 +2,7 @@
 
 本文档涵盖从零开始部署、配置、启动和验证 `AI Tool FunctionCall Gateway` 的完整流程。
 
-> 最后校准：2026-07-24。文档导航与历史/当前资料边界见 [`文档中心`](README.md)。当前机器可读能力以 `GET /capabilities` 为准。
+> 最后校准：2026-07-29。文档导航与历史/当前资料边界见 [`文档中心`](README.md)。当前机器可读能力以 `GET /capabilities` 为准。
 
 **特性**：核心服务以 Python 实现，使用 `cryptography` 加密持久配置中的敏感值，并可选使用 Pillow/GUI 依赖；支持 macOS / Linux / Windows (WSL)。
 
@@ -915,4 +915,4 @@ ai_tool_functioncall/
 
 ---
 
-**最后更新**: 2026-07-24
+**最后更新**: 2026-07-29

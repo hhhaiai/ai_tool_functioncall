@@ -70,7 +70,7 @@ scoped live audit: 12/12 proven/current_scope, missing_session_count=0
 
 ### 已修复的 CRITICAL/HIGH 问题 (15 项)
 
-详见 [CRITICAL_FIXES.md](./CRITICAL_FIXES.md)
+详见 [CRITICAL_FIXES.md](CRITICAL_FIXES.md)
 
 ## 安全状态
 
@@ -83,7 +83,7 @@ scoped live audit: 12/12 proven/current_scope, missing_session_count=0
 
 ## 竞品对比
 
-详见 [COMPETITIVE_ANALYSIS.md](./COMPETITIVE_ANALYSIS.md)
+详见 [COMPETITIVE_ANALYSIS.md](COMPETITIVE_ANALYSIS.md)
 
 **我们的独特优势** (竞品均无):
 - 无限上下文 (自动压缩 + 记忆 + 扇出并行)

@@ -362,15 +362,16 @@ src/
 | 文档 | 用途 |
 |---|---|
 | [`docs/README.md`](docs/README.md) | **统一文档中心**：当前入口、权威级别、全部文档分类和能力覆盖矩阵 |
-| [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) | 顶部为当前能力校准，后续为按日期实现记录 |
+| [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) | 当前能力、生产调用链、边界与最新验证证据 |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 上游/中游/下游定位、模块边界、请求流程 |
 | [`docs/RUNNING_AND_TESTING.md`](docs/RUNNING_AND_TESTING.md) | 部署、配置、启动、测试、API 验证 |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | 生产环境部署指南 |
-| [`docs/gateway-admin-ui-config.md`](docs/gateway-admin-ui-config.md) | Admin UI、下游 key、能力配置 |
-| [`docs/gateway-infinite-context-memory.md`](docs/gateway-infinite-context-memory.md) | 长上下文、SQLite 记忆、fan-out |
-| [`CLAUDE.md`](CLAUDE.md) | 历史开发进度日志；当前事实以上述入口和 `GET /capabilities` 为准 |
+| [`docs/guides/`](docs/guides/README.md) | 当前操作指南：弱上游 adapter、curl、Admin/Config |
+| [`docs/reference/`](docs/reference/README.md) | 当前技术参考：Agent Runtime、工具、上下文、格式映射 |
+| [`docs/archive/`](docs/archive/README.md) | 历史审计、旧设计、旧进度和 Workspace 修复材料 |
+| [`CLAUDE.md`](CLAUDE.md) | 当前项目协作说明、所有权边界和必跑门禁 |
 
-带日期的审计、验收矩阵、`docs/progress/` 与 `docs/archive/` 属于历史证据。它们保留当时的路径和测试数字，不用于覆盖当前能力声明；完整分类见文档中心。
+所有项目文档已统一整理到 `docs/`；根目录仅保留 README 与项目协作说明。带日期的审计、验收矩阵、旧设计和旧进度统一位于 `docs/archive/`，只作为历史证据，不用于覆盖当前能力声明。
 
 ---
 
