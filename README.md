@@ -83,7 +83,9 @@ python3 -m pytest -q
 ./scripts/ci_gate.sh
 ```
 
-最近一次 Agent Planner 完整验收（2026-07-28）已通过：全部 integration smoke、focused gate `92 passed`、clean-env 全量 pytest `1495 passed, 2 skipped`，最终输出 `Agent Planner acceptance gate: PASS`。脚本会在全量阶段移除 `GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN` 覆盖，不再污染仓库默认值测试；两个 skip 是未设置 `TEST_UPSTREAM_URL` 的外部上游用例。同日完整 CI 也通过：compile/config、Ruff、17 个模块的 Mypy、Bandit、`pip check`、`pip-audit`（无已知漏洞）、pytest、Git/secret guard、两套 Compose 渲染和 Docker 镜像构建/删除均成功。GitHub CI 会显式安装 Chromium，并要求 Config Center 的 Playwright 浏览器回归真实执行；缺少 Playwright 或 Chromium 会使门禁失败。生产/公网部署前仍必须配置非默认 Admin 凭证，并以部署环境自己的门禁输出为准。
+当前整理发布的 CI 证据是 2026-07-29 的 [GitHub Actions run 30472613525](https://github.com/hhhaiai/ai_tool_functioncall/actions/runs/30472613525)：提交 `45837d91ce8d4294d9b18a979215f9c573f00d7e` 在 Python 3.10 和 3.11 上均为 `1500 passed, 4 skipped`，compile/config、Ruff、17 个模块的 Mypy、Bandit、`pip check`、`pip-audit`（无已知漏洞）、Git/secret guard、两套 Compose 渲染和 Docker 镜像构建/删除全部通过。四个 skip 是两个未配置 `TEST_UPSTREAM_URL` 的实时外部上游用例和两个 Linux CI 不适用的 macOS `sandbox-exec` 用例；Playwright/Chromium 浏览器回归已真实执行。
+
+最近一次 Agent Planner 完整验收（2026-07-28）也已通过：全部 integration smoke、focused gate `92 passed`、clean-env 全量 pytest `1495 passed, 2 skipped`，最终输出 `Agent Planner acceptance gate: PASS`。脚本会在全量阶段移除 `GATEWAY_AGENT_PLANNER_STRICT_EVERY_TURN` 覆盖，不再污染仓库默认值测试。生产/公网部署前仍必须配置非默认 Admin 凭证，并以部署环境自己的门禁输出为准。
 
 本轮真实测试上游 / Mimo 兼容结论（2026-05-25，地址只保存在本地 ignored 配置或环境变量中）：
 

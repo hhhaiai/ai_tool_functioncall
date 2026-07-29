@@ -70,6 +70,10 @@
 | Config Center 标签页 | 9 |
 | Config Center 字段 | 89 |
 
+### 当前发布验证
+
+2026-07-29 的代码与文档整理提交 `45837d91ce8d4294d9b18a979215f9c573f00d7e` 已通过 [GitHub Actions run 30472613525](https://github.com/hhhaiai/ai_tool_functioncall/actions/runs/30472613525)：Python 3.10 与 3.11 均为 `1500 passed, 4 skipped`，静态检查、安全和依赖门禁、Config Center 浏览器回归、development/production Compose 渲染以及 Docker 镜像构建/删除全部成功。四个 skip 是两个实时外部上游用例和两个仅适用于 macOS 的沙箱用例，不代表外部 Provider 已做 live 验证。
+
 ### 能力真实性矩阵
 
 | 能力 | 生产入口 | 当前边界 |

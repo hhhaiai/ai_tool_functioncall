@@ -166,7 +166,22 @@ Config Center 的字段分布：
 
 ## 7. 测试证据
 
-### 最近已发布稳定基线
+### 当前整理发布验证
+
+2026-07-29，代码与文档整理提交 `45837d91ce8d4294d9b18a979215f9c573f00d7e` 已由 [GitHub Actions run 30472613525](https://github.com/hhhaiai/ai_tool_functioncall/actions/runs/30472613525) 在两套 Python 环境完整验证：
+
+```text
+Python 3.10:                success, 1500 passed, 4 skipped
+Python 3.11:                success, 1500 passed, 4 skipped
+Compile/config/Ruff/Mypy:   PASS
+Bandit/pip check/pip-audit: PASS（无已知依赖漏洞）
+Compose development/prod:  PASS
+Docker build/remove:       PASS
+```
+
+CI 运行在 Linux；四个 skip 分别是两个未设置 `TEST_UPSTREAM_URL` 的实时外部上游用例，以及两个仅在 macOS 执行的 `sandbox-exec` 强制隔离用例。Config Center 的 Playwright/Chromium 浏览器测试没有被跳过。
+
+### Agent Planner 完整验收基线
 
 2026-07-28，commit `0c2bfbdb3a0b973a5a377fb63dfbf528ea3c02b5`：
 
@@ -180,7 +195,7 @@ GitHub Python 3.11:         success
 GitHub run:                 30290530328
 ```
 
-两个 skip 是未设置 `TEST_UPSTREAM_URL` 的外部上游用例，因此该基线证明 Gateway 本身、mock/public-surface 集成、浏览器配置中心和部署门禁，不证明任意外部 Provider 在 2026-07-28 之后仍实时可用。
+两个 skip 是未设置 `TEST_UPSTREAM_URL` 的外部上游用例，因此该验收证明 Gateway 本身、mock/public-surface 集成、浏览器配置中心和部署门禁，不证明任意外部 Provider 在 2026-07-28 之后仍实时可用。
 
 ### 当前发布门禁
 

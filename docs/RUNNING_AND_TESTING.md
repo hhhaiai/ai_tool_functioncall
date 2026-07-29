@@ -501,6 +501,8 @@ full gate 的全量 pytest 子进程会先 `unset GATEWAY_AGENT_PLANNER_STRICT_E
 
 同日 `./scripts/ci_gate.sh` 也在安装 `requirements-dev.txt` 的隔离环境中完整通过：compile/config、Ruff、17 个模块 Mypy、Bandit、`pip check`、`pip-audit`（无已知漏洞）、pytest、Git/secret guard、development/production Compose 渲染和 Docker 镜像构建/删除全部成功。开发依赖包含 Playwright；GitHub CI 显式安装 Chromium，并设置 `GATEWAY_REQUIRE_BROWSER_TESTS=1`，因此缺少 Playwright/Chromium 会直接失败而不是 skip。浏览器回归会真实打开 Config Center，验证四个状态请求、正常/降级/HTTP 错误/无效 JSON、刷新按钮和两个导航入口。仓库已跟踪两个门禁脚本的 executable bit，因此文档中的 `./scripts/...` 调用在新 checkout 中可直接执行。
 
+2026-07-29 的代码与文档整理提交 `45837d91ce8d4294d9b18a979215f9c573f00d7e` 又由 [GitHub Actions run 30472613525](https://github.com/hhhaiai/ai_tool_functioncall/actions/runs/30472613525) 重新执行完整 `ci_gate.sh`：Python 3.10 和 3.11 均为 `1500 passed, 4 skipped`，静态、安全、依赖、浏览器、Compose 和 Docker 门禁全部成功。Linux CI 的四个 skip 是两个需要 `TEST_UPSTREAM_URL` 的实时上游用例，以及两个仅在 macOS 执行的 `sandbox-exec` 用例；不能据此声明外部 Provider 已实时验证。
+
 ### 5.6 当前稳定性 smoke（临时端口）
 
 不想影响本机 8885 服务时，可用临时配置和端口启动真实进程：
