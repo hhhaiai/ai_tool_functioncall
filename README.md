@@ -35,7 +35,7 @@
    如果上游完全不支持 tools，或只部分支持 tools，Gateway 可以把工具定义以文本协议方式提供给上游模型，解析上游返回的文本工具调用，再按工具归属处理：HTTP Action/MCP/网络/纯函数/记忆等 Gateway-owned 工具由 Gateway 真执行并回填；Read/LS/Bash/Skill/GUI/local agent 等用户侧工具返回下游原生工具请求，由 Claude Code/Codex 在用户机器执行并把结果回传。
 
 3. **配置与能力声明**
-   Gateway 提供受 Basic Auth 保护的运维控制台，以及独立的 9-Tab `/ui/config` Config Center。运维面可管理上游 profile、下游 key、能力矩阵、MCP、HTTP Actions 和 **Skills**；Config Center 通过带 revision 的原子更新管理实际运行时字段。Admin UI 可通过上游 `/v1/models` 自动拉取模型列表。
+   Gateway 提供受 Basic Auth 保护的运维控制台，以及独立的 10-Tab `/ui/config` Config Center。运维面可管理上游 profile、下游 key、能力矩阵、MCP、HTTP Actions 和 **Skills**；Config Center 通过带 revision 的原子更新管理实际运行时字段。Admin UI 可通过上游 `/v1/models` 自动拉取模型列表。
 
 4. **长上下文 / 类无限上下文**
    Gateway 支持 token 估算、压缩、SQLite 记忆召回、超长输入 fan-out 分片与综合，让下游获得类似“无限上下文”的使用效果。
@@ -50,14 +50,15 @@
 | HTTP API 入口、认证、ACL、错误映射 | ✅ 已实现 | `src/gateway_http_handler.py` |
 | 上游代理、连接复用、自动重试 | ✅ 已实现 | `src/gateway_proxy.py` |
 | 工具调用编排、多轮执行、文本 fallback | ✅ 已实现 | `src/gateway_tool_runtime.py` |
-| 内置 coding-agent 工具（67 个唯一工具；含别名 178 个注册项） | ✅ 已实现 | `src/gateway_builtin_tools.py` |
+| 内置 coding-agent 工具（70 个唯一工具；含别名 199 个注册项） | ✅ 已实现 | `src/gateway_builtin_tools.py` |
+| Per-model 能力矩阵与识别路由 | ⚠️ 13 个标志可配置；当前 ModelRouter 消费 image/music/video recognition 三项，其他标志仅用于矩阵或仍由既有 profile 级逻辑读取 | `src/gateway_model_router.py`, `src/gateway_config.py` |
 | MCP / HTTP Action 扩展 | ✅ 已实现 | `src/gateway_mcp.py`, `src/gateway_http_actions.py` |
 | 流式 SSE 编排 + 流式缓存 | ✅ 已实现 | `src/gateway_streaming.py` |
 | 上下文压缩、SQLite 记忆、fan-out | ✅ 已实现 | `src/gateway_context.py` |
 | 语义缓存（精确 + 相似匹配） | ✅ 已实现 | `src/gateway_cache.py` |
 | 请求前 Intelligence 分析（规则 + 可插拔 LLM provider） | ✅ 已接入非流式与流式编排；响应后质量评分/二次反思尚未接线 | `src/gateway_intelligence.py`, `src/gateway_llm.py` |
 | HTTP 请求/工具统计与辅助 Q&A 统计库 | ✅ 主链由 `gateway_logging.py` 采集；`gateway_stats.py` 为辅助数据源 | `src/gateway_logging.py`, `src/gateway_stats.py` |
-| Web 配置 UI（9 Tab + 实时状态卡） | ✅ 已实现；自动读取 stats/cache/upstream/intelligence 状态 | `src/gateway_web_config.py` |
+| Web 配置 UI（10 Tab + 实时状态卡） | ✅ 已实现；自动读取 stats/cache/upstream/intelligence 状态 | `src/gateway_web_config.py` |
 | Assistants / Threads | ✅ Gateway-owned SQLite 生命周期、messages、runs、steps、tool-output resume、租户隔离 | `src/gateway_assistants.py` |
 | Web2API（网页转结构化 API） | ✅ 已接 `/v1/web2api`、`/api/web2api`、`/anthropic/v1/web2api` | `src/gateway_web2api.py` |
 | 单上游连接复用、重试、限界 | ✅ 已接入 | `src/gateway_proxy.py` |
@@ -65,7 +66,7 @@
 | Claude Code 兼容层 | ✅ 已实现 | `src/gateway_claude_compat.py` |
 | Admin UI / Config API / cache、stats、provider 状态 | ✅ 已实现 | `src/gateway_admin.py`, `src/gateway_admin_api.py` |
 
-运行时能力以 `GET /capabilities` 为准。模块文件存在或单元测试通过，不代表该模块已经接入生产 HTTP 请求路径。上述工具数字是 2026-07-28 对当前 registry 的运行时快照：67 个唯一 canonical 工具，178 个含别名 key。
+运行时能力以 `GET /capabilities` 为准。模块文件存在或单元测试通过，不代表该模块已经接入生产 HTTP 请求路径。上述工具数字是 2026-08-25 对当前 registry 的运行时快照：70 个唯一 canonical 工具，199 个含别名 key。
 
 当前回归测试（以实际门禁输出为准）：
 
@@ -316,9 +317,10 @@ client = OpenAI(base_url="http://127.0.0.1:8885/v1", api_key="your-gateway-key")
 | `/v1/threads` / `/v1/threads/{id}` | POST/GET/DELETE | Thread 创建、读取、修改、删除 |
 | `/v1/threads/{thread_id}/messages` | GET/POST | Message 列表和创建；资源路径另支持读取、修改、删除 |
 | `/v1/threads/{thread_id}/runs` | GET/POST | Run 列表和同步创建；另支持读取、修改、取消、提交 tool outputs 和 steps |
-| `/ui/config` | GET | 9-Tab Config Center（Basic Auth） |
+| `/ui/config` | GET | 10-Tab Config Center（Basic Auth） |
 | `/api/config` / `/api/config/schema` | GET | 脱敏配置、revision 和可编辑 schema（Basic Auth） |
 | `/api/config` / `/api/config/update` | POST | revision-aware 原子配置更新（Basic Auth + same-origin） |
+| `/api/config/model-capability` | POST | revision-aware per-model 能力覆盖更新（严格 JSON boolean；Basic Auth + same-origin） |
 | `/api/stats/dashboard` / `/api/cache/stats` | GET | 统计和缓存状态（Basic Auth） |
 | `/api/cache/clear` | POST | 清除内存及持久语义/工具缓存（Basic Auth + same-origin） |
 | `/api/upstreams/status` / `/api/intelligence/status` | GET | 脱敏上游池和 LLM provider 状态（Basic Auth） |
@@ -338,14 +340,14 @@ src/
 ├── gateway_protocol.py       # 三协议请求/响应/工具格式转换
 ├── gateway_proxy.py          # 上游 HTTP 客户端
 ├── gateway_tool_runtime.py   # 工具解析、规范化、多轮编排、直接调用
-├── gateway_builtin_tools.py  # 内置工具真实实现（67 unique / 178 including aliases）
+├── gateway_builtin_tools.py  # 内置工具真实实现（70 unique / 199 registry keys）
 ├── gateway_streaming.py      # SSE 流式编排 + 流式缓存
 ├── gateway_context.py        # token 估算、压缩、记忆、fan-out
 ├── gateway_cache.py          # 语义缓存 (精确/相似匹配)
 ├── gateway_intelligence.py   # 请求前问题分析/prompt enhancement；另含未接响应链的质量/反思 helper
 ├── gateway_llm.py            # 可插拔 LLM intelligence provider
 ├── gateway_stats.py          # 辅助 Q&A 统计库与 dashboard 数据源
-├── gateway_web_config.py     # Web 配置 UI (9 Tab)
+├── gateway_web_config.py     # Web 配置 UI (10 Tab)
 ├── gateway_admin_api.py      # revision-aware 配置、统计和缓存管理 API
 ├── gateway_web2api.py        # Web → 结构化 API
 ├── gateway_upstream_pool.py  # 多上游选择、熔断、恢复和状态快照

@@ -40,6 +40,101 @@ DIRECT_TOOL_CALL_PATHS = {"/v1/tools/call", "/v1/functions/call", "/tools/call"}
 WEB2API_PATHS = {"/v1/web2api", "/api/web2api"}
 ANTHROPIC_COMPAT_PREFIX = "/anthropic"
 
+# Canonical model capability registry.
+#
+# Each upstream model declares which capabilities it actually supports.  The
+# Gateway routes tool traffic (tool call, function call, web search, image /
+# music / video recognition, ...) to a model that declares the matching
+# capability instead of assuming the whole profile is uniform.
+#
+# `kind` groups capabilities for the Config Center matrix UI:
+#   tool      - tool-call / function-call / web-search style
+#   recognition - upstream-side content understanding (image / music / video / audio / speech)
+#   protocol  - transport-level protocol features (streaming / json schema / network / vision)
+MODEL_CAPABILITY_SPEC: list[tuple[str, str, str]] = [
+    ("supports_tools",              "Tool Call",        "tool"),
+    ("supports_function_calls",     "Function Call",    "tool"),
+    ("supports_parallel_tool_calls", "Parallel Tools",   "tool"),
+    ("supports_web_search",         "Web Search",       "tool"),
+    ("supports_image_recognition",  "Recognize Image",  "recognition"),
+    ("supports_music_recognition",  "Recognize Music",  "recognition"),
+    ("supports_video_recognition",  "Recognize Video",  "recognition"),
+    ("supports_audio_recognition",  "Recognize Audio",  "recognition"),
+    ("supports_speech",             "Speech to Text",   "recognition"),
+    ("supports_streaming",          "Streaming",        "protocol"),
+    ("supports_json_schema",        "JSON Schema",      "protocol"),
+    ("supports_network",            "Network",          "protocol"),
+    ("supports_vision",             "Vision (protocol)", "protocol"),
+]
+
+MODEL_CAPABILITY_KEYS: tuple[str, ...] = tuple(spec[0] for spec in MODEL_CAPABILITY_SPEC)
+MODEL_CAPABILITY_LABELS: dict[str, str] = {spec[0]: spec[1] for spec in MODEL_CAPABILITY_SPEC}
+MODEL_CAPABILITY_KINDS: dict[str, str] = {spec[0]: spec[2] for spec in MODEL_CAPABILITY_SPEC}
+
+
+def model_capability_defaults() -> dict[str, bool]:
+    """Return the canonical default capability set (everything off by default)."""
+    return {key: False for key in MODEL_CAPABILITY_KEYS}
+
+
+def _merge_model_capabilities(base: dict[str, bool], override: Any) -> dict[str, bool]:
+    """Merge a model-level capability override over a profile-level base.
+
+    Only keys present in the canonical registry are honored; unknown keys are
+    dropped so typos cannot silently create new capability columns.
+    """
+    merged = dict(base)
+    if not isinstance(override, dict):
+        return merged
+    for key, value in override.items():
+        if key in MODEL_CAPABILITY_KEYS:
+            if not isinstance(value, bool):
+                raise ConfigError(
+                    f"capability {key!r} must be a JSON boolean"
+                )
+            merged[key] = value
+    return merged
+
+
+def _normalize_model_entry(model: Any, *, base_capabilities: dict[str, bool]) -> dict[str, Any]:
+    """Normalize a single model entry inside a profile's ``models`` list."""
+    if not isinstance(model, dict):
+        return {}
+    name = str(model.get("name") or model.get("model") or "").strip()
+    if not name:
+        return {}
+    # ``capability_overrides`` is the persisted, sparse source of truth.  The
+    # materialized ``capabilities`` map is retained for compatibility and for
+    # the Config Center matrix, but must not turn inherited profile values into
+    # sticky model overrides on the next normalization pass.
+    if "capability_overrides" in model:
+        raw_overrides = model.get("capability_overrides")
+        if not isinstance(raw_overrides, dict):
+            raise ConfigError("model capability_overrides must be an object")
+    else:
+        # Backward compatibility: old model entries only had ``capabilities``;
+        # those values were user-authored and are therefore explicit.
+        raw_overrides = model.get("capabilities")
+    overrides = _merge_model_capabilities({}, raw_overrides)
+    caps = _merge_model_capabilities(base_capabilities, overrides)
+    entry: dict[str, Any] = {
+        "name": name,
+        "capability_overrides": overrides,
+        "capabilities": caps,
+    }
+    for extra in (
+        "description",
+        "max_input_tokens",
+        "max_output_tokens",
+        "enabled",
+        "load_balance_enabled",
+        "healthy",
+        "health_status",
+    ):
+        if model.get(extra) is not None:
+            entry[extra] = model[extra]
+    return entry
+
 
 def _normalize_request_path(path: str) -> str:
     """Map compatibility URL prefixes to the gateway's canonical API paths."""
@@ -144,6 +239,11 @@ def _env_float(name: str, default: float) -> float:
 
 def _env_upstream_protocol(default: str = "openai_chat") -> str:
     return str(os.environ.get("GATEWAY_UPSTREAM_PROTOCOL") or os.environ.get("UPSTREAM_PROTOCOL") or default)
+
+
+def _env_model_name(default: str = "") -> str:
+    """Return the configured upstream model name (used to seed the default models list)."""
+    return str(os.environ.get("UPSTREAM_MODEL") or default).strip()
 
 
 def _admin_form_numeric_raw(
@@ -258,6 +358,21 @@ def _default_config() -> Json:
                 "supports_web_search": _env_bool("UPSTREAM_SUPPORTS_WEB_SEARCH", False),
                 "supports_json_schema": _env_bool("UPSTREAM_SUPPORTS_JSON_SCHEMA", False),
             },
+            "models": [
+                {
+                    "name": _env_model_name(),
+                    "capabilities": {
+                        "supports_streaming": _env_bool("UPSTREAM_SUPPORTS_STREAMING", True),
+                        "supports_tools": _env_bool("UPSTREAM_SUPPORTS_TOOLS", False),
+                        "supports_function_calls": _env_bool("UPSTREAM_SUPPORTS_FUNCTION_CALLS", False),
+                        "supports_parallel_tool_calls": _env_bool("UPSTREAM_SUPPORTS_PARALLEL_TOOL_CALLS", False),
+                        "supports_vision": _env_bool("UPSTREAM_SUPPORTS_VISION", False),
+                        "supports_network": _env_bool("UPSTREAM_SUPPORTS_NETWORK", False),
+                        "supports_web_search": _env_bool("UPSTREAM_SUPPORTS_WEB_SEARCH", False),
+                        "supports_json_schema": _env_bool("UPSTREAM_SUPPORTS_JSON_SCHEMA", False),
+                    },
+                }
+            ],
         },
         "gateway": {
             "tool_mode": os.environ.get("GATEWAY_TOOL_MODE", "orchestrate"),
@@ -498,8 +613,17 @@ def _load_config_unlocked() -> Json:
         ) from exc
 
     cfg = _default_config()
+    loaded_upstream = loaded.get("upstream")
     _normalize_admin_credentials(loaded)
     _deep_update(cfg, loaded)
+    # Preserve migration provenance.  The env-seeded default contains a
+    # ``models`` list, but a legacy persisted profile may only declare its own
+    # singular ``model``.  Do not let the environment list masquerade as an
+    # explicitly persisted per-model list for the active profile.
+    if isinstance(loaded_upstream, dict) and "models" not in loaded_upstream:
+        active = cfg.get("upstream")
+        if isinstance(active, dict):
+            active.pop("models", None)
     _apply_security_environment_overrides(cfg)
     _ensure_client_snippet_downstream_key(cfg)
     return _sync_active_upstream(cfg)
@@ -719,13 +843,27 @@ def _redact_sensitive_values(value: Any) -> Any:
     if isinstance(value, dict):
         redacted = {}
         for key, item in value.items():
+            normalized_key = re.sub(r"[^a-z0-9]", "", str(key).lower())
             if _sensitive_key_name(key):
                 redacted[key] = "***"
+            elif normalized_key == "base64" or (
+                normalized_key == "data"
+                and (
+                    str(value.get("type") or "").lower() == "base64"
+                    or "media_type" in value
+                    or "format" in value
+                )
+            ):
+                redacted[key] = "[REDACTED_MEDIA]"
             else:
                 redacted[key] = _redact_sensitive_values(item)
         return redacted
     if isinstance(value, list):
         return [_redact_sensitive_values(item) for item in value]
+    if isinstance(value, str):
+        match = re.match(r"^(data:[^;,]+;base64,)", value, flags=re.IGNORECASE)
+        if match:
+            return f"{match.group(1)}[REDACTED_MEDIA]"
     return value
 
 
@@ -783,14 +921,271 @@ def _upstream_profile_id(profile: Json) -> str:
 
 
 def _normalize_upstream_profile(profile: Json, *, fallback_name: str = "default") -> Json:
+    raw_profile = profile if isinstance(profile, dict) else {}
+    raw_models = raw_profile.get("models") if "models" in raw_profile else None
     default_upstream = _default_config()["upstream"]
     merged = copy.deepcopy(default_upstream)
-    _deep_update(merged, profile if isinstance(profile, dict) else {})
+    _deep_update(merged, raw_profile)
     merged["name"] = str(merged.get("name") or fallback_name or "default")
     merged["id"] = _upstream_profile_id(merged)
     merged.setdefault("paths", {})
     merged.setdefault("capabilities", {})
+    merged["capabilities"] = _merge_model_capabilities(
+        model_capability_defaults(), merged.get("capabilities")
+    )
+    merged["models"] = _normalize_profile_models(
+        raw_models,
+        base_capabilities=merged["capabilities"],
+        default_model=merged.get("model"),
+    )
+    model_names = [str(item.get("name") or "") for item in merged["models"]]
+    if model_names and str(merged.get("model") or "").strip() not in model_names:
+        merged["model"] = model_names[0]
     return merged
+
+
+def _normalize_profile_models(
+    models: Any, *, base_capabilities: dict[str, bool], default_model: str | None
+) -> list[dict[str, Any]]:
+    """Normalize a profile's per-model capability list.
+
+    Backward compatible: an empty/absent ``models`` list falls back to the
+    profile's single ``model`` field, inheriting the profile-level capabilities.
+    """
+    normalized: list[dict[str, Any]] = []
+    if isinstance(models, list):
+        for item in models:
+            entry = _normalize_model_entry(item, base_capabilities=base_capabilities)
+            if entry:
+                normalized.append(entry)
+    if not normalized and default_model:
+        normalized.append(
+            {
+                "name": str(default_model).strip(),
+                "capability_overrides": {},
+                "capabilities": dict(base_capabilities),
+            }
+        )
+    if not normalized:
+        normalized.append(
+            {
+                "name": str(merged_default_model()),
+                "capability_overrides": {},
+                "capabilities": dict(base_capabilities),
+            }
+        )
+    return normalized
+
+
+def merged_default_model() -> str:
+    """Return the default model name from the default upstream config."""
+    return str(_default_config()["upstream"].get("model") or "")
+
+
+def _normalized_profiles(config: Json) -> list[Json]:
+    """Return all upstream profiles with normalized per-model capability lists."""
+    raw = config.get("upstream_profiles")
+    if not isinstance(raw, list) or not raw:
+        active = config.get("upstream")
+        raw = [active] if isinstance(active, dict) else []
+    return [_normalize_upstream_profile(item) for item in raw if isinstance(item, dict)]
+
+
+def flatten_profile_models(config: Json) -> list[dict[str, Any]]:
+    """Flatten every profile's models into a single list of capability rows.
+
+    Each row: ``{profile_id, profile_name, base_url, model, capabilities, is_default}``.
+    ``is_default`` marks the model that backs the active profile's top-level
+    ``model`` field (used by the legacy single-model code path).
+    """
+    active_id = str(config.get("active_upstream_id") or "")
+    rows: list[dict[str, Any]] = []
+    for profile in _normalized_profiles(config):
+        pid = str(profile.get("id") or "")
+        models = profile.get("models") or []
+        default_model = str(profile.get("model") or "").strip()
+        for index, model in enumerate(models):
+            if not isinstance(model, dict):
+                continue
+            rows.append(
+                {
+                    "profile_id": pid,
+                    "profile_name": str(profile.get("name") or pid),
+                    "base_url": str(profile.get("base_url") or ""),
+                    "protocol": str(profile.get("protocol") or ""),
+                    "model": str(model.get("name") or ""),
+                    "capabilities": dict(model.get("capabilities") or {}),
+                    "capability_overrides": dict(model.get("capability_overrides") or {}),
+                    "is_default": bool(default_model and model.get("name") == default_model),
+                    "is_active_profile": pid == active_id,
+                }
+            )
+    return rows
+
+
+def find_model_row(config: Json, profile_id: str, model_name: str) -> dict[str, Any] | None:
+    """Locate a single model capability row, or None if it does not exist."""
+    for row in flatten_profile_models(config):
+        if row["profile_id"] == profile_id and row["model"] == model_name:
+            return row
+    return None
+
+
+def model_capability_snapshot(config: Json) -> dict[str, Any]:
+    """Return a web-UI-friendly snapshot of the full model capability matrix."""
+    rows = flatten_profile_models(config)
+    columns = [
+        {"key": key, "label": label, "kind": kind}
+        for key, label, kind in MODEL_CAPABILITY_SPEC
+    ]
+    return {
+        "profiles": sorted({row["profile_id"] for row in rows}),
+        "columns": columns,
+        "rows": rows,
+        "capability_counts": {
+            key: sum(1 for row in rows if row["capabilities"].get(key))
+            for key in MODEL_CAPABILITY_KEYS
+        },
+    }
+
+
+def _normalized_config_for_mutation(config: Json) -> Json:
+    """Return a copy of ``config`` with ``upstream_profiles`` populated.
+
+    The Admin UI edits the single ``upstream`` object, so a freshly loaded
+    config may only have ``upstream`` and no ``upstream_profiles`` list.  The
+    per-model mutation helpers operate on the normalized profile list, so they
+    need this bridge.  The returned copy is safe to mutate in place.
+    """
+    normalized = copy.deepcopy(config)
+    profiles = normalized.get("upstream_profiles")
+    if not isinstance(profiles, list) or not profiles:
+        active = normalized.get("upstream")
+        if isinstance(active, dict) and active:
+            profiles = [copy.deepcopy(active)]
+            normalized["upstream_profiles"] = profiles
+    normalized["upstream_profiles"] = [
+        _normalize_upstream_profile(item) for item in profiles if isinstance(item, dict)
+    ]
+    return normalized
+
+
+def set_model_capability(
+    config: Json, profile_id: str, model_name: str, capability: str, value: bool
+) -> tuple[Json, str]:
+    """Set a single capability flag on a specific model.
+
+    Returns ``(updated_config, changed_field_path)``.  Raises ConfigError if the
+    model does not exist or the capability is not in the canonical registry.
+    """
+    if capability not in MODEL_CAPABILITY_KEYS:
+        raise ConfigError(f"unknown capability: {capability!r}")
+    if not isinstance(value, bool):
+        raise ConfigError("model capability value must be a JSON boolean")
+    config = _normalized_config_for_mutation(config)
+    profiles = config.get("upstream_profiles")
+    if not isinstance(profiles, list):
+        profiles = []
+        config["upstream_profiles"] = profiles
+    found = False
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            continue
+        if str(profile.get("id") or "") != profile_id:
+            continue
+        models = profile.setdefault("models", [])
+        if not isinstance(models, list):
+            models = []
+            profile["models"] = models
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            if str(model.get("name") or "") == model_name:
+                overrides = model.setdefault("capability_overrides", {})
+                if not isinstance(overrides, dict):
+                    raise ConfigError("model capability_overrides must be an object")
+                overrides[capability] = value
+                base = _merge_model_capabilities(
+                    model_capability_defaults(), profile.get("capabilities")
+                )
+                model["capabilities"] = _merge_model_capabilities(base, overrides)
+                found = True
+                break
+        if found:
+            break
+    if not found:
+        raise ConfigError(f"model not found: {profile_id}/{model_name}")
+    active_id = str(config.get("active_upstream_id") or config.get("active_upstream") or "")
+    if profile_id == active_id:
+        active_profile = next(
+            (
+                item
+                for item in profiles
+                if isinstance(item, dict) and str(item.get("id") or "") == profile_id
+            ),
+            None,
+        )
+        if active_profile is not None:
+            config["upstream"] = copy.deepcopy(active_profile)
+    field = f"upstream_profiles[?id=={profile_id}].models[?name=={model_name}].capability_overrides.{capability}"
+    return config, field
+
+
+def add_model_to_profile(
+    config: Json, profile_id: str, model_name: str, capabilities: dict[str, bool] | None = None
+) -> Json:
+    """Add a new model to a profile, inheriting the profile's capability defaults."""
+    config = _normalized_config_for_mutation(config)
+    profiles = config.get("upstream_profiles")
+    if not isinstance(profiles, list):
+        profiles = []
+        config["upstream_profiles"] = profiles
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            continue
+        if str(profile.get("id") or "") != profile_id:
+            continue
+        models = profile.setdefault("models", [])
+        if not isinstance(models, list):
+            models = []
+            profile["models"] = models
+        for model in models:
+            if isinstance(model, dict) and str(model.get("name") or "") == model_name:
+                return config  # already exists
+        base = _merge_model_capabilities(model_capability_defaults(), profile.get("capabilities"))
+        overrides = _merge_model_capabilities({}, capabilities)
+        models.append(
+            {
+                "name": model_name,
+                "capability_overrides": overrides,
+                "capabilities": _merge_model_capabilities(base, overrides),
+            }
+        )
+        return config
+    raise ConfigError(f"profile not found: {profile_id}")
+
+
+def remove_model_from_profile(config: Json, profile_id: str, model_name: str) -> Json:
+    """Remove a model from a profile.  Refuses to remove the last model."""
+    config = _normalized_config_for_mutation(config)
+    profiles = config.get("upstream_profiles")
+    if not isinstance(profiles, list):
+        raise ConfigError("no upstream_profiles to modify")
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            continue
+        if str(profile.get("id") or "") != profile_id:
+            continue
+        models = profile.get("models")
+        if not isinstance(models, list) or not models:
+            raise ConfigError(f"profile {profile_id} has no models")
+        if len(models) == 1:
+            raise ConfigError(f"cannot remove the last model from profile {profile_id}")
+        profile["models"] = [m for m in models if not (isinstance(m, dict) and str(m.get("name") or "") == model_name)]
+        if not profile["models"]:
+            raise ConfigError(f"model not found: {profile_id}/{model_name}")
+        return config
+    raise ConfigError(f"profile not found: {profile_id}")
 
 
 def _sync_active_upstream(config: Json) -> Json:
@@ -823,12 +1218,17 @@ def _sync_active_upstream(config: Json) -> Json:
             # env defaults for keys the user never set.
             rebuilt = copy.deepcopy(env_default)
             _deep_update(rebuilt, copy.deepcopy(main))
+            if "models" not in main:
+                rebuilt.pop("models", None)
             # Preserve the profile's id/name if main did not override them
             rebuilt.setdefault("id", prof.get("id") or "default")
             rebuilt["name"] = str(
                 main.get("name") or prof.get("name") or rebuilt.get("id") or "default"
             )
-            prof = rebuilt
+            prof = _normalize_upstream_profile(
+                rebuilt,
+                fallback_name=str(prof.get("name") or f"profile-{index}"),
+            )
         pid = prof["id"]
         if pid in seen:
             pid = f"{pid}-{index}"
@@ -844,6 +1244,68 @@ def _sync_active_upstream(config: Json) -> Json:
     active = next((p for p in normalized if p["id"] == active_id), normalized[0])
     config["upstream"] = copy.deepcopy(active)
     return config
+
+
+def _models_from_admin_form(
+    form: dict[str, str], existing: Json | None, profile: Json
+) -> list[dict[str, Any]]:
+    """Build the per-model list for a profile from the admin form.
+
+    When the form carries a non-empty ``models_json`` field it is parsed as a
+    JSON array of ``{"name": str, "capabilities": {key: bool}, ...}`` entries
+    and becomes the profile's ``models`` list.  Otherwise the legacy single
+    ``model`` field is used (one model inheriting the profile-level
+    capabilities), preserving backward compatibility.
+    """
+    raw = str(form.get("models_json") or "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"models_json 不是合法 JSON: {exc}") from exc
+        if not isinstance(parsed, list):
+            raise ValueError("models_json 必须是 JSON 数组")
+        models: list[dict[str, Any]] = []
+        for index, item in enumerate(parsed):
+            if not isinstance(item, dict):
+                raise ValueError(f"models_json[{index}] 不是对象")
+            name = str(item.get("name") or item.get("model") or "").strip()
+            if not name:
+                raise ValueError(f"models_json[{index}] 缺少 name")
+            entry: dict[str, Any] = {"name": name}
+            caps = item.get("capabilities")
+            if caps is not None and not isinstance(caps, dict):
+                raise ValueError(f"models_json[{index}].capabilities 必须是对象")
+            if isinstance(caps, dict):
+                overrides: dict[str, bool] = {}
+                for key, value in caps.items():
+                    if key not in MODEL_CAPABILITY_KEYS:
+                        continue
+                    if not isinstance(value, bool):
+                        raise ValueError(
+                            f"models_json[{index}].capabilities.{key} 必须是 JSON 布尔值"
+                        )
+                    overrides[key] = value
+                entry["capability_overrides"] = overrides
+            for extra in ("description", "max_input_tokens", "max_output_tokens"):
+                if item.get(extra) is not None:
+                    entry[extra] = item[extra]
+            models.append(entry)
+        if models:
+            return models
+    # Legacy single-model fallback.
+    default_model = str(profile.get("model") or "").strip()
+    if not default_model and isinstance(existing, dict):
+        default_model = str(existing.get("model") or "").strip()
+    if not default_model:
+        default_model = merged_default_model()
+    return [
+        {
+            "name": default_model,
+            "capability_overrides": {},
+            "capabilities": dict(profile.get("capabilities") or {}),
+        }
+    ]
 
 
 def _profile_from_admin_form(form: dict[str, str], existing: Json | None = None) -> Json:
@@ -901,6 +1363,11 @@ def _profile_from_admin_form(form: dict[str, str], existing: Json | None = None)
         "supports_network": "cap_supports_network",
         "supports_web_search": "cap_supports_web_search",
         "supports_json_schema": "cap_supports_json_schema",
+        "supports_image_recognition": "cap_supports_image_recognition",
+        "supports_music_recognition": "cap_supports_music_recognition",
+        "supports_video_recognition": "cap_supports_video_recognition",
+        "supports_audio_recognition": "cap_supports_audio_recognition",
+        "supports_speech": "cap_supports_speech",
     }
     existing_caps = profile.get("capabilities") if isinstance(profile.get("capabilities"), dict) else {}
     explicit_capability_form = form.get("capabilities_form", "") != "" or any(form_key in form for form_key in cap_form_keys.values())
@@ -910,16 +1377,11 @@ def _profile_from_admin_form(form: dict[str, str], existing: Json | None = None)
             for cap_key, form_key in cap_form_keys.items()
         }
     else:
-        profile["capabilities"] = {
-            "supports_streaming": bool(existing_caps.get("supports_streaming", True)),
-            "supports_tools": bool(existing_caps.get("supports_tools", False)),
-            "supports_function_calls": bool(existing_caps.get("supports_function_calls", False)),
-            "supports_parallel_tool_calls": bool(existing_caps.get("supports_parallel_tool_calls", False)),
-            "supports_vision": bool(existing_caps.get("supports_vision", False)),
-            "supports_network": bool(existing_caps.get("supports_network", False)),
-            "supports_web_search": bool(existing_caps.get("supports_web_search", False)),
-            "supports_json_schema": bool(existing_caps.get("supports_json_schema", True)),
-        }
+        profile["capabilities"] = dict(existing_caps)
+    # Per-model capability list.  When the admin form supplies a ``models_json``
+    # field it wins; otherwise the legacy single ``model`` field is used and the
+    # profile-level capabilities are inherited (backward compatible).
+    profile["models"] = _models_from_admin_form(form, existing, profile)
     return _normalize_upstream_profile(profile, fallback_name=profile["name"])
 
 

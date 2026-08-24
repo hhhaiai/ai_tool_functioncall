@@ -13,7 +13,7 @@ Gateway 的核心闭环已经实现并接入生产 HTTP 路径：
 - Gateway-owned 工具、MCP、HTTP Actions、直接工具调用；
 - 用户侧工具向 Claude Code / Codex 下发并回填结果；
 - 流式 SSE、上下文压缩、SQLite memory、fan-out、缓存；
-- Admin UI、9-Tab Config Center、revision-aware 配置更新；
+- Admin UI、10-Tab Config Center、revision-aware 配置更新；
 - Assistants / Threads 持久生命周期、Web2API、多上游、请求前 Intelligence；
 - 认证、ACL、限流、全局准入、沙箱、日志、统计、维护和部署门禁。
 
@@ -31,10 +31,10 @@ Gateway 的核心闭环已经实现并接入生产 HTTP 路径：
 
 ```text
 _supported_public_paths()                  = 24
-len(BUILTIN_TOOLS)                         = 178
-unique GatewayTool.name                    = 67
-len(get_config_schema())                   = 9
-sum(len(tab["fields"]) for each tab)      = 89
+len(BUILTIN_TOOLS)                         = 199
+unique GatewayTool.name                    = 70
+len(get_config_schema())                   = 10
+sum(len(tab["fields"]) for each tab)      = 94
 ```
 
 Config Center 的字段分布：
@@ -42,7 +42,7 @@ Config Center 的字段分布：
 | Tab | 字段数 |
 |---|---:|
 | upstream | 11 |
-| capabilities | 8 |
+| capabilities | 13 |
 | context | 11 |
 | intelligence | 12 |
 | concurrency | 9 |
@@ -50,7 +50,8 @@ Config Center 的字段分布：
 | tools | 12 |
 | web2api | 10 |
 | security | 8 |
-| **合计** | **89** |
+| model_matrix | 0 |
+| **合计** | **94** |
 
 ## 3. 公开 API
 
@@ -101,7 +102,9 @@ Config Center 的字段分布：
 | 弱上游 adapter | Handler → Agent Planner/tool runtime → upstream synthesis | 文本工具调用解析、多轮执行、结果回填、final synthesis | 质量受上游模型遵循度影响 | 已实现 |
 | 工具归属分流 | Tool runtime → Gateway-owned executor 或 downstream native request | MCP/HTTP/网络/纯函数/记忆服务端执行；用户工具下发 | 服务端用户工具执行必须显式授权 | 已实现 |
 | 直接工具接口 | `/v1/tools/call`, `/v1/functions/call`, `/tools/call` | Gateway-owned 工具不依赖上游模型可直接执行 | 工具权限和输入 schema 仍生效 | 已实现 |
-| 内置工具 registry | `gateway_builtin_tools.py` | 67 canonical / 178 aliases；权限、workspace 和 output limit | 部分工具依赖本机程序或显式开关 | 已实现 |
+| 内置工具 registry | `gateway_builtin_tools.py` | 70 canonical / 199 registry keys；权限、workspace 和 output limit | 部分工具依赖本机程序或显式开关 | 已实现 |
+| Per-model 能力路由 | `gateway_model_router.py` + `gateway_config.py` | 13 项可配置能力标志、稀疏 per-model 覆盖、共享状态、健康过滤与 failover/round_robin/random/first/least_connections | 当前新 Router 只由三个 recognition 工具消费；普通 tools/function/web-search 请求仍走既有 profile 级路径 | 部分接入，边界明确 |
+| 识图 / 识音乐 / 识视频 | `gateway_builtin_tools.py` → `call_upstream_llm` → ModelRouter → upstream | 图片适配 Chat/Responses/Anthropic；音乐仅 OpenAI Chat base64/local MP3/WAV；视频无标准 adapter 时返回 `unsupported_media_transport`，不伪装成图片 | 需上游真实支持；URL/本地/base64 有归属、MIME、大小和私网边界 | 部分实现，fail-closed |
 | MCP | `gateway_mcp.py` | servers、tools/list、tools/call、public name 映射 | 外部 MCP 可用性取决于其进程/网络 | 已实现 |
 | HTTP Actions | `gateway_http_actions.py` | schema、启用状态、执行、Admin 管理 | 受 SSRF/网络和超时边界限制 | 已实现 |
 | Streaming | `gateway_streaming.py` | passthrough、增量 safe text、工具决策轮、断连取消 | chat-only rewrite 可为正确性缓冲；SSE 不跨 profile | 已实现 |
@@ -111,7 +114,7 @@ Config Center 的字段分布：
 | Web2API | `gateway_web2api.py` | 真实 HTTP fetch、HTML extraction、3 个公开别名 | SSRF/DNS/redirect/type/size/timeout 限制 | 已实现 |
 | 多上游 | `gateway_upstream_pool.py` + `gateway_proxy.py` | 选择、熔断、恢复、retryable error failover | 非流式跨 profile；SSE 单 profile | 已实现（有明确边界） |
 | Intelligence | orchestration 请求前 → `gateway_intelligence.py` / `gateway_llm.py` | 规则/LLM 分析、system/reflection prompt enhancement、provider fallback/strict failure | 响应后自动评分与二次反思未接线 | 部分实现，已接请求前主链 |
-| Config Center | `/ui/config` + `/api/config*` | 9 Tab、89 字段、revision、schema-bound update、secret placeholder、runtime reset | 需要 Basic Auth 和 same-origin 写保护 | 已实现 |
+| Config Center | `/ui/config` + `/api/config*` | 10 Tab、94 字段、revision、schema-bound update、per-model capability CAS、secret placeholder、runtime reset | 需要 Basic Auth 和 same-origin 写保护 | 已实现 |
 | Admin/状态 | `gateway_admin.py` / `gateway_admin_api.py` | 配置、stats、cache、upstream、intelligence、skills、MCP、HTTP Actions | 状态卡区分正常、降级和加载失败 | 已实现 |
 | Rate limit / admission | 所有公开入口 → SQLite/memory backend | token bucket、lease、多进程共享、degraded/fail-closed | 由配置决定 backend 和失败策略 | 已实现 |
 | Sandbox/process | Tool runtime → sandbox worker/process group | workspace、timeout、cancel、输出上限、子进程清理 | OS 能力依赖部署环境 | 已实现 |

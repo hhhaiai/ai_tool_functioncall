@@ -290,8 +290,20 @@ def _render_html(**kw):
     cap_specs = [("supports_tools","Tools"),("supports_function_calls","Function Calls"),("supports_parallel_tool_calls","Parallel Tools"),("supports_vision","Vision"),("supports_streaming","Streaming"),("supports_json_schema","JSON Schema"),("supports_network","Network"),("supports_web_search","Web Search")]
     cap_badges = " ".join(B(lab, caps.get(key)) for key, lab in cap_specs)
 
-    cap_form = [("cap_supports_tools","supports_tools","Tools","Native tools"),("cap_supports_function_calls","supports_function_calls","Function Calls","OpenAI function_call"),("cap_supports_parallel_tool_calls","supports_parallel_tool_calls","Parallel","Parallel tool calls"),("cap_supports_vision","supports_vision","Vision","Image input"),("cap_supports_streaming","supports_streaming","Streaming","SSE"),("cap_supports_json_schema","supports_json_schema","JSON Schema","Structured output"),("cap_supports_network","supports_network","Network","Web search"),("cap_supports_web_search","supports_web_search","Web Search","Model search")]
+    cap_form = [("cap_supports_tools","supports_tools","Tools","Native tools"),("cap_supports_function_calls","supports_function_calls","Function Calls","OpenAI function_call"),("cap_supports_parallel_tool_calls","supports_parallel_tool_calls","Parallel","Parallel tool calls"),("cap_supports_vision","supports_vision","Vision","Image input"),("cap_supports_streaming","supports_streaming","Streaming","SSE"),("cap_supports_json_schema","supports_json_schema","JSON Schema","Structured output"),("cap_supports_network","supports_network","Network","Web search"),("cap_supports_web_search","supports_web_search","Web Search","Model search"),("cap_supports_image_recognition","supports_image_recognition","识图","Upstream image recognition"),("cap_supports_music_recognition","supports_music_recognition","识音乐","Upstream music recognition"),("cap_supports_video_recognition","supports_video_recognition","识视频","Upstream video recognition"),("cap_supports_audio_recognition","supports_audio_recognition","识音频","Upstream audio recognition"),("cap_supports_speech","supports_speech","语音","Speech to text")]
     cap_inputs = "\n".join(f'<label class="check-card"><input type="checkbox" name="{fk}" value="1"{C(caps.get(ck))}><span><b>{lab}</b><small>{desc}</small></span></label>' for fk,ck,lab,desc in cap_form)
+
+    def _models_json_for(profile: Any) -> str:
+        """Serialize a profile's per-model list as a JSON textarea value."""
+        if not isinstance(profile, dict):
+            return "[]"
+        models = profile.get("models")
+        if not isinstance(models, list) or not models:
+            # Legacy single-model profile: emit one row so the editor is usable.
+            return json.dumps([{"name": str(profile.get("model") or ""), "capabilities": dict(profile.get("capabilities") or {})}], ensure_ascii=False)
+        return json.dumps(models, ensure_ascii=False)
+
+    models_json_value = _models_json_for(upstream)
 
     # Profile rows
     prows = []
@@ -482,6 +494,7 @@ def _render_html(**kw):
 <label class="field"><span>并发</span><input name="max_concurrency" type="number" value="{E(upstream.get("max_concurrency",32))}"></label>
 <label class="field"><span>Tools</span><select name="tools_enabled"><option value="adapter"{S(upstream.get("tools_enabled","adapter"),"adapter")}>Adapter (default)</option><option value="auto"{S(upstream.get("tools_enabled"),"auto")}>Auto (explicit)</option><option value="native"{S(upstream.get("tools_enabled"),"native")}>Native</option><option value="off"{S(upstream.get("tools_enabled"),"off")}>Off</option></select></label>
 <div class="field full"><h3>能力</h3><div class="check-grid">{cap_inputs}</div></div>
+<div class="field full"><h3>多模型列表（JSON）</h3><textarea name="models_json" rows="6" placeholder='[{{"name":"gpt-4o","capabilities":{{"supports_image_recognition":true}}}},{{"name":"mimo-v2.5-pro"}}]' style="font-family:monospace;font-size:12px">{E(models_json_value)}</textarea><p class="muted small">每项至少含 <code>name</code>；可选 <code>capabilities</code>（per-model 能力标志，覆盖 profile 级默认）、<code>description</code>、<code>max_input_tokens</code>。留空则退回上方单 model 字段。</p></div>
 <div class="field full"><button type="submit">保存配置</button></div>
 </form></div>
 <div class="card"><h2>新增上游模型</h2><form method="POST" action="/admin/upstream-profile" class="form-row">
@@ -497,6 +510,7 @@ def _render_html(**kw):
 <label class="field wide"><span>Models Path</span><input name="path_models" id="path_models" placeholder="/v1/models"></label>
 <div class="field"><button type="button" class="ghost" onclick="fetchModels()">Fetch Models</button> <span id="model-fetch-status" class="muted small"></span></div>
 <div class="field full"><h3>能力</h3><div class="check-grid">{cap_inputs}</div></div>
+<div class="field full"><h3>多模型列表（JSON）</h3><textarea name="models_json" rows="6" placeholder='[{{"name":"gpt-4o","capabilities":{{"supports_image_recognition":true}}}},{{"name":"mimo-v2.5-pro"}}]' style="font-family:monospace;font-size:12px"></textarea><p class="muted small">每项至少含 <code>name</code>；可选 <code>capabilities</code>（per-model 能力标志）、<code>description</code>、<code>max_input_tokens</code>。留空则使用上方单 model 字段。</p></div>
 <div class="field full"><button type="submit">添加上游</button></div>
 </form></div></div>
 <div class="grid2"><div class="card"><h2>下游 API Keys</h2><table><thead><tr><th>名称</th><th>前缀</th><th>状态</th><th>操作</th></tr></thead><tbody>{key_html}</tbody></table>

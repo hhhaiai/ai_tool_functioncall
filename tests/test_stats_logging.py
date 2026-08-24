@@ -58,6 +58,36 @@ class TestPayloadRedaction:
         redacted = _redact_payload({})
         assert redacted == {}
 
+    def test_redacts_media_base64_and_data_urls_without_dropping_shape(self):
+        payload = {
+            "messages": [
+                {
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,YWJj"},
+                        },
+                        {
+                            "type": "gateway_media",
+                            "media_kind": "audio",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "audio/mpeg",
+                                "data": "YWJj",
+                            },
+                        },
+                    ]
+                }
+            ],
+            "base64": "YWJj",
+        }
+
+        redacted = _redact_payload(payload)
+        rendered = str(redacted)
+        assert "YWJj" not in rendered
+        assert "[REDACTED_MEDIA]" in rendered
+        assert redacted["messages"][0]["content"][1]["media_kind"] == "audio"
+
 
 class TestSqliteLogging:
     def test_init_creates_tables(self):

@@ -103,6 +103,224 @@ _CLIENT_ID_SCOPE_OVERRIDE: contextvars.ContextVar[str | None] = contextvars.Cont
     default=None,
 )
 
+# Injected by the tool executor for ``llm`` tools so the handler can route to
+# an upstream model by capability without holding a reference to the router.
+_MODEL_ROUTER: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "gateway_model_router",
+    default=None,
+)
+_UPSTREAM_CLIENT: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "gateway_upstream_client",
+    default=None,
+)
+
+
+def get_model_router() -> Any:
+    """Return the request-scoped ModelRouter, or None if not set."""
+    return _MODEL_ROUTER.get()
+
+
+def get_upstream_client() -> Any:
+    """Return the request-scoped NativeProxyClient, or None if not set."""
+    return _UPSTREAM_CLIENT.get()
+
+
+def call_upstream_llm(
+    capability: str,
+    content: list[Json],
+    *,
+    question: str = "",
+    model_strategy: str = "failover",
+    exclude: set[str] | None = None,
+    path: str = "/v1/chat/completions",
+) -> str:
+    """Dispatch a multimodal request to an upstream model that declares ``capability``.
+
+    ``content`` is an OpenAI Chat-style content list (text / image_url parts).
+    The router selects a model that declares the capability; a fresh
+    NativeProxyClient is built for the selected profile and the request is
+    forwarded through it.  Returns the model's text answer.
+
+    Raises ToolExecutionError when no model declares the capability or the
+    upstream call fails.
+    """
+    router = get_model_router()
+    if router is None:
+        raise ToolExecutionError(
+            "model router unavailable for llm tool",
+            failure_type="internal_error",
+        )
+    from .gateway_proxy import NativeProxyClient
+    from .gateway_model_router import (
+        NoHealthyModelRouteError,
+        NoModelCapabilityError,
+    )
+
+    excluded = set(exclude or ())
+    deadline: float | None = None
+    last_error: BaseException | None = None
+    while True:
+        try:
+            route = router.select_or_raise(
+                capability, exclude=excluded, strategy=model_strategy
+            )
+        except NoModelCapabilityError as exc:
+            raise ToolExecutionError(
+                f"no upstream model declares capability {capability!r}: {exc}",
+                failure_type="no_capability",
+            ) from exc
+        except NoHealthyModelRouteError as exc:
+            if isinstance(last_error, ToolExecutionError):
+                raise last_error
+            if last_error is not None:
+                raise ToolExecutionError(
+                    f"upstream {capability} request failed after failover: {last_error}",
+                    failure_type="execution_failed",
+                    retryable=router.is_retryable_failure(last_error),
+                ) from last_error
+            raise ToolExecutionError(
+                f"no healthy upstream route declares capability {capability!r}: {exc}",
+                failure_type="no_healthy_route",
+                retryable=True,
+            ) from exc
+        except Exception as exc:
+            raise ToolExecutionError(
+                f"model route selection failed for {capability!r}: {exc}",
+                failure_type="internal_error",
+            ) from exc
+
+        if deadline is None:
+            try:
+                max_elapsed = float(
+                    route.profile.get("model_failover_max_elapsed_seconds")
+                    or route.profile.get("retry_max_elapsed_seconds")
+                    or 90.0
+                )
+            except (TypeError, ValueError):
+                max_elapsed = 90.0
+            deadline = time.monotonic() + max(0.1, max_elapsed)
+        if time.monotonic() >= deadline:
+            raise ToolExecutionError(
+                f"upstream {capability} failover deadline exceeded",
+                failure_type="execution_failed",
+                retryable=True,
+            ) from last_error
+
+        request_content: Any = list(content)
+        if question:
+            request_content = (
+                list(content) + [{"type": "text", "text": question}]
+                if any(p.get("type") != "text" for p in content)
+                else question
+            )
+        try:
+            if isinstance(request_content, list):
+                request_content = [
+                    _media_part_for_protocol(part, route.protocol)
+                    if isinstance(part, dict) and part.get("type") == "gateway_media"
+                    else part
+                    for part in request_content
+                ]
+        except ToolExecutionError as exc:
+            if exc.failure_type != "unsupported_media_transport":
+                raise
+            excluded.add(route.key)
+            last_error = exc
+            continue
+
+        client = NativeProxyClient(
+            profile=route.profile,
+            model=route.model,
+            _allow_failover=False,
+        )
+        body: Json = {
+            "model": route.model,
+            "messages": [{"role": "user", "content": request_content}],
+            "max_tokens": route.max_output_tokens or 1024,
+        }
+        started = router.request_start(route)
+        try:
+            response = client.forward(path, body)
+            router.request_success(route, started)
+            return _extract_text_from_response(response)
+        except Exception as exc:
+            router.request_failure(route, exc)
+            if not router.is_retryable_failure(exc):
+                raise ToolExecutionError(
+                    f"upstream {capability} request failed: {exc}",
+                    failure_type="execution_failed",
+                ) from exc
+            excluded.add(route.key)
+            last_error = exc
+        finally:
+            router.request_end(route)
+
+
+def _media_part_for_protocol(part: Json, protocol: str) -> Json:
+    """Convert one canonical Gateway media part for the selected transport."""
+    kind = str(part.get("media_kind") or "")
+    source = part.get("source") if isinstance(part.get("source"), dict) else {}
+    source_type = str(source.get("type") or "")
+    media_type = str(source.get("media_type") or "")
+
+    if kind == "image":
+        if source_type == "url":
+            url = str(source.get("url") or "")
+        elif source_type == "base64":
+            url = f"data:{media_type};base64,{source.get('data') or ''}"
+        else:
+            raise ToolExecutionError(
+                "invalid canonical image source", failure_type="invalid_input"
+            )
+        return {"type": "image_url", "image_url": {"url": url}}
+
+    if kind == "audio":
+        if protocol != "openai_chat" or source_type != "base64":
+            raise ToolExecutionError(
+                f"{protocol} does not support this audio transport",
+                failure_type="unsupported_media_transport",
+            )
+        audio_formats = {"audio/mpeg": "mp3", "audio/wav": "wav"}
+        audio_format = audio_formats.get(media_type)
+        if not audio_format:
+            raise ToolExecutionError(
+                f"openai_chat does not support audio mime type {media_type}",
+                failure_type="unsupported_media_transport",
+            )
+        return {
+            "type": "input_audio",
+            "input_audio": {"data": str(source.get("data") or ""), "format": audio_format},
+        }
+
+    if kind == "video":
+        raise ToolExecutionError(
+            f"{protocol} has no configured video transport adapter",
+            failure_type="unsupported_media_transport",
+        )
+    raise ToolExecutionError(
+        f"unsupported canonical media kind: {kind}", failure_type="invalid_input"
+    )
+
+
+def _extract_text_from_response(response: Any) -> str:
+    """Pull the assistant text out of an OpenAI Chat-style response."""
+    if not isinstance(response, dict):
+        return str(response)
+    choices = response.get("choices") or []
+    if not choices:
+        return ""
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text") or ""))
+        return "\n".join(parts)
+    return ""
+
 @dataclass(frozen=True)
 class GatewayTool:
     name: str
@@ -111,6 +329,10 @@ class GatewayTool:
     handler: Callable[[Json], str]
     risk: str = "pure"
     aliases: tuple[str, ...] = ()
+    # ``llm`` tools dispatch to an upstream model selected by capability
+    # (image / music / video recognition, ...).  The tool executor injects the
+    # active ModelRouter and upstream client so the handler can route and call.
+    llm: bool = False
 
 @dataclass(frozen=True)
 class ToolCall:
@@ -1451,6 +1673,203 @@ def _tool_view_image(args: Json) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+_MEDIA_MIME_TYPES: dict[str, set[str]] = {
+    "image": {"image/png", "image/jpeg", "image/gif", "image/webp"},
+    "audio": {"audio/mpeg", "audio/wav", "audio/ogg", "audio/mp4", "audio/flac", "audio/aac"},
+    "video": {"video/mp4", "video/quicktime", "video/webm"},
+}
+_MEDIA_DEFAULT_MIME = {
+    "image": "image/png",
+    "audio": "audio/mpeg",
+    "video": "video/mp4",
+}
+_MEDIA_MIME_BY_SUFFIX = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "gif": "image/gif",
+    "webp": "image/webp",
+    "mp3": "audio/mpeg",
+    "wav": "audio/wav",
+    "ogg": "audio/ogg",
+    "m4a": "audio/mp4",
+    "flac": "audio/flac",
+    "aac": "audio/aac",
+    "mp4": "video/mp4",
+    "mov": "video/quicktime",
+    "webm": "video/webm",
+}
+_MEDIA_DATA_URL_RE = re.compile(r"^data:([^;,]+);base64,([A-Za-z0-9+/=]+)$", re.DOTALL)
+
+
+def _media_kind(kind: str) -> str:
+    normalized = str(kind or "").strip().lower()
+    return "audio" if normalized in {"music", "audio"} else normalized
+
+
+def _max_media_input_bytes() -> int:
+    try:
+        value = int(os.environ.get("GATEWAY_MAX_MEDIA_INPUT_BYTES") or 20 * 1024 * 1024)
+    except (TypeError, ValueError):
+        value = 20 * 1024 * 1024
+    return max(1, value)
+
+
+def _validated_media_mime(kind: str, value: Any) -> str:
+    mime = str(value or _MEDIA_DEFAULT_MIME[kind]).strip().lower()
+    if mime not in _MEDIA_MIME_TYPES[kind]:
+        raise ToolExecutionError(
+            f"unsupported {kind} mime type: {mime}",
+            failure_type="invalid_input",
+        )
+    return mime
+
+
+def _validated_media_base64(data: Any, *, max_bytes: int) -> str:
+    encoded = str(data or "").strip()
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError, base64.binascii.Error) as exc:
+        raise ToolExecutionError("invalid media base64", failure_type="invalid_input") from exc
+    if len(decoded) > max_bytes:
+        raise ToolExecutionError(
+            f"media input exceeds max bytes ({len(decoded)} > {max_bytes})",
+            failure_type="input_too_large",
+        )
+    return encoded
+
+
+def _media_part_from_input(args: Json, kind: str) -> Json:
+    """Build a bounded canonical Gateway media part.
+
+    Media stays typed as image/audio/video until the selected route's protocol
+    is known.  This prevents audio/video from being silently serialized as fake
+    image blocks.
+    """
+    media_kind = _media_kind(kind)
+    if media_kind not in _MEDIA_MIME_TYPES:
+        raise ToolExecutionError(f"unsupported media kind: {kind}", failure_type="invalid_input")
+    max_bytes = _max_media_input_bytes()
+
+    raw_base64 = args.get("base64")
+    if raw_base64 is not None and raw_base64 != "":
+        mime = _validated_media_mime(
+            media_kind, args.get("mime_type") or args.get("media_type")
+        )
+        encoded = _validated_media_base64(raw_base64, max_bytes=max_bytes)
+        return {
+            "type": "gateway_media",
+            "media_kind": media_kind,
+            "source": {"type": "base64", "media_type": mime, "data": encoded},
+        }
+
+    data_url = str(args.get("data_url") or "").strip()
+    if data_url:
+        match = _MEDIA_DATA_URL_RE.fullmatch(data_url)
+        if not match:
+            raise ToolExecutionError("invalid media data URL", failure_type="invalid_input")
+        mime = _validated_media_mime(media_kind, match.group(1))
+        encoded = _validated_media_base64(match.group(2), max_bytes=max_bytes)
+        return {
+            "type": "gateway_media",
+            "media_kind": media_kind,
+            "source": {"type": "base64", "media_type": mime, "data": encoded},
+        }
+
+    url = str(args.get("url") or "").strip()
+    if url:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.username is not None or parsed.password is not None:
+            raise ToolExecutionError(
+                "media URL must not contain credentials", failure_type="invalid_input"
+            )
+        # The Gateway does not fetch this URL, so literal target validation is
+        # sufficient here; the selected upstream receives the public URL.
+        _validate_action_url(url, resolve_dns=False)
+        return {
+            "type": "gateway_media",
+            "media_kind": media_kind,
+            "source": {"type": "url", "url": url},
+        }
+
+    raw_path = str(
+        args.get("path")
+        or args.get("file_path")
+        or args.get("image_path")
+        or args.get("audio_path")
+        or args.get("video_path")
+        or ""
+    ).strip()
+    if not raw_path:
+        raise ToolExecutionError(
+            f"missing {media_kind} input (path/url/data_url/base64)",
+            failure_type="invalid_input",
+        )
+    if urllib.parse.urlparse(raw_path).scheme:
+        raise ToolExecutionError(
+            "media path must not use a URL scheme", failure_type="invalid_input"
+        )
+    path = _resolve_workspace_path(raw_path)
+    if not path.is_file():
+        raise ToolExecutionError(
+            f"{media_kind} not found: {path}", failure_type="not_found"
+        )
+    size = path.stat().st_size
+    if size > max_bytes:
+        raise ToolExecutionError(
+            f"media input exceeds max bytes ({size} > {max_bytes})",
+            failure_type="input_too_large",
+        )
+    mime = _validated_media_mime(
+        media_kind,
+        args.get("mime_type")
+        or args.get("media_type")
+        or _MEDIA_MIME_BY_SUFFIX.get(path.suffix.lower().lstrip(".")),
+    )
+    payload = path.read_bytes()
+    if len(payload) > max_bytes:
+        raise ToolExecutionError(
+            f"media input exceeds max bytes ({len(payload)} > {max_bytes})",
+            failure_type="input_too_large",
+        )
+    return {
+        "type": "gateway_media",
+        "media_kind": media_kind,
+        "source": {
+            "type": "base64",
+            "media_type": mime,
+            "data": base64.b64encode(payload).decode("ascii"),
+        },
+    }
+
+
+def _tool_recognize_image(args: Json) -> str:
+    """Ask an upstream vision model to describe an image.
+
+    Input: local workspace path, http(s) URL, data: URL, or base64 + mime_type.
+    Dispatches through the capability router to a model that declares
+    ``supports_image_recognition``; raises ToolExecutionError(no_capability)
+    when none is configured.
+    """
+    part = _media_part_from_input(args, "image")
+    question = str(args.get("question") or args.get("prompt") or "Describe this image in detail.")
+    return call_upstream_llm("supports_image_recognition", [part], question=question)
+
+
+def _tool_recognize_music(args: Json) -> str:
+    """Ask an upstream model to analyze / describe music audio."""
+    part = _media_part_from_input(args, "music")
+    question = str(args.get("question") or args.get("prompt") or "Describe this music audio, including genre, mood, instruments and tempo.")
+    return call_upstream_llm("supports_music_recognition", [part], question=question)
+
+
+def _tool_recognize_video(args: Json) -> str:
+    """Ask an upstream model to analyze / describe a video."""
+    part = _media_part_from_input(args, "video")
+    question = str(args.get("question") or args.get("prompt") or "Describe this video, including scenes, actions, visual style and any text visible.")
+    return call_upstream_llm("supports_video_recognition", [part], question=question)
+
+
 def _tool_intent_detect(args: Json) -> str:
     text = str(args.get("text") or args.get("input") or args.get("query") or args.get("prompt") or "")
     lowered = text.lower()
@@ -2318,6 +2737,9 @@ def _build_builtin_tools() -> dict[str, GatewayTool]:
         GatewayTool("update_plan", "Accept a plan/update_plan payload.", _json_schema({"plan": {"type": "array"}, "explanation": {"type": "string"}}), _tool_update_plan, "state"),
         GatewayTool("NotebookEdit", "Edit a Jupyter .ipynb notebook cell. Disabled unless GATEWAY_ALLOW_WRITE_TOOLS=1.", _json_schema({"notebook_path": {"type": "string"}, "cell_number": {"type": "integer"}, "cell_id": {"type": "string"}, "new_source": {"type": "string"}, "edit_mode": {"type": "string"}, "cell_type": {"type": "string"}}), _tool_notebook_edit, "write_local", aliases=("notebook_edit",)),
         GatewayTool("view_image", "Return local image metadata, dimensions, color summary, and optional base64 bytes.", _json_schema({"path": {"type": "string"}, "max_bytes": {"type": "integer"}, "histogram": {"type": "boolean"}}, ["path"]), _tool_view_image, "read_local", aliases=("ImageInfo", "AnalyzeImage", "image_info", "analyze_image", "inspect_image")),
+        GatewayTool("recognize_image", "Ask an upstream vision model to describe an image (path/url/data_url/base64). Requires a model declaring supports_image_recognition.", _json_schema({"path": {"type": "string"}, "url": {"type": "string"}, "data_url": {"type": "string"}, "base64": {"type": "string"}, "mime_type": {"type": "string"}, "question": {"type": "string"}, "prompt": {"type": "string"}}), _tool_recognize_image, "read_network", llm=True, aliases=("gateway__recognize_image", "vision", "analyze_image_llm", "see_image", "look_at_image", "RecognizeImage", "image_recognition")),
+        GatewayTool("recognize_music", "Ask an upstream model to analyze music audio (path/url/data_url/base64). Requires a model declaring supports_music_recognition.", _json_schema({"path": {"type": "string"}, "url": {"type": "string"}, "data_url": {"type": "string"}, "base64": {"type": "string"}, "mime_type": {"type": "string"}, "question": {"type": "string"}, "prompt": {"type": "string"}}), _tool_recognize_music, "read_network", llm=True, aliases=("gateway__recognize_music", "music_recognition", "listen_music", "analyze_audio", "RecognizeMusic", "audio_recognition")),
+        GatewayTool("recognize_video", "Ask an upstream model to analyze a video (path/url/data_url/base64). Requires a model declaring supports_video_recognition.", _json_schema({"path": {"type": "string"}, "url": {"type": "string"}, "data_url": {"type": "string"}, "base64": {"type": "string"}, "mime_type": {"type": "string"}, "question": {"type": "string"}, "prompt": {"type": "string"}}), _tool_recognize_video, "read_network", llm=True, aliases=("gateway__recognize_video", "video_recognition", "watch_video", "analyze_video", "RecognizeVideo")),
         GatewayTool("list_mcp_resources", "List configured MCP resources through real MCP resources/list.", _json_schema({"server": {"type": "string"}}), _tool_list_mcp_resources, "mcp", aliases=("ListMcpResourcesTool",)),
         GatewayTool("list_mcp_resource_templates", "List configured MCP resource templates through real MCP resources/templates/list.", _json_schema({"server": {"type": "string"}}), _tool_list_mcp_resource_templates, "mcp"),
         GatewayTool("read_mcp_resource", "Read an MCP resource through real MCP resources/read.", _json_schema({"server": {"type": "string"}, "uri": {"type": "string"}}, ["uri"]), _tool_read_mcp_resource, "mcp", aliases=("mcp_read_resource", "ReadMcpResourceTool")),

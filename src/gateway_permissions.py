@@ -39,7 +39,8 @@ TOOL_CATEGORIES = {
         "write_stdin",
     },
     "network": {
-        "WebFetch", "WebSearch", "Agent",
+        "WebFetch", "WebSearch", "Agent", "recognize_image", "recognize_music",
+        "recognize_video",
     },
     "system": {
         "Skill", "ScheduleWakeup", "AskUserQuestion",

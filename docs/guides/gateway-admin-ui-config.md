@@ -1,18 +1,19 @@
 # Gateway Admin UI 与 Config Center
 
-> 最后校准：2026-07-29。管理面分为运维 Control Center `/ui`、schema-driven Config Center `/ui/config` 和下游客户端配置中心 `/client-config`。
+> 最后校准：2026-08-25。管理面分为运维 Control Center `/ui`、schema-driven Config Center `/ui/config` 和下游客户端配置中心 `/client-config`。
 
 ## 入口
 
 | 路径 | 用途 | 鉴权 |
 |---|---|---|
 | `/ui` | 上游、下游 key、工具、MCP、HTTP Actions、Skills、请求/失败/runtime 状态 | Admin Basic Auth |
-| `/ui/config` | 9-Tab canonical 配置中心 | Admin Basic Auth |
+| `/ui/config` | 10-Tab canonical 配置中心 | Admin Basic Auth |
 | `/client-config` | Codex、Claude Code、OpenCode 配置片段 | Admin Basic Auth |
 | `/client-config.json` | 同上，机器可读 JSON | Admin Basic Auth |
 | `/api/config` | 脱敏配置和 revision；POST 兼容更新 | Admin Basic Auth |
-| `/api/config/schema` | 9 Tab / 89 字段 schema | Admin Basic Auth |
+| `/api/config/schema` | 10 Tab / 94 字段 schema | Admin Basic Auth |
 | `/api/config/update` | revision-aware schema-bound 更新 | Admin Basic Auth + same-origin/CLI |
+| `/api/config/model-capability` | revision-aware per-model 能力覆盖更新 | Admin Basic Auth + same-origin/CLI |
 | `/api/stats/dashboard` | 主 HTTP snapshot 与辅助统计 | Admin Basic Auth |
 | `/api/cache/stats` | 内存/持久缓存状态 | Admin Basic Auth |
 | `/api/cache/clear` | 清空缓存 | Admin Basic Auth + same-origin/CLI |
@@ -43,7 +44,7 @@
 | Tab | 字段数 | 范围 |
 |---|---:|---|
 | upstream | 11 | URL、key、model、protocol、timeout、token 上限等 |
-| capabilities | 8 | tools/function/parallel/vision/stream/json/network/search |
+| capabilities | 13 | tools/function/parallel/vision/stream/json/network/search 与 image/music/video/audio/speech |
 | context | 11 | compact、fan-out、memory |
 | intelligence | 12 | 请求前分析、LLM provider、strict/fallback |
 | concurrency | 9 | upstream pool、请求并发、准入 |
@@ -51,7 +52,8 @@
 | tools | 12 | tool mode、rounds、权限、adapter |
 | web2api | 10 | enable、timeout、大小、网络边界 |
 | security | 8 | CORS、限流、管理安全等 |
-| **合计** | **89** |  |
+| model_matrix | 0 | 可编辑 per-model 能力矩阵（独立 CAS API） |
+| **合计** | **94** |  |
 
 页面 schema 来自 `src/gateway_web_config.py:get_config_schema()`，API 只接受 schema 中的字段。
 

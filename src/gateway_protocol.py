@@ -5,9 +5,11 @@ Handles conversion of tools, messages, and responses between different API forma
 """
 from __future__ import annotations
 
+import base64
 import copy
 import json
 import re
+import urllib.parse
 import uuid
 from typing import Any
 
@@ -68,6 +70,153 @@ def _openai_text_from_content(content: Any) -> str:
         if content.get("type") == "text":
             return str(content.get("text") or "")
     return str(content) if content else ""
+
+
+# ---------------------------------------------------------------------------
+# Multimodal image part normalization
+#
+# OpenAI Chat, OpenAI Responses and Anthropic Messages all support image content
+# blocks, but with different schemas.  The Gateway must translate between them
+# instead of dropping images (the old behaviour replaced them with "[image]").
+# ---------------------------------------------------------------------------
+
+_DATA_URL_RE = re.compile(r"^data:([^;]+);base64,(.+)$", re.DOTALL)
+
+
+def _parse_data_url(url: str) -> tuple[str, str] | None:
+    """Parse ``data:<media_type>;base64,<data>`` into ``(media_type, data)``."""
+    if not isinstance(url, str):
+        return None
+    match = _DATA_URL_RE.match(url.strip())
+    if not match:
+        return None
+    return match.group(1), match.group(2)
+
+
+def _image_source_from_part(part: Json) -> tuple[str | None, str | None, str]:
+    """Extract ``(url, base64_data, media_type)`` from any image part shape.
+
+    Exactly one of ``url`` / ``base64_data`` is set; ``media_type`` defaults to
+    ``image/jpeg``.  Returns ``(None, None, "")`` when the part is not an image.
+    """
+    if not isinstance(part, dict):
+        return None, None, ""
+    ptype = str(part.get("type") or "").lower()
+    if ptype == "image_url":
+        url_obj = part.get("image_url") or {}
+        if isinstance(url_obj, str):
+            return url_obj, None, ""
+        if isinstance(url_obj, dict):
+            return str(url_obj.get("url") or ""), None, ""
+        return None, None, ""
+    if ptype == "input_image":
+        return str(part.get("image_url") or ""), None, ""
+    if ptype == "image":
+        source = part.get("source") or {}
+        stype = str(source.get("type") or "").lower()
+        if stype == "base64":
+            return None, str(source.get("data") or ""), str(source.get("media_type") or "image/jpeg")
+        if stype == "url":
+            return str(source.get("url") or ""), None, ""
+        return None, None, ""
+    return None, None, ""
+
+
+def _normalize_image_part(part: Any, target_protocol: str) -> Json | None:
+    """Convert an image content part to ``target_protocol``'s image schema.
+
+    Supported targets: ``"anthropic"``, ``"openai_chat"``, ``"openai_responses"``.
+    Returns None when the part is not an image part (caller should skip it).
+    """
+    url, base64_data, media_type = _image_source_from_part(part)
+    if url is None and base64_data is None:
+        return None
+
+    if target_protocol == "anthropic":
+        if base64_data:
+            return {
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": base64_data},
+            }
+        parsed = _parse_data_url(url)
+        if parsed:
+            return {
+                "type": "image",
+                "source": {"type": "base64", "media_type": parsed[0], "data": parsed[1]},
+            }
+        return {"type": "image", "source": {"type": "url", "url": url}}
+
+    # OpenAI Chat / Responses both use a URL (data URL or http(s) URL).
+    if base64_data:
+        data_url = f"data:{media_type};base64,{base64_data}"
+    else:
+        data_url = url
+    if target_protocol == "openai_chat":
+        return {"type": "image_url", "image_url": {"url": data_url}}
+    return {"type": "input_image", "image_url": data_url}
+
+
+def _normalize_content_parts(parts: Any, target_protocol: str) -> list[Json]:
+    """Normalize a content list, translating image parts to ``target_protocol``.
+
+    Adjacent text parts are merged; non-image, non-text parts are passed through
+    unchanged so tool_result / thinking blocks survive untouched.
+
+    Text parts use ``input_text`` for the OpenAI Responses target and ``text``
+    everywhere else, matching each protocol's content-part vocabulary.
+    """
+    if not isinstance(parts, list):
+        return []
+    text_type = "input_text" if target_protocol == "openai_responses" else "text"
+    normalized: list[Json] = []
+    for item in parts:
+        if not isinstance(item, dict):
+            if isinstance(item, str):
+                normalized.append({"type": text_type, "text": item})
+            continue
+        ptype = str(item.get("type") or "").lower()
+        if ptype in {"image", "image_url", "input_image"}:
+            converted = _normalize_image_part(item, target_protocol)
+            if converted is not None:
+                normalized.append(converted)
+            continue
+        if ptype in {"text", "input_text", "output_text"}:
+            part = {"type": text_type, "text": str(item.get("text") or "")}
+            if normalized and normalized[-1].get("type") == text_type:
+                existing = normalized[-1]
+                existing["text"] = f"{existing.get('text', '')}{part['text']}"
+            else:
+                normalized.append(part)
+            continue
+        normalized.append(copy.deepcopy(item))
+    return normalized
+
+
+def _content_list_to_openai_user_content(parts: list[Json]) -> Any:
+    """Collapse a normalized content list into OpenAI user ``content``.
+
+    A single text part becomes a plain string (OpenAI accepts both); mixed
+    text/image parts stay a list.
+    """
+    if not parts:
+        return ""
+    if len(parts) == 1 and parts[0].get("type") == "text":
+        return str(parts[0].get("text") or "")
+    return parts
+
+
+def _merge_adjacent_text_parts(parts: list[Json]) -> list[Json]:
+    """Merge consecutive text parts into one (keeps images/tool blocks intact)."""
+    merged: list[Json] = []
+    for part in parts:
+        if not isinstance(part, dict):
+            merged.append(part)
+            continue
+        if merged and merged[-1].get("type") == "text" and part.get("type") == "text":
+            merged[-1]["text"] = f"{merged[-1].get('text', '')}{part.get('text', '')}"
+        else:
+            merged.append(part)
+    return merged
 
 
 def _legacy_function_call_id(name: Any) -> str:
@@ -312,14 +461,16 @@ def _convert_anthropic_messages_to_openai(messages: list[Json]) -> tuple[list[Js
             if isinstance(content, str):
                 result.append({"role": "user", "content": content})
             elif isinstance(content, list):
-                text_parts = []
+                content_parts = []
                 tool_results = []
                 for item in content:
                     if isinstance(item, dict):
                         if item.get("type") == "text":
-                            text_parts.append(str(item.get("text") or ""))
-                        elif item.get("type") == "image":
-                            text_parts.append("[image]")
+                            content_parts.append({"type": "text", "text": str(item.get("text") or "")})
+                        elif item.get("type") in {"image", "image_url", "input_image"}:
+                            converted = _normalize_image_part(item, "openai_chat")
+                            if converted is not None:
+                                content_parts.append(converted)
                         elif item.get("type") == "tool_result":
                             tool_use_id = item.get("tool_use_id", "")
                             result_text = _encode_tool_result_content(
@@ -332,10 +483,12 @@ def _convert_anthropic_messages_to_openai(messages: list[Json]) -> tuple[list[Js
                                 "content": result_text,
                             })
                     elif isinstance(item, str):
-                        text_parts.append(item)
-                # Text parts first, then tool results
-                if text_parts:
-                    result.append({"role": "user", "content": "\n".join(text_parts)})
+                        content_parts.append({"type": "text", "text": item})
+                # Merge adjacent text parts, then collapse single-text lists.
+                content_parts = _merge_adjacent_text_parts(content_parts)
+                # Text/image parts first, then tool results
+                if content_parts:
+                    result.append({"role": "user", "content": _content_list_to_openai_user_content(content_parts)})
                 result.extend(tool_results)
         elif role == "assistant":
             if isinstance(content, str):
@@ -641,7 +794,8 @@ def _openai_messages_to_anthropic(messages: list[Json]) -> tuple[list[Json], str
             if isinstance(content, str):
                 result.append({"role": "user", "content": content})
             elif isinstance(content, list):
-                result.append({"role": "user", "content": content})
+                normalized = _normalize_content_parts(content, "anthropic")
+                result.append({"role": "user", "content": _content_list_to_openai_user_content(normalized)})
         elif role == "assistant":
             content_parts = []
             text = msg.get("content")
@@ -728,6 +882,7 @@ def _from_anthropic_response_to_openai(response: Json) -> Json:
     content = response.get("content") or []
     text_parts = []
     thinking_parts = []
+    image_parts = []
     tool_calls = []
     for item in content:
         if isinstance(item, dict):
@@ -735,6 +890,10 @@ def _from_anthropic_response_to_openai(response: Json) -> Json:
                 text_parts.append(str(item.get("text") or ""))
             elif item.get("type") == "thinking":
                 thinking_parts.append(str(item.get("thinking") or ""))
+            elif item.get("type") in {"image", "image_url", "input_image"}:
+                converted = _normalize_image_part(item, "openai_chat")
+                if converted is not None:
+                    image_parts.append(converted)
             elif item.get("type") == "tool_use":
                 tool_calls.append({
                     "id": item.get("id", ""),
@@ -745,8 +904,12 @@ def _from_anthropic_response_to_openai(response: Json) -> Json:
                     },
                 })
     message: Json = {"role": "assistant"}
-    if text_parts:
-        message["content"] = "\n".join(text_parts)
+    if text_parts or image_parts:
+        if image_parts:
+            content_list = [{"type": "text", "text": "\n".join(text_parts)}] + image_parts if text_parts else image_parts
+            message["content"] = content_list
+        else:
+            message["content"] = "\n".join(text_parts)
     if thinking_parts:
         message["reasoning"] = "\n".join(thinking_parts)
     if tool_calls:
@@ -796,7 +959,8 @@ def _openai_chat_to_responses_payload(body: Json, *, stream: bool | None = None)
             if isinstance(content, str):
                 input_items.append({"role": "user", "content": content})
             elif isinstance(content, list):
-                input_items.append({"role": "user", "content": content})
+                normalized = _normalize_content_parts(content, "openai_responses")
+                input_items.append({"role": "user", "content": normalized})
         elif role == "assistant":
             content = msg.get("content", "")
             if content:
@@ -922,9 +1086,28 @@ def _from_openai_chat_to_responses_response(response: Json) -> Json:
     message = choices[0].get("message") or {}
     output_items = []
     if message.get("content"):
+        content = message["content"]
+        if isinstance(content, list):
+            text_parts: list[str] = []
+            omitted_media = 0
+            for part in content:
+                if not isinstance(part, dict):
+                    if isinstance(part, str):
+                        text_parts.append(part)
+                    continue
+                if part.get("type") in {"text", "input_text", "output_text"}:
+                    text_parts.append(str(part.get("text") or ""))
+                elif part.get("type") in {"image", "image_url", "input_image"}:
+                    omitted_media += 1
+            content = "\n".join(item for item in text_parts if item)
+            if omitted_media:
+                marker = f"[assistant media omitted: {omitted_media} image block(s)]"
+                content = f"{content}\n{marker}" if content else marker
+        elif not isinstance(content, str):
+            content = str(content)
         output_items.append({
             "type": "message",
-            "content": [{"type": "output_text", "text": message["content"]}],
+            "content": [{"type": "output_text", "text": content}],
         })
     for tc in _openai_tool_calls_from_message(message):
         func = tc.get("function") or {}

@@ -387,3 +387,169 @@ def test_malformed_connector_collections_fail_closed(monkeypatch: pytest.MonkeyP
         assert message in result.error
         assert saved == []
 
+
+def test_profile_form_supports_multiple_models_with_per_model_capabilities(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The admin profile form can carry a models_json list; each model may
+    declare its own capabilities that override the profile-level defaults."""
+    config = _base_config()
+    saved = _capture_saves(monkeypatch)
+    models_json = (
+        '[{"name":"text-pro","capabilities":{"supports_tools":true}},'
+        '{"name":"vision-pro","capabilities":{"supports_image_recognition":true,"supports_tools":true}},'
+        '{"name":"music-pro","capabilities":{"supports_music_recognition":true}}]'
+    )
+    form = {
+        "action": "save",
+        "id": "active",
+        "name": "active",
+        "base_url": "https://active.example.com",
+        "api_key": "",
+        "model": "text-pro",
+        "protocol": "openai_chat",
+        "tools_enabled": "adapter",
+        "timeout_seconds": "60",
+        "max_input_tokens": "128000",
+        "max_output_tokens": "8192",
+        "max_concurrency": "32",
+        "path_models": "/v1/models",
+        "models_json": models_json,
+    }
+    result = mutations.apply_admin_connector_mutation("/admin/upstream-profile", config, "revision", form)
+    assert result.success, result.error
+    assert saved
+    saved_config = saved[0][0]
+    profile = next(p for p in saved_config["upstream_profiles"] if p["id"] == "active")
+    models = profile.get("models") or []
+    names = [m["name"] for m in models]
+    assert names == ["text-pro", "vision-pro", "music-pro"]
+    by_name = {m["name"]: m for m in models}
+    assert by_name["vision-pro"]["capabilities"]["supports_image_recognition"] is True
+    assert by_name["vision-pro"]["capabilities"]["supports_tools"] is True
+    assert by_name["music-pro"]["capabilities"]["supports_music_recognition"] is True
+    # The legacy top-level model field stays in sync with the first model.
+    assert saved_config["upstream"]["model"] == "text-pro"
+
+
+def test_profile_form_falls_back_to_single_model_when_models_json_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty models_json keeps the legacy single-model behaviour."""
+    config = _base_config()
+    saved = _capture_saves(monkeypatch)
+    form = {
+        "action": "save",
+        "id": "active",
+        "name": "active",
+        "base_url": "https://active.example.com",
+        "api_key": "",
+        "model": "legacy-model",
+        "protocol": "openai_chat",
+        "tools_enabled": "adapter",
+        "timeout_seconds": "60",
+        "max_input_tokens": "128000",
+        "max_output_tokens": "8192",
+        "max_concurrency": "32",
+        "path_models": "/v1/models",
+        "models_json": "",
+    }
+    result = mutations.apply_admin_connector_mutation("/admin/upstream-profile", config, "revision", form)
+    assert result.success, result.error
+    saved_config = saved[0][0]
+    profile = next(p for p in saved_config["upstream_profiles"] if p["id"] == "active")
+    models = profile.get("models") or []
+    assert len(models) == 1
+    assert models[0]["name"] == "legacy-model"
+    assert saved_config["upstream"]["model"] == "legacy-model"
+
+
+def test_profile_form_rejects_invalid_models_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _base_config()
+    saved = _capture_saves(monkeypatch)
+    form = {
+        "action": "save",
+        "id": "active",
+        "name": "active",
+        "base_url": "https://active.example.com",
+        "api_key": "",
+        "model": "legacy-model",
+        "protocol": "openai_chat",
+        "tools_enabled": "adapter",
+        "timeout_seconds": "60",
+        "max_input_tokens": "128000",
+        "max_output_tokens": "8192",
+        "max_concurrency": "32",
+        "path_models": "/v1/models",
+        "models_json": "{not valid json",
+    }
+    result = mutations.apply_admin_connector_mutation("/admin/upstream-profile", config, "revision", form)
+    assert not result.success
+    assert "models_json" in result.error
+    assert saved == []
+
+
+@pytest.mark.parametrize("value", ["false", 0, None, [], {}])
+def test_profile_form_rejects_non_boolean_model_capabilities(
+    value: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _base_config()
+    saved = _capture_saves(monkeypatch)
+    form = {
+        "action": "save",
+        "id": "active",
+        "model": "vision-pro",
+        "models_json": __import__("json").dumps(
+            [{"name": "vision-pro", "capabilities": {"supports_image_recognition": value}}]
+        ),
+    }
+
+    result = mutations.apply_admin_connector_mutation(
+        "/admin/upstream-profile", config, "revision", form
+    )
+
+    assert result.status == 400
+    assert "JSON 布尔值" in result.error
+    assert saved == []
+
+
+def test_profile_form_synchronizes_default_model_to_first_declared_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _base_config()
+    saved = _capture_saves(monkeypatch)
+    form = {
+        "action": "save",
+        "id": "active",
+        "model": "legacy-model-not-in-list",
+        "models_json": '[{"name":"vision-pro"},{"name":"text-pro"}]',
+    }
+
+    result = mutations.apply_admin_connector_mutation(
+        "/admin/upstream-profile", config, "revision", form
+    )
+
+    assert result.success, result.error
+    profile = next(
+        item for item in saved[0][0]["upstream_profiles"] if item["id"] == "active"
+    )
+    assert profile["model"] == "vision-pro"
+    assert saved[0][0]["upstream"]["model"] == "vision-pro"
+
+
+def test_inherited_model_capability_tracks_profile_changes_without_stale_override() -> None:
+    profile = _profile("active", api_key="secret")
+    profile["capabilities"] = {"supports_tools": True}
+    profile["models"] = [{"name": "inherited-model"}]
+    config = {
+        "upstream_profiles": [profile],
+        "active_upstream_id": "active",
+        "upstream": copy.deepcopy(profile),
+    }
+
+    first = gateway_config.flatten_profile_models(config)[0]
+    assert first["capabilities"]["supports_tools"] is True
+    assert first["capability_overrides"] == {}
+
+    config["upstream_profiles"][0]["capabilities"]["supports_tools"] = False
+    config["upstream"]["capabilities"]["supports_tools"] = False
+    second = gateway_config.flatten_profile_models(config)[0]
+    assert second["capabilities"]["supports_tools"] is False
+    assert second["capability_overrides"] == {}

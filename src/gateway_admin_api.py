@@ -20,7 +20,12 @@ _GET_PATHS = {
     "/api/stats/dashboard",
     "/api/cache/stats",
 }
-_POST_PATHS = {"/api/config", "/api/config/update", "/api/cache/clear"}
+_POST_PATHS = {
+    "/api/config",
+    "/api/config/update",
+    "/api/config/model-capability",
+    "/api/cache/clear",
+}
 _SECRET_PLACEHOLDERS = {"", "***"}
 _MAX_UPDATE_FIELDS = 200
 _MAX_UPDATE_DEPTH = 8
@@ -257,16 +262,62 @@ def apply_config_update(payload: Json) -> tuple[Json, str, list[str]]:
     return _redacted_config(candidate), new_revision, sorted(changed)
 
 
+def apply_model_capability_update(payload: Json) -> tuple[Json, str, str]:
+    """Persist one strict, revision-bound per-model capability override."""
+    from .gateway_config import (
+        MODEL_CAPABILITY_KEYS,
+        _redacted_config,
+        load_config_with_revision,
+        save_config,
+        set_model_capability,
+    )
+    from .gateway_errors import ConfigError
+
+    allowed = {"profile_id", "model", "capability", "value", "revision"}
+    unknown = set(payload) - allowed
+    if unknown:
+        raise BadRequestError(
+            f"unknown model capability update field: {sorted(unknown)[0]}"
+        )
+    profile_id = str(payload.get("profile_id") or "").strip()
+    model = str(payload.get("model") or "").strip()
+    capability = str(payload.get("capability") or "").strip()
+    revision = str(payload.get("revision") or "").strip()
+    value = payload.get("value")
+    if not profile_id or not model:
+        raise BadRequestError("profile_id and model are required")
+    if capability not in MODEL_CAPABILITY_KEYS:
+        raise BadRequestError(f"unknown capability: {capability!r}")
+    if not isinstance(value, bool):
+        raise BadRequestError("model capability value must be a JSON boolean")
+    if not revision:
+        raise BadRequestError("revision is required for model capability update")
+
+    current, _current_revision = load_config_with_revision()
+    try:
+        candidate, changed = set_model_capability(
+            current, profile_id, model, capability, value
+        )
+    except ConfigError as exc:
+        raise BadRequestError(str(exc)) from exc
+    new_revision = save_config(candidate, expected_revision=revision)
+    _reload_runtime_after_config_update({changed, "upstream.models"})
+    return _redacted_config(candidate), new_revision, changed
+
+
 def _reload_runtime_after_config_update(changed: set[str]) -> None:
     from .gateway_assistants import reset_assistant_store
     from .gateway_cache import reset_caches
     from .gateway_upstream_pool import reset_upstream_pool
     from .gateway_web2api import reset_engine
+    from .gateway_model_router import reset_model_router
 
     if any(path.startswith(("cache.", "gateway.tool_cache_", "persistence.")) for path in changed):
         reset_caches()
     if any(path.startswith(("upstream.", "concurrency.")) for path in changed):
         reset_upstream_pool()
+    if any(path.startswith(("upstream.", "upstream_profiles", "concurrency.")) for path in changed):
+        reset_model_router()
     if any(path.startswith("web2api.") for path in changed):
         reset_engine()
     if any(path.startswith("assistants.") for path in changed):
@@ -384,6 +435,19 @@ def handle_admin_api_post(
         json_response(handler, 200, {"ok": True, **clear_caches()})
         return True
     payload = read_json(handler)
+    if path == "/api/config/model-capability":
+        config, revision, changed = apply_model_capability_update(payload)
+        json_response(
+            handler,
+            200,
+            {
+                "ok": True,
+                "config": config,
+                "revision": revision,
+                "changed_fields": [changed],
+            },
+        )
+        return True
     config, revision, changed = apply_config_update(payload)
     json_response(
         handler,
@@ -397,6 +461,7 @@ __all__ = [
     "_GET_PATHS",
     "_POST_PATHS",
     "apply_config_update",
+    "apply_model_capability_update",
     "cache_status",
     "clear_caches",
     "dashboard_status",

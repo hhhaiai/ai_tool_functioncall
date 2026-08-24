@@ -111,7 +111,7 @@ Gateway 是中游服务，不把自身启动目录当作用户项目目录。每
 ### 3.4 配置管理
 
 - **Admin UI**: `gateway_admin.py` + `gateway_http_handler.py`
-- **9-Tab Config Center**: `gateway_web_config.py` + `gateway_admin_api.py`
+- **10-Tab Config Center**: `gateway_web_config.py` + `gateway_admin_api.py`
 - **配置文件**: `gateway_config.py`
 - 支持配置上游能力、模型参数、工具权限等
 
@@ -179,7 +179,7 @@ src/
 │   ├── 正则提取
 │   └── 自动元数据提取
 ├── gateway_web_config.py      # Web 配置 UI
-│   ├── Tab 式配置界面 (9 个标签页)
+│   ├── Tab 式配置界面 (10 个标签页)
 │   └── 配置 Schema + 更新 API
 ├── gateway_assistants.py      # Assistants/Threads/messages/runs/steps SQLite 生命周期
 ├── gateway_persistence.py     # 语义缓存、工具缓存等持久化入口

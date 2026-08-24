@@ -122,8 +122,8 @@ def test_admin_config_ui_schema_and_redacted_get_are_live(admin_server: str) -> 
     assert 'href="/ui/config/client"' not in str(ui)
     assert 'href="/stats"' not in str(ui)
     assert schema_status == 200
-    assert len(schema["tabs"]) == 9
-    assert {tab["id"] for tab in schema["tabs"]} >= {"intelligence", "concurrency", "web2api"}
+    assert len(schema["tabs"]) == 10
+    assert {tab["id"] for tab in schema["tabs"]} >= {"intelligence", "concurrency", "web2api", "model_matrix"}
     assert config_status == 200
     assert config["revision"]
     serialized = json.dumps(config)
@@ -209,6 +209,73 @@ def test_config_update_rejects_cross_origin_unknown_fields_and_invalid_invariant
     assert invalid_status == 400
     assert "must not exceed" in invalid["error"]["message"]
     assert gateway_config.load_config()["admin"]["username"] == "admin"
+
+
+def test_model_capability_update_is_strict_revision_bound_and_persistent(
+    admin_server: str,
+) -> None:
+    _, current = _request(admin_server, "/api/config")
+    profile = current["config"]["upstream"]
+    model = profile["models"][0]["name"]
+    payload = {
+        "profile_id": profile["id"],
+        "model": model,
+        "capability": "supports_image_recognition",
+        "value": True,
+        "revision": current["revision"],
+    }
+
+    status, updated = _request(
+        admin_server,
+        "/api/config/model-capability",
+        method="POST",
+        payload=payload,
+        origin=admin_server,
+    )
+
+    assert status == 200
+    assert updated["ok"] is True
+    assert updated["revision"] != current["revision"]
+    row = next(
+        item
+        for item in gateway_config.flatten_profile_models(gateway_config.load_config())
+        if item["profile_id"] == profile["id"] and item["model"] == model
+    )
+    assert row["capabilities"]["supports_image_recognition"] is True
+    assert row["capability_overrides"]["supports_image_recognition"] is True
+
+    stale_status, _ = _request(
+        admin_server,
+        "/api/config/model-capability",
+        method="POST",
+        payload={**payload, "value": False},
+        origin=admin_server,
+    )
+    assert stale_status == 409
+
+
+@pytest.mark.parametrize("value", ["false", 0, None, [], {}])
+def test_model_capability_update_rejects_non_boolean_values(
+    admin_server: str,
+    value: object,
+) -> None:
+    _, current = _request(admin_server, "/api/config")
+    profile = current["config"]["upstream"]
+    status, result = _request(
+        admin_server,
+        "/api/config/model-capability",
+        method="POST",
+        payload={
+            "profile_id": profile["id"],
+            "model": profile["models"][0]["name"],
+            "capability": "supports_image_recognition",
+            "value": value,
+            "revision": current["revision"],
+        },
+        origin=admin_server,
+    )
+    assert status == 400
+    assert "JSON boolean" in result["error"]["message"]
 
 
 def test_stats_cache_and_cache_clear_admin_apis(admin_server: str) -> None:

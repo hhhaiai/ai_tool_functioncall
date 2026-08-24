@@ -3473,11 +3473,29 @@ def _tool_call_requires_downstream_execution(call: ToolCall, body: Json | None =
     MCP server tools, network tools, pure utilities, and Gateway state tools can
     still execute in the service.
     """
-    if _gateway_executes_user_side_tools_locally():
-        return False
     normalized = _normalize_tool_call(call)
     tool = BUILTIN_TOOLS.get(normalized.name)
     canonical_name = tool.name if tool is not None else normalized.name
+
+    if canonical_name in {"recognize_image", "recognize_music", "recognize_video"}:
+        # A deployed Gateway checkout is service code, never a user's local
+        # workspace.  Recognition paths therefore remain downstream-owned even
+        # when legacy local-proxy execution is enabled for other tool classes.
+        args = normalized.arguments if isinstance(normalized.arguments, dict) else {}
+        if any(
+            bool(args.get(key))
+            for key in (
+                "path",
+                "file_path",
+                "image_path",
+                "audio_path",
+                "video_path",
+            )
+        ):
+            return True
+
+    if _gateway_executes_user_side_tools_locally():
+        return False
 
     if canonical_name == "multi_tool_use.parallel":
         tool_uses = normalized.arguments.get("tool_uses")
@@ -3499,6 +3517,10 @@ def _tool_call_requires_downstream_execution(call: ToolCall, body: Json | None =
         return True
 
     if tool is not None:
+        if canonical_name in {"recognize_image", "recognize_music", "recognize_video"}:
+            # Remote/data media is service-owned and routed through the
+            # configured upstream; path-based media already returned above.
+            return False
         if canonical_name == "JsonQuery":
             # JsonQuery(data=...) is a pure service helper.  JsonQuery(file_path=...)
             # reads the downstream workspace and must not run on the cloud Gateway
@@ -3698,6 +3720,26 @@ def _record_failed_tool_result(
     return result
 
 
+def _call_tool_handler(tool: Any, arguments: Json) -> str:
+    """Invoke a tool handler, injecting the model router for ``llm`` tools.
+
+    ``llm`` tools (image / music / video recognition, ...) dispatch to an
+    upstream model selected by capability.  The handler reads the router from
+    a contextvar so it stays decoupled from the orchestration layer.
+    """
+    if not getattr(tool, "llm", False):
+        return tool.handler(arguments)
+    from .gateway_model_router import get_model_router as _get_router
+    from . import gateway_builtin_tools as _bt
+
+    router = _get_router()
+    token = _bt._MODEL_ROUTER.set(router)
+    try:
+        return tool.handler(arguments)
+    finally:
+        _bt._MODEL_ROUTER.reset(token)
+
+
 def _execute_tool_call_impl(call: ToolCall, provider: str | None = None, client_id: str | None = None) -> ToolResult:
     import time as _time
     _start = _time.time()
@@ -3819,7 +3861,7 @@ def _execute_tool_call_impl(call: ToolCall, provider: str | None = None, client_
                     retry_count=attempt,
                     provider=provider,
                 )
-            content = tool.handler(call.arguments)
+            content = _call_tool_handler(tool, call.arguments)
             if mutates_workspace:
                 _invalidate_tool_cache_scope(_tool_cache, workspace_cache_key, runtime_cache_key)
             _record_tool_stat(call.name, True)

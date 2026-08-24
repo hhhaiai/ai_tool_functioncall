@@ -10,7 +10,7 @@
 - 弱上游工具调用适配、工具归属分流与多轮编排；
 - Gateway-owned 工具、MCP、HTTP Actions 与内置工具 runtime；
 - 长上下文压缩、SQLite 记忆、fan-out、缓存和持久化；
-- Admin UI、9-Tab Config Center、运行状态与部署入口；
+- Admin UI、10-Tab Config Center、运行状态与部署入口；
 - Assistants / Threads、Web2API、多上游和请求前 Intelligence。
 
 运行时能力以 `GET /capabilities`、真实请求行为和当前测试为准。文件名、注释、历史文档或 helper 存在，不等于能力已接入生产请求路径。
@@ -111,8 +111,8 @@ bash -n scripts/*.sh
 以下数字由当前代码 registry/schema 生成，不应手工猜测：
 
 - 公开路径：24；
-- 内置工具：67 个唯一 canonical 工具；
-- 内置工具 registry：178 个含别名 key；
-- Config Center：9 个标签页、89 个字段。
+- 内置工具：70 个唯一 canonical 工具；
+- 内置工具 registry：199 个含别名 key；
+- Config Center：10 个标签页、94 个字段。
 
 仓库整洁性由 `tests/test_repository_hygiene.py` 约束：Admin renderer 只能有一个权威定义，根目录文档只能保留两个入口，退休文件不能回流，本地 Markdown 链接必须可解析，代码围栏必须闭合。

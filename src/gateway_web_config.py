@@ -102,6 +102,11 @@ def _get_config_tabs() -> list[ConfigTab]:
                 ConfigField("upstream.capabilities.supports_network", "支持网络", "boolean", default=False),
                 ConfigField("upstream.capabilities.supports_web_search", "支持 Web Search", "boolean", default=False),
                 ConfigField("upstream.capabilities.supports_json_schema", "支持 JSON Schema", "boolean", default=False),
+                ConfigField("upstream.capabilities.supports_image_recognition", "支持图片识别", "boolean", default=False),
+                ConfigField("upstream.capabilities.supports_music_recognition", "支持音乐识别", "boolean", default=False),
+                ConfigField("upstream.capabilities.supports_video_recognition", "支持视频识别", "boolean", default=False),
+                ConfigField("upstream.capabilities.supports_audio_recognition", "支持音频识别", "boolean", default=False),
+                ConfigField("upstream.capabilities.supports_speech", "支持语音转写", "boolean", default=False),
             ],
         ),
         ConfigTab(
@@ -234,6 +239,13 @@ def _get_config_tabs() -> list[ConfigTab]:
                 ConfigField("gateway.public_base_url", "公开 Base URL", "text", default="http://127.0.0.1:8885"),
             ],
         ),
+        ConfigTab(
+            id="model_matrix",
+            label="模型能力矩阵",
+            icon="🎯",
+            description="按 per-model 能力标志检查并修改每个上游 profile / 模型的能力覆盖；每次修改都使用配置 revision 做并发保护。",
+            fields=[],
+        ),
     ]
 
 
@@ -318,12 +330,122 @@ def _render_field(field: ConfigField, current_value: Any = None) -> str:
         </div>"""
 
 
+def _render_model_capability_matrix(config: dict[str, Any]) -> str:
+    """Render an editable model × capability matrix for the Config Center.
+
+    Rows come from every upstream profile's per-model list (via
+    ``flatten_profile_models``); columns come from ``MODEL_CAPABILITY_SPEC``.
+    Also surfaces consistency warnings: models that declare a capability but
+    sit on a profile that disables it, profiles with no models, etc.
+    """
+    from .gateway_config import (
+        MODEL_CAPABILITY_SPEC,
+        _normalized_profiles,
+        flatten_profile_models,
+    )
+
+    rows = flatten_profile_models(config)
+    if not rows:
+        return """
+        <div class="matrix-empty">
+            <p>尚未配置任何上游模型。请到「上游配置」Tab 添加 profile 与模型，或在「能力配置」Tab 声明能力。</p>
+        </div>"""
+
+    # Group columns by kind for a readable layout.
+    kind_groups: dict[str, list[tuple[str, str]]] = {}
+    for key, label, kind in MODEL_CAPABILITY_SPEC:
+        kind_groups.setdefault(kind, []).append((key, label))
+
+    # Profile-level settings used by the consistency checks.
+    profile_settings = {
+        str(p.get("id") or ""): p for p in _normalized_profiles(config)
+    }
+
+    # Consistency warnings.
+    warnings: list[str] = []
+    for row in rows:
+        caps = row.get("capabilities") or {}
+        declared = {k for k, v in caps.items() if v}
+        profile = profile_settings.get(str(row.get("profile_id") or ""), {})
+        profile_tools = str(profile.get("tools_enabled") or "adapter")
+        if (declared & {"supports_tools", "supports_function_calls"}) and profile_tools == "disabled":
+            warnings.append(
+                f"{row['profile_id']}/{row['model']} 声明了 tool 能力，但所在 profile 的 tools_enabled=disabled。"
+            )
+        if not declared:
+            warnings.append(
+                f"{row['profile_id']}/{row['model']} 没有声明任何能力标志；路由时将无法被按能力选中。"
+            )
+
+    header_cells = '<th class="matrix-model">模型</th>'
+    header_cells += '<th class="matrix-profile">Profile</th>'
+    header_cells += '<th class="matrix-default">默认</th>'
+    for key, label in [(k, l) for k, l, _ in MODEL_CAPABILITY_SPEC]:
+        safe = html.escape(key)
+        title = html.escape(label)
+        header_cells += f'<th data-capability="{safe}" title="{title}">{title}</th>'
+
+    body_rows = ""
+    for row in rows:
+        caps = row.get("capabilities") or {}
+        model = html.escape(row.get("model") or "")
+        profile = html.escape(row.get("profile_name") or row.get("profile_id") or "")
+        profile_id_attr = html.escape(str(row.get("profile_id") or ""), quote=True)
+        model_attr = html.escape(str(row.get("model") or ""), quote=True)
+        default_badge = "★" if row.get("is_default") else ""
+        cells = f'<td class="matrix-model">{model}</td>'
+        cells += f'<td class="matrix-profile">{profile}</td>'
+        cells += f'<td class="matrix-default">{default_badge}</td>'
+        for key, _label in [(k, l) for k, l, _ in MODEL_CAPABILITY_SPEC]:
+            on = bool(caps.get(key))
+            safe_key = html.escape(key, quote=True)
+            checked = " checked" if on else ""
+            state_class = "yes" if on else "no"
+            cells += (
+                f'<td class="matrix-cell {state_class}" data-capability="{safe_key}">'
+                f'<input type="checkbox" class="model-capability-toggle" '
+                f'data-profile-id="{profile_id_attr}" data-model="{model_attr}" '
+                f'data-capability="{safe_key}" aria-label="{model_attr} {safe_key}"{checked}>'
+                "</td>"
+            )
+        body_rows += f"<tr>{cells}</tr>"
+
+    legend = "".join(
+        f'<span class="matrix-legend-kind">{html.escape(kind)}：'
+        + "、".join(html.escape(label) for _key, label in items)
+        + "</span>"
+        for kind, items in sorted(kind_groups.items())
+    )
+
+    warn_html = ""
+    if warnings:
+        items = "".join(f"<li>{html.escape(w)}</li>" for w in warnings)
+        warn_html = f'<div class="matrix-warnings"><strong>一致性检查：</strong><ul>{items}</ul></div>'
+
+    return f"""
+    <div class="matrix-wrapper">
+        <div class="matrix-legend">{legend}</div>
+        <div class="matrix-table-wrap">
+            <table class="matrix-table">
+                <thead><tr>{header_cells}</tr></thead>
+                <tbody>{body_rows}</tbody>
+            </table>
+        </div>
+        {warn_html}
+    </div>"""
+
+
 def _render_tab(tab: ConfigTab, config: dict[str, Any]) -> str:
     """Render a single configuration tab."""
     tab_id = html.escape(tab.id)
     icon = tab.icon
     label = html.escape(tab.label)
     desc = html.escape(tab.description)
+
+    if tab.id == "model_matrix":
+        extra = _render_model_capability_matrix(config)
+    else:
+        extra = ""
 
     fields_html = ""
     for field in tab.fields:
@@ -339,6 +461,7 @@ def _render_tab(tab: ConfigTab, config: dict[str, Any]) -> str:
         </div>
         <div class="tab-content">
             {fields_html}
+            {extra}
         </div>
     </div>"""
 
@@ -974,6 +1097,44 @@ def render_web_config_ui(
 
         document.getElementById('refresh-status').addEventListener('click', loadStatusCards);
         loadStatusCards();
+
+        async function updateModelCapability(toggle) {{
+            const requestedValue = toggle.checked;
+            toggle.disabled = true;
+            try {{
+                const response = await fetch('/api/config/model-capability', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    credentials: 'same-origin',
+                    body: JSON.stringify({{
+                        profile_id: toggle.dataset.profileId,
+                        model: toggle.dataset.model,
+                        capability: toggle.dataset.capability,
+                        value: requestedValue,
+                        revision: configRevision,
+                    }}),
+                }});
+                const payload = await response.json().catch(() => ({{}}));
+                if (!response.ok) {{
+                    throw new Error(payload.error?.message || ('HTTP ' + response.status));
+                }}
+                configRevision = payload.revision || configRevision;
+                const cell = toggle.closest('.matrix-cell');
+                if (cell) {{
+                    cell.classList.toggle('yes', requestedValue);
+                    cell.classList.toggle('no', !requestedValue);
+                }}
+            }} catch (error) {{
+                toggle.checked = !requestedValue;
+                alert('模型能力保存失败: ' + error.message);
+            }} finally {{
+                toggle.disabled = false;
+            }}
+        }}
+
+        document.querySelectorAll('.model-capability-toggle').forEach(toggle => {{
+            toggle.addEventListener('change', () => updateModelCapability(toggle));
+        }});
 
         // Tab switching
         document.querySelectorAll('.tab-btn').forEach(btn => {{

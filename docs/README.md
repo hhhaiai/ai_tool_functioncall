@@ -65,10 +65,10 @@
 | 项目 | 当前值 |
 |---|---:|
 | 公开 API 路径 | 24 |
-| 唯一内置工具 | 67 |
-| 含别名工具 registry key | 178 |
-| Config Center 标签页 | 9 |
-| Config Center 字段 | 89 |
+| 唯一内置工具 | 70 |
+| 含别名工具 registry key | 199 |
+| Config Center 标签页 | 10 |
+| Config Center 字段 | 94 |
 
 ### 当前发布验证
 
@@ -84,7 +84,7 @@
 | Web2API | 3 条公开 POST 路径 → `gateway_web2api.py` | 有 SSRF、DNS、redirect、类型、大小和 timeout 边界 |
 | 多上游 | `gateway_upstream_pool.py` + `gateway_proxy.py` | 非流式可跨 profile；SSE 不跨 profile |
 | Intelligence | 请求发送上游前的分析和 prompt enhancement | 响应后自动评分/二次反思未接主链 |
-| Config/Admin | Basic Auth → schema-bound revision update → runtime reset | 9 Tab / 89 字段；浏览器状态回归必须真实执行 |
+| Config/Admin | Basic Auth → schema-bound revision update → runtime reset | 10 Tab / 94 字段；per-model 能力使用独立 CAS endpoint；浏览器状态回归必须真实执行 |
 | 持久化、限流、准入、沙箱 | SQLite backend / token bucket / lease / worker boundary | 已有多进程、隔离、清理和失败路径测试 |
 
 ## 文档维护规则

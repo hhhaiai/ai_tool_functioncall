@@ -80,8 +80,13 @@ class TestGetConfigTabs:
 
     def test_tabs_have_fields(self):
         tabs = _get_config_tabs()
+        # Every tab must declare a fields list; the model_matrix tab is a
+        # read-only inspection view and is allowed to have zero form fields.
         for tab in tabs:
-            assert len(tab.fields) > 0
+            assert hasattr(tab, "fields")
+            if tab.id == "model_matrix":
+                continue
+            assert len(tab.fields) > 0, f"tab {tab.id!r} has no fields"
 
 
 class TestNestedValue:
@@ -319,6 +324,9 @@ class TestGetConfigSchema:
             assert "id" in tab
             assert "label" in tab
             assert "fields" in tab
+            # model_matrix is a read-only inspection tab with no form fields.
+            if tab["id"] == "model_matrix":
+                continue
             assert len(tab["fields"]) > 0
 
     def test_schema_fields_have_type(self):
@@ -327,6 +335,89 @@ class TestGetConfigSchema:
             for field in tab["fields"]:
                 assert "name" in field
                 assert "type" in field
+
+
+class TestModelCapabilityMatrix:
+    def test_matrix_tab_present(self):
+        tabs = _get_config_tabs()
+        ids = [t.id for t in tabs]
+        assert "model_matrix" in ids
+
+    def test_matrix_renders_models_and_capabilities(self):
+        from src.gateway_web_config import _render_model_capability_matrix
+
+        config = {
+            "upstream": {
+                "id": "p1",
+                "name": "primary",
+                "base_url": "https://api.example.com",
+                "model": "vision-pro",
+                "tools_enabled": "adapter",
+                "models": [
+                    {"name": "text-only", "capabilities": {}},
+                    {"name": "vision-pro", "capabilities": {"supports_image_recognition": True, "supports_tools": True}},
+                    {"name": "music-pro", "capabilities": {"supports_music_recognition": True}},
+                ],
+            },
+        }
+        html = _render_model_capability_matrix(config)
+        assert "vision-pro" in html
+        assert "music-pro" in html
+        assert "text-only" in html
+        assert "data:image/png;base64," not in html  # no image data in matrix
+        # capability columns present
+        assert "supports_image_recognition" in html
+        assert "supports_music_recognition" in html
+        assert "model-capability-toggle" in html
+        assert 'data-profile-id="p1"' in html
+        assert 'data-model="vision-pro"' in html
+
+    def test_matrix_empty_when_no_models(self):
+        from src.gateway_web_config import _render_model_capability_matrix
+
+        # No upstream profile at all -> the matrix shows the empty state.
+        html = _render_model_capability_matrix({})
+        assert "matrix-empty" in html
+
+    def test_matrix_warns_on_undeclared_capabilities(self):
+        from src.gateway_web_config import _render_model_capability_matrix
+
+        config = {
+            "upstream": {
+                "id": "p1",
+                "name": "primary",
+                "base_url": "https://api.example.com",
+                "tools_enabled": "disabled",
+                "models": [
+                    {"name": "bare-model", "capabilities": {"supports_tools": True}},
+                ],
+            },
+        }
+        html = _render_model_capability_matrix(config)
+        assert "一致性检查" in html
+        assert "tools_enabled=disabled" in html
+
+    def test_config_center_wires_matrix_to_revision_bound_update_endpoint(self):
+        page = render_web_config_ui(
+            {
+                "upstream": {
+                    "id": "p1",
+                    "name": "primary",
+                    "base_url": "https://api.example.com",
+                    "model": "vision-pro",
+                    "models": [
+                        {
+                            "name": "vision-pro",
+                            "capabilities": {"supports_image_recognition": True},
+                        }
+                    ],
+                }
+            },
+            revision="revision-1",
+        )
+        assert "/api/config/model-capability" in page
+        assert "configRevision" in page
+        assert "model-capability-toggle" in page
 
 
 @pytest.mark.integration
