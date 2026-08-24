@@ -110,6 +110,11 @@ class NativeProxyClient:
         profile: Json | None = None,
         _pool: Any | None = None,
         _allow_failover: bool = True,
+        _model_router: Any | None = None,
+        _model_route: Any | None = None,
+        _model_required_capabilities: tuple[str, ...] = (),
+        _model_strategy: str = "failover",
+        _model_adapter_fallback: bool = False,
     ) -> None:
         from .gateway_config import _upstream_config
 
@@ -133,6 +138,11 @@ class NativeProxyClient:
         self.profile_id = str(cfg.get("id") or cfg.get("name") or "active")
         self._pool = pool
         self._allow_failover = bool(_allow_failover and pool is not None and not explicit_transport)
+        self._model_router = _model_router
+        self._model_route = _model_route
+        self._model_required_capabilities = tuple(_model_required_capabilities)
+        self._model_strategy = str(_model_strategy or "failover")
+        self._model_adapter_fallback = bool(_model_adapter_fallback)
         self.paths = dict(cfg.get("paths")) if isinstance(cfg.get("paths"), dict) else {}
         self.timeout = max(0.1, float(cfg.get("timeout_seconds", 60.0) or 60.0))
         self.retry_max_attempts = max(1, int(cfg.get("retry_max_attempts", 3) or 3))
@@ -150,7 +160,11 @@ class NativeProxyClient:
         self.supports_streaming = bool(capabilities.get("supports_streaming", True))
         self.max_input_tokens = max(0, int(cfg.get("max_input_tokens", 0) or 0))
         env_protocol = os.environ.get("GATEWAY_UPSTREAM_PROTOCOL") or os.environ.get("UPSTREAM_PROTOCOL")
-        self.protocol = str(env_protocol or cfg.get("protocol") or "openai_chat")
+        self.protocol = str(
+            (cfg.get("protocol") if _model_route is not None else env_protocol)
+            or cfg.get("protocol")
+            or "openai_chat"
+        )
         self._opener = self._get_opener()
 
     def _headers(self) -> dict[str, str]:
@@ -442,11 +456,20 @@ class NativeProxyClient:
         pool = getattr(self, "_pool", None)
         profile_id = str(getattr(self, "profile_id", "active") or "active")
         pool_started = pool.request_start(profile_id) if pool is not None else started
+        model_router = getattr(self, "_model_router", None)
+        model_route = getattr(self, "_model_route", None)
+        model_started = (
+            model_router.request_start(model_route)
+            if model_router is not None and model_route is not None
+            else started
+        )
         try:
             result = self._do_request_impl(method, path, body)
         except Exception as exc:
             if pool is not None:
                 pool.request_failure(profile_id, exc)
+            if model_router is not None and model_route is not None:
+                model_router.request_failure(model_route, exc)
             observe_upstream(
                 method=method,
                 path=path,
@@ -460,8 +483,12 @@ class NativeProxyClient:
         finally:
             if pool is not None:
                 pool.request_end(profile_id)
+            if model_router is not None and model_route is not None:
+                model_router.request_end(model_route)
         if pool is not None:
             pool.request_success(profile_id, pool_started)
+        if model_router is not None and model_route is not None:
+            model_router.request_success(model_route, model_started)
         observe_upstream(
             method=method,
             path=path,
@@ -492,6 +519,8 @@ class NativeProxyClient:
         """Yield bounded upstream SSE events and close promptly on cancellation."""
         stream_body = dict(body)
         stream_body["stream"] = True
+        if self.model and "model" in stream_body:
+            stream_body["model"] = self.model
         data = json.dumps(stream_body, ensure_ascii=False).encode("utf-8")
         headers = self._headers()
         headers["Accept"] = "text/event-stream"
@@ -643,6 +672,13 @@ class NativeProxyClient:
         pool = getattr(self, "_pool", None)
         profile_id = str(getattr(self, "profile_id", "active") or "active")
         pool_started = pool.request_start(profile_id) if pool is not None else started
+        model_router = getattr(self, "_model_router", None)
+        model_route = getattr(self, "_model_route", None)
+        model_started = (
+            model_router.request_start(model_route)
+            if model_router is not None and model_route is not None
+            else started
+        )
         first_event_seconds: float | None = None
         event_count = 0
         success = False
@@ -661,12 +697,18 @@ class NativeProxyClient:
             failure_type = exc.__class__.__name__
             if pool is not None:
                 pool.request_failure(profile_id, exc)
+            if model_router is not None and model_route is not None:
+                model_router.request_failure(model_route, exc)
             raise
         finally:
             if pool is not None:
                 if success:
                     pool.request_success(profile_id, pool_started)
                 pool.request_end(profile_id)
+            if model_router is not None and model_route is not None:
+                if success:
+                    model_router.request_success(model_route, model_started)
+                model_router.request_end(model_route)
             observe_upstream(
                 method="POST",
                 path=path,
@@ -686,6 +728,38 @@ class NativeProxyClient:
         return isinstance(exc, UpstreamHTTPError) and exc.upstream_status in _RETRY_STATUSES
 
     def _failover_clients(self) -> Iterator["NativeProxyClient"]:
+        model_router = getattr(self, "_model_router", None)
+        model_route = getattr(self, "_model_route", None)
+        required = tuple(getattr(self, "_model_required_capabilities", ()))
+        if model_router is not None and model_route is not None and required:
+            excluded = {model_route.key}
+            while True:
+                if self._model_adapter_fallback:
+                    route = model_router.select_adapter_for_capabilities(
+                        required,
+                        exclude=excluded,
+                        strategy=self._model_strategy,
+                    )
+                else:
+                    route = model_router.select_for_capabilities(
+                        required,
+                        exclude=excluded,
+                        strategy=self._model_strategy,
+                    )
+                if route is None:
+                    return
+                excluded.add(route.key)
+                yield NativeProxyClient(
+                    profile=route.profile,
+                    model=route.model,
+                    _allow_failover=False,
+                    _model_router=model_router,
+                    _model_route=route,
+                    _model_required_capabilities=required,
+                    _model_strategy=self._model_strategy,
+                    _model_adapter_fallback=self._model_adapter_fallback,
+                )
+            return
         if not self._allow_failover or self._pool is None:
             return
         for profile in self._pool.failover_profiles(self.profile_id):
@@ -735,6 +809,9 @@ class NativeProxyClient:
         from .gateway_protocol import _convert_request_to_upstream, _convert_response_to_downstream
         from .gateway_headroom import headroom_compress
         upstream_path, upstream_body = _convert_request_to_upstream(path, body, self.protocol)
+        if self.model and "model" in upstream_body:
+            upstream_body = dict(upstream_body)
+            upstream_body["model"] = self.model
         if _force_upstream_stream_aggregate():
             upstream_body = dict(upstream_body)
             upstream_body["stream"] = True

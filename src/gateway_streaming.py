@@ -329,7 +329,6 @@ def run_streaming_orchestration(
         _maybe_compact_request_for_upstream,
         _remember_conversation_turn,
     )
-    from .gateway_proxy import NativeProxyClient
     from .gateway_protocol import _convert_request_to_upstream, _convert_response_to_downstream
     from .gateway_agent_planner import (
         apply_synthesis_refusal_fallback as _agent_apply_synthesis_refusal_fallback,
@@ -351,6 +350,8 @@ def run_streaming_orchestration(
         _extract_text_tool_calls,
         _extract_tool_calls,
         _request_scope_body,
+        _REQUEST_UPSTREAM_CONFIG,
+        _runtime_upstream_config_for_client,
         _request_workspace_root,
         _weak_upstream_text_tools_active,
         _workspace_scope,
@@ -361,27 +362,35 @@ def run_streaming_orchestration(
     try:
         gateway_cfg = _gateway_config()
         mode = str(os.environ.get("GATEWAY_TOOL_MODE") or gateway_cfg.get("tool_mode") or "orchestrate").lower()
-        upstream = NativeProxyClient()
+        from .gateway_model_router import client_for_request
+
+        upstream = client_for_request(path, body)
         upstream_protocol = str(getattr(upstream, "protocol", "") or _upstream_protocol())
+        config_token = _REQUEST_UPSTREAM_CONFIG.set(
+            _runtime_upstream_config_for_client(upstream)
+        )
 
-        if mode in {"passthrough", "native_passthrough", "proxy"}:
-            _stream_upstream_passthrough(handler, path, body)
-            return
+        try:
+            if mode in {"passthrough", "native_passthrough", "proxy"}:
+                _stream_upstream_passthrough(handler, path, body, client=upstream)
+                return
 
-        scope_body = _request_scope_body(body, client_id)
-        with _workspace_scope(_request_workspace_root(scope_body), scope_body):
-            _run_streaming_orchestration_scoped(
-                handler,
-                path,
-                body,
-                mode=mode,
-                upstream_protocol=upstream_protocol,
-                gateway_cfg=gateway_cfg,
-                max_rounds=_configured_max_tool_rounds(gateway_cfg),
-                upstream=upstream,
-                context_cfg=_context_config(),
-                client_id=client_id,
-            )
+            scope_body = _request_scope_body(body, client_id)
+            with _workspace_scope(_request_workspace_root(scope_body), scope_body):
+                _run_streaming_orchestration_scoped(
+                    handler,
+                    path,
+                    body,
+                    mode=mode,
+                    upstream_protocol=upstream_protocol,
+                    gateway_cfg=gateway_cfg,
+                    max_rounds=_configured_max_tool_rounds(gateway_cfg),
+                    upstream=upstream,
+                    context_cfg=_context_config(),
+                    client_id=client_id,
+                )
+        finally:
+            _REQUEST_UPSTREAM_CONFIG.reset(config_token)
     except Exception as exc:
         try:
             _write_sse(handler, {"error": str(exc)}, event="error")
@@ -644,15 +653,17 @@ def _run_streaming_orchestration_scoped(
 
 def _tools_enabled_for_upstream() -> str:
     """Check if tools should be enabled for the upstream API."""
-    from .gateway_config import _upstream_config
-    cfg = _upstream_config()
+    from .gateway_tool_runtime import _request_upstream_config
+
+    cfg = _request_upstream_config()
     return str(cfg.get("tools_enabled", "adapter") or "adapter").strip().lower()
 
 
 def _upstream_native_tools_capable() -> bool:
     """Return whether the active upstream profile is configured as native-tool capable."""
-    from .gateway_config import _upstream_config
-    cfg = _upstream_config()
+    from .gateway_tool_runtime import _request_upstream_config
+
+    cfg = _request_upstream_config()
     capabilities = cfg.get("capabilities") if isinstance(cfg.get("capabilities"), dict) else {}
     return bool(capabilities.get("supports_tools", False)) and bool(capabilities.get("supports_function_calls", False))
 
@@ -839,12 +850,19 @@ def _merge_builtin_tools(path: str, body: dict) -> dict:
     return body
 
 
-def _stream_upstream_passthrough(handler: Any, path: str, body: dict) -> None:
+def _stream_upstream_passthrough(
+    handler: Any,
+    path: str,
+    body: dict,
+    *,
+    client: Any | None = None,
+) -> None:
     """Stream response directly from upstream through the bounded transport."""
     from .gateway_proxy import NativeProxyClient
     from .gateway_protocol import _convert_request_to_upstream
 
-    client = NativeProxyClient()
+    if client is None:
+        client = NativeProxyClient()
     upstream_path, upstream_body = _convert_request_to_upstream(path, body, client.protocol)
     stream_iterator = client.stream(upstream_path, upstream_body)
     try:

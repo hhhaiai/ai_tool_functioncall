@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import copy
+import contextvars
 import logging
 import os
 
@@ -89,6 +90,31 @@ from .gateway_request_admission import _acquire_request_slot, _request_slot_scop
 from .gateway_streaming import _merge_builtin_tools
 
 Json = dict[str, Any]
+
+_REQUEST_UPSTREAM_CONFIG: contextvars.ContextVar[Json | None] = contextvars.ContextVar(
+    "gateway_request_upstream_config",
+    default=None,
+)
+
+
+def _request_upstream_config() -> Json:
+    """Return request-selected, credential-free upstream behavior settings."""
+    selected = _REQUEST_UPSTREAM_CONFIG.get()
+    return selected if isinstance(selected, dict) else _upstream_config()
+
+
+def _runtime_upstream_config_for_client(client: Any) -> Json | None:
+    cfg = getattr(client, "_cfg", None)
+    if not isinstance(cfg, dict):
+        return None
+    capabilities = cfg.get("capabilities")
+    return {
+        "model": str(getattr(client, "model", "") or cfg.get("model") or ""),
+        "protocol": str(getattr(client, "protocol", "") or cfg.get("protocol") or ""),
+        "tools_enabled": cfg.get("tools_enabled", "adapter"),
+        "max_input_tokens": cfg.get("max_input_tokens", 0),
+        "capabilities": dict(capabilities) if isinstance(capabilities, dict) else {},
+    }
 
 DEFAULT_MAX_TOOL_ROUNDS = 5
 
@@ -1605,7 +1631,7 @@ def _extract_tool_calls(path: str, response: Json) -> list[ToolCall]:
 
 def _text_tool_call_fallback_enabled() -> bool:
     gateway = _gateway_config()
-    upstream = _upstream_config()
+    upstream = _request_upstream_config()
     tools_enabled = str(upstream.get("tools_enabled", "adapter") or "adapter").strip().lower()
     if tools_enabled in {"off", "disabled", "false", "0", "none"}:
         return False
@@ -1730,7 +1756,7 @@ def _detect_intent_tool_calls(path: str, response: Json, body: Json) -> list[Too
     # Only enable for weak upstream models that can't generate tool calls.
     # Capabilities are stored under upstream.capabilities in the modern config;
     # keep the legacy top-level fallback for older local config files.
-    upstream_cfg = _upstream_config()
+    upstream_cfg = _request_upstream_config()
     capabilities = upstream_cfg.get("capabilities") if isinstance(upstream_cfg.get("capabilities"), dict) else {}
     native_capable = (
         bool(capabilities.get("supports_tools", upstream_cfg.get("supports_tools", False)))
@@ -3274,7 +3300,7 @@ def _weak_upstream_text_tools_active(gateway_mode: str) -> bool:
     """Return True when the gateway must compensate for non-native tool support."""
     if gateway_mode in {"passthrough", "native_passthrough", "proxy"}:
         return False
-    upstream = _upstream_config()
+    upstream = _request_upstream_config()
     tools_enabled = str(upstream.get("tools_enabled", "adapter") or "adapter").strip().lower()
     capabilities = upstream.get("capabilities") if isinstance(upstream.get("capabilities"), dict) else {}
     native_capable = bool(capabilities.get("supports_tools", False)) and bool(capabilities.get("supports_function_calls", False))
@@ -4521,8 +4547,16 @@ def run_tool_orchestration(path: str, body: Json, client: NativeProxyClient | No
     if len(tools_in_body) > 0:
         _logger.debug("First 3 tools: %s", [t.get('name', t.get('function', {}).get('name', 'unknown')) for t in tools_in_body[:3]])
 
-    with _workspace_scope(workspace_root, scope_body):
-        return _run_tool_orchestration_scoped(path, body, client, client_id)
+    if client is None:
+        from .gateway_model_router import client_for_request
+
+        client = client_for_request(path, body)
+    token = _REQUEST_UPSTREAM_CONFIG.set(_runtime_upstream_config_for_client(client))
+    try:
+        with _workspace_scope(workspace_root, scope_body):
+            return _run_tool_orchestration_scoped(path, body, client, client_id)
+    finally:
+        _REQUEST_UPSTREAM_CONFIG.reset(token)
 
 
 def _convert_response_to_path(target_path: str, response: Json) -> Json:
@@ -4616,7 +4650,12 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
     if direct_response is not None:
         _remember_conversation_turn(path, body, direct_response)
         return direct_response
-    upstream = client or NativeProxyClient()
+    if client is None:
+        from .gateway_model_router import client_for_request
+
+        upstream = client_for_request(path, memory_body)
+    else:
+        upstream = client
     from .gateway_config import _upstream_protocol
     upstream_protocol = str(getattr(upstream, "protocol", "") or _upstream_protocol())
 
@@ -4624,7 +4663,12 @@ def _run_tool_orchestration_scoped(path: str, body: Json, client: NativeProxyCli
     upstream_path, converted_body = _convert_request_to_upstream(path, memory_body, upstream_protocol)
 
     # Override model with configured upstream model
-    upstream_model = _config_env("UPSTREAM_MODEL", "") or str(getattr(upstream, "model", "") or _upstream_config().get("model", ""))
+    if getattr(upstream, "_model_route", None) is not None:
+        upstream_model = str(getattr(upstream, "model", "") or "")
+    else:
+        upstream_model = _config_env("UPSTREAM_MODEL", "") or str(
+            getattr(upstream, "model", "") or _request_upstream_config().get("model", "")
+        )
     if upstream_model and "model" in converted_body:
         converted_body["model"] = upstream_model
 

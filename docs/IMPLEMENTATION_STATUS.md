@@ -103,7 +103,7 @@ Config Center 的字段分布：
 | 工具归属分流 | Tool runtime → Gateway-owned executor 或 downstream native request | MCP/HTTP/网络/纯函数/记忆服务端执行；用户工具下发 | 服务端用户工具执行必须显式授权 | 已实现 |
 | 直接工具接口 | `/v1/tools/call`, `/v1/functions/call`, `/tools/call` | Gateway-owned 工具不依赖上游模型可直接执行 | 工具权限和输入 schema 仍生效 | 已实现 |
 | 内置工具 registry | `gateway_builtin_tools.py` | 70 canonical / 199 registry keys；权限、workspace 和 output limit | 部分工具依赖本机程序或显式开关 | 已实现 |
-| Per-model 能力路由 | `gateway_model_router.py` + `gateway_config.py` | 13 项可配置能力标志、稀疏 per-model 覆盖、共享状态、健康过滤与 failover/round_robin/random/first/least_connections | 当前新 Router 只由三个 recognition 工具消费；普通 tools/function/web-search 请求仍走既有 profile 级路径 | 部分接入，边界明确 |
+| Per-model 能力路由 | `gateway_model_router.py` + `gateway_config.py` + `gateway_proxy.py` | 13 项可配置能力标志、稀疏 per-model 覆盖、共享状态、健康过滤与 failover/round_robin/random/first/least_connections | recognition 严格选路；普通 tools/function/parallel/web-search/stream/json-schema/network/vision/audio/speech 请求在 request boundary 推导完整能力组合并优先选匹配 model；text-tool adapter 只替代 tool 协议能力，无可用匹配时保留既有 Gateway adapter/profile 路径 | 已接入请求主链；真实 Provider 仍需部署后验证 |
 | 识图 / 识音乐 / 识视频 | `gateway_builtin_tools.py` → `call_upstream_llm` → ModelRouter → upstream | 图片适配 Chat/Responses/Anthropic；音乐仅 OpenAI Chat base64/local MP3/WAV；视频无标准 adapter 时返回 `unsupported_media_transport`，不伪装成图片 | 需上游真实支持；URL/本地/base64 有归属、MIME、大小和私网边界 | 部分实现，fail-closed |
 | MCP | `gateway_mcp.py` | servers、tools/list、tools/call、public name 映射 | 外部 MCP 可用性取决于其进程/网络 | 已实现 |
 | HTTP Actions | `gateway_http_actions.py` | schema、启用状态、执行、Admin 管理 | 受 SSRF/网络和超时边界限制 | 已实现 |

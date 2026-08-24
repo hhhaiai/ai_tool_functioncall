@@ -51,7 +51,7 @@
 | 上游代理、连接复用、自动重试 | ✅ 已实现 | `src/gateway_proxy.py` |
 | 工具调用编排、多轮执行、文本 fallback | ✅ 已实现 | `src/gateway_tool_runtime.py` |
 | 内置 coding-agent 工具（70 个唯一工具；含别名 199 个注册项） | ✅ 已实现 | `src/gateway_builtin_tools.py` |
-| Per-model 能力矩阵与识别路由 | ⚠️ 13 个标志可配置；当前 ModelRouter 消费 image/music/video recognition 三项，其他标志仅用于矩阵或仍由既有 profile 级逻辑读取 | `src/gateway_model_router.py`, `src/gateway_config.py` |
+| Per-model 能力矩阵与请求路由 | ✅ 13 个标志可配置；recognition 严格选路，普通 tools/function/parallel/web-search/stream/json-schema/network/vision/audio/speech 请求优先按完整能力组合选 model；弱模型 text-tool adapter 只替代 tool 协议能力，无可用匹配时保留既有 Gateway adapter/profile 路径 | `src/gateway_model_router.py`, `src/gateway_proxy.py`, `src/gateway_config.py` |
 | MCP / HTTP Action 扩展 | ✅ 已实现 | `src/gateway_mcp.py`, `src/gateway_http_actions.py` |
 | 流式 SSE 编排 + 流式缓存 | ✅ 已实现 | `src/gateway_streaming.py` |
 | 上下文压缩、SQLite 记忆、fan-out | ✅ 已实现 | `src/gateway_context.py` |

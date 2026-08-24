@@ -6,13 +6,26 @@ import copy
 import random
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from .gateway_config import MODEL_CAPABILITY_KEYS, flatten_profile_models, model_capability_snapshot
 from .gateway_errors import ConfigError, UpstreamHTTPError, UpstreamTimeoutError
 
 Json = dict[str, Any]
 _RETRYABLE_STATUS_CODES = {429, 502, 503, 504}
+_MODEL_ROUTING_STRATEGIES = {
+    "failover",
+    "first",
+    "least_connections",
+    "random",
+    "round_robin",
+}
+_TEXT_TOOL_ADAPTER_CAPABILITIES = {
+    "supports_tools",
+    "supports_function_calls",
+    "supports_parallel_tool_calls",
+}
+_TEXT_TOOL_ADAPTER_MODES = {"adapter", "prompt", "text_only"}
 
 
 class NoModelCapabilityError(ConfigError):
@@ -158,6 +171,105 @@ class ModelRouter:
             f"no upstream model declares capability {capability!r}"
         )
 
+    def select_for_capabilities(
+        self,
+        capabilities: Iterable[str],
+        *,
+        exclude: set[str] | None = None,
+        strategy: str = "failover",
+    ) -> ModelRoute | None:
+        required = self._normalize_required_capabilities(capabilities)
+        route, _declared = self._select_capabilities_from_snapshot(
+            self._config_snapshot(), required, exclude or set(), strategy
+        )
+        return route
+
+    def select_or_raise_for_capabilities(
+        self,
+        capabilities: Iterable[str],
+        *,
+        exclude: set[str] | None = None,
+        strategy: str = "failover",
+    ) -> ModelRoute:
+        required = self._normalize_required_capabilities(capabilities)
+        route, declared = self._select_capabilities_from_snapshot(
+            self._config_snapshot(), required, exclude or set(), strategy
+        )
+        if route is not None:
+            return route
+        label = ", ".join(required)
+        if declared:
+            raise NoHealthyModelRouteError(
+                f"no healthy upstream route declares all capabilities: {label}"
+            )
+        raise NoModelCapabilityError(
+            f"no upstream model declares all capabilities: {label}"
+        )
+
+    def select_adapter_for_capabilities(
+        self,
+        capabilities: Iterable[str],
+        *,
+        exclude: set[str] | None = None,
+        strategy: str = "failover",
+    ) -> ModelRoute | None:
+        """Select a route whose profile can safely emulate tool capabilities.
+
+        Text-tool adaptation only substitutes the tool protocol flags. Other
+        requirements, such as streaming, vision or JSON Schema, must still be
+        declared by the selected model.
+        """
+        required = self._normalize_required_capabilities(capabilities)
+        route, _declared = self._select_adapter_from_snapshot(
+            self._config_snapshot(), required, exclude or set(), strategy
+        )
+        return route
+
+    def select_request_route(
+        self,
+        capabilities: Iterable[str],
+        *,
+        exclude: set[str] | None = None,
+        strategy: str | None = None,
+    ) -> tuple[ModelRoute, str, bool]:
+        """Select one request route from one config snapshot.
+
+        The configured concurrency strategy is used when ``strategy`` is not
+        explicitly supplied. Native capability matching is always preferred;
+        a text-tool adapter is considered only when no healthy native route
+        satisfies the complete capability set.
+        """
+        required = self._normalize_required_capabilities(capabilities)
+        config = self._config_snapshot()
+        resolved_strategy = self._resolve_request_strategy(config, strategy)
+        excluded = exclude or set()
+        route, native_declared = self._select_capabilities_from_snapshot(
+            config,
+            required,
+            excluded,
+            resolved_strategy,
+        )
+        if route is not None:
+            return route, resolved_strategy, False
+
+        adapter_route, adapter_declared = self._select_adapter_from_snapshot(
+            config,
+            required,
+            excluded,
+            resolved_strategy,
+        )
+        if adapter_route is not None:
+            return adapter_route, resolved_strategy, True
+
+        label = ", ".join(required)
+        if native_declared or adapter_declared:
+            raise NoHealthyModelRouteError(
+                f"no healthy upstream route can satisfy all capabilities: {label}"
+            )
+        raise NoModelCapabilityError(
+            f"no upstream model or text-tool adapter can satisfy all capabilities: {label}"
+        )
+
     def request_start(self, route: ModelRoute) -> float:
         started = time.monotonic()
         with self._lock:
@@ -210,10 +322,54 @@ class ModelRouter:
         if capability not in MODEL_CAPABILITY_KEYS:
             raise ConfigError(f"unknown capability: {capability!r}")
 
+    def _normalize_required_capabilities(
+        self, capabilities: Iterable[str]
+    ) -> tuple[str, ...]:
+        requested = {str(capability) for capability in capabilities}
+        if not requested:
+            raise ConfigError("at least one model capability is required")
+        for capability in requested:
+            self._validate_capability(capability)
+        return tuple(
+            capability
+            for capability in MODEL_CAPABILITY_KEYS
+            if capability in requested
+        )
+
+    @staticmethod
+    def _resolve_request_strategy(config: Json, strategy: str | None) -> str:
+        if strategy is None:
+            concurrency = (
+                config.get("concurrency")
+                if isinstance(config.get("concurrency"), dict)
+                else {}
+            )
+            strategy = str(
+                concurrency.get("load_balance_strategy") or "round_robin"
+            )
+        normalized = str(strategy).strip().lower()
+        if normalized not in _MODEL_ROUTING_STRATEGIES:
+            raise ConfigError(f"unknown model routing strategy: {strategy!r}")
+        return normalized
+
     def _select_from_snapshot(
         self,
         config: Json,
         capability: str,
+        exclude: set[str],
+        strategy: str,
+    ) -> tuple[ModelRoute | None, bool]:
+        return self._select_capabilities_from_snapshot(
+            config,
+            (capability,),
+            exclude,
+            strategy,
+        )
+
+    def _select_capabilities_from_snapshot(
+        self,
+        config: Json,
+        capabilities: tuple[str, ...],
         exclude: set[str],
         strategy: str,
     ) -> tuple[ModelRoute | None, bool]:
@@ -229,7 +385,7 @@ class ModelRouter:
                     continue
                 model = str(model_entry.get("name") or "").strip()
                 caps = dict(model_entry.get("capabilities") or {})
-                if not caps.get(capability):
+                if not all(caps.get(capability) for capability in capabilities):
                     continue
                 declared = True
                 row = {
@@ -246,7 +402,69 @@ class ModelRouter:
                     continue
                 candidates.append((row, profile, model_entry))
 
-        selected = self._pick(capability, candidates, strategy)
+        selection_key = "&".join(capabilities)
+        selected = self._pick(selection_key, candidates, strategy)
+        if selected is None:
+            return None, declared
+        row, profile, model_entry = selected
+        return ModelRoute(row, profile, model_entry), declared
+
+    def _select_adapter_from_snapshot(
+        self,
+        config: Json,
+        capabilities: tuple[str, ...],
+        exclude: set[str],
+        strategy: str,
+    ) -> tuple[ModelRoute | None, bool]:
+        from .gateway_config import _normalized_profiles
+
+        adaptable = set(capabilities) & _TEXT_TOOL_ADAPTER_CAPABILITIES
+        if not adaptable:
+            return None, False
+
+        native_required = tuple(
+            capability
+            for capability in capabilities
+            if capability not in _TEXT_TOOL_ADAPTER_CAPABILITIES
+        )
+        active_id = str(config.get("active_upstream_id") or "")
+        declared = False
+        candidates: list[tuple[Json, Json, Json]] = []
+        for profile in _normalized_profiles(config):
+            profile_id = str(profile.get("id") or "")
+            mode = str(profile.get("tools_enabled") or "adapter").strip().lower()
+            for model_entry in profile.get("models") or []:
+                if not isinstance(model_entry, dict):
+                    continue
+                model = str(model_entry.get("name") or "").strip()
+                caps = dict(model_entry.get("capabilities") or {})
+                native_tools = bool(caps.get("supports_tools")) and bool(
+                    caps.get("supports_function_calls")
+                )
+                adapter_enabled = mode in _TEXT_TOOL_ADAPTER_MODES or (
+                    mode == "auto" and not native_tools
+                )
+                if not adapter_enabled or not all(
+                    caps.get(capability) for capability in native_required
+                ):
+                    continue
+                declared = True
+                row = {
+                    "profile_id": profile_id,
+                    "profile_name": str(profile.get("name") or profile_id),
+                    "model": model,
+                    "capabilities": caps,
+                    "is_active_profile": profile_id == active_id,
+                }
+                key = f"{profile_id}/{model}"
+                if key in exclude:
+                    continue
+                if not self._route_is_eligible(profile, model_entry, key):
+                    continue
+                candidates.append((row, profile, model_entry))
+
+        selection_key = "adapter:" + "&".join(capabilities)
+        selected = self._pick(selection_key, candidates, strategy)
         if selected is None:
             return None, declared
         row, profile, model_entry = selected
@@ -324,3 +542,145 @@ def reset_model_router() -> None:
     global _model_router
     with _model_router_lock:
         _model_router = None
+
+
+def _iter_request_content_parts(path: str, body: Json) -> Iterable[Json]:
+    containers: list[Any] = []
+    if "/responses" in path:
+        raw_input = body.get("input")
+        for item in raw_input if isinstance(raw_input, list) else []:
+            if not isinstance(item, dict):
+                continue
+            containers.append([item])
+            containers.append(item.get("content"))
+    else:
+        for message in body.get("messages") or []:
+            if isinstance(message, dict):
+                containers.append(message.get("content"))
+
+    while containers:
+        value = containers.pop()
+        if not isinstance(value, list):
+            continue
+        for part in value:
+            if not isinstance(part, dict):
+                continue
+            yield part
+            if part.get("type") == "tool_result":
+                containers.append(part.get("content"))
+
+
+def required_capabilities_for_request(path: str, body: Json) -> tuple[str, ...]:
+    """Infer only transport/model capabilities required by this request.
+
+    The returned tuple contains no tenant, workspace, prompt or credential
+    data and is safe to pass to the process-wide router.
+    """
+    required: set[str] = set()
+    if body.get("stream") is True:
+        required.add("supports_streaming")
+    modalities = body.get("modalities")
+    if isinstance(modalities, list) and any(
+        str(modality).strip().lower() == "audio" for modality in modalities
+    ):
+        required.add("supports_speech")
+
+    tools = body.get("tools") if isinstance(body.get("tools"), list) else []
+    functions = body.get("functions") if isinstance(body.get("functions"), list) else []
+    if tools or functions or body.get("tool_choice") not in (None, "", "none"):
+        required.add("supports_tools")
+    if functions:
+        required.add("supports_function_calls")
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        tool_type = str(tool.get("type") or "").strip().lower()
+        if tool_type.startswith("web_search"):
+            required.update({"supports_web_search", "supports_network"})
+        elif tool_type == "function" or isinstance(tool.get("function"), dict):
+            required.add("supports_function_calls")
+        elif not tool_type and (tool.get("name") or tool.get("input_schema")):
+            # Anthropic Messages function tools have no explicit type.
+            required.add("supports_function_calls")
+    if body.get("web_search_options") is not None:
+        required.update(
+            {"supports_tools", "supports_web_search", "supports_network"}
+        )
+    if body.get("parallel_tool_calls") is True:
+        required.update(
+            {
+                "supports_tools",
+                "supports_function_calls",
+                "supports_parallel_tool_calls",
+            }
+        )
+
+    response_format = body.get("response_format")
+    responses_text = body.get("text")
+    output_config = body.get("output_config")
+    format_candidates = [
+        response_format,
+        responses_text.get("format") if isinstance(responses_text, dict) else None,
+        output_config.get("format") if isinstance(output_config, dict) else None,
+    ]
+    if any(
+        isinstance(candidate, dict)
+        and str(candidate.get("type") or "").strip().lower() == "json_schema"
+        for candidate in format_candidates
+    ):
+        required.add("supports_json_schema")
+
+    for part in _iter_request_content_parts(path, body):
+        part_type = str(part.get("type") or "").strip().lower()
+        if part_type in {"image", "image_url", "input_image"}:
+            required.add("supports_vision")
+        elif part_type in {"audio", "input_audio"}:
+            required.add("supports_audio_recognition")
+
+    return tuple(
+        capability
+        for capability in MODEL_CAPABILITY_KEYS
+        if capability in required
+    )
+
+
+def client_for_request(
+    path: str,
+    body: Json,
+    *,
+    strategy: str | None = None,
+) -> Any:
+    """Build a request-local client for the best matching model route.
+
+    A profile explicitly configured for text-tool adaptation may substitute
+    only tool-protocol capabilities. Native-only profiles and non-adaptable
+    requirements never bypass the complete capability check.
+    """
+    from .gateway_proxy import NativeProxyClient
+
+    required = required_capabilities_for_request(path, body)
+    if not required:
+        return NativeProxyClient()
+    router = get_model_router()
+    try:
+        route, resolved_strategy, adapter_fallback = router.select_request_route(
+            required,
+            strategy=strategy,
+        )
+    except (NoModelCapabilityError, NoHealthyModelRouteError):
+        # Ordinary conversation requests retain the legacy profile/adapter
+        # path when the capability matrix is incomplete or its matching routes
+        # are temporarily unavailable.  This is required for Gateway-owned and
+        # downstream-owned tools, which may complete without a capability-
+        # native upstream.  Recognition entry points remain strict.
+        return NativeProxyClient()
+    return NativeProxyClient(
+        profile=route.profile,
+        model=route.model,
+        _allow_failover=False,
+        _model_router=router,
+        _model_route=route,
+        _model_required_capabilities=required,
+        _model_strategy=resolved_strategy,
+        _model_adapter_fallback=adapter_fallback,
+    )
