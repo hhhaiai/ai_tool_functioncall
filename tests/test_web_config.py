@@ -395,7 +395,7 @@ class TestModelCapabilityMatrix:
         }
         html = _render_model_capability_matrix(config)
         assert "一致性检查" in html
-        assert "tools_enabled=disabled" in html
+        assert "tools_enabled=off" in html
 
     def test_config_center_wires_matrix_to_revision_bound_update_endpoint(self):
         page = render_web_config_ui(

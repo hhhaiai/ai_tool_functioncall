@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .gateway_concurrency import _concurrency_config
+from .gateway_config import canonical_tools_enabled
 from .gateway_errors import UpstreamHTTPError, UpstreamTimeoutError
 
 Json = dict[str, Any]
@@ -41,7 +42,7 @@ def _routing_signature(profile: Json) -> str:
     paths: Json = raw_paths if isinstance(raw_paths, dict) else {}
     payload = {
         "protocol": str(profile.get("protocol") or "openai_chat"),
-        "tools_enabled": str(profile.get("tools_enabled") or "adapter"),
+        "tools_enabled": canonical_tools_enabled(profile.get("tools_enabled")),
         "paths": {key: str(paths.get(key) or "") for key in sorted(paths)},
         "capabilities": {
             key: bool(capabilities.get(key))

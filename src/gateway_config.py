@@ -71,6 +71,31 @@ MODEL_CAPABILITY_KEYS: tuple[str, ...] = tuple(spec[0] for spec in MODEL_CAPABIL
 MODEL_CAPABILITY_LABELS: dict[str, str] = {spec[0]: spec[1] for spec in MODEL_CAPABILITY_SPEC}
 MODEL_CAPABILITY_KINDS: dict[str, str] = {spec[0]: spec[2] for spec in MODEL_CAPABILITY_SPEC}
 
+TOOLS_ENABLED_DISABLED_ALIASES: frozenset[str] = frozenset(
+    {"off", "disabled", "false", "0", "none"}
+)
+
+
+def canonical_tools_enabled(value: Any, *, default: str = "adapter") -> str:
+    """Return the canonical, case-insensitive upstream tools mode.
+
+    Historical config and environment inputs used five equivalent disabled
+    spellings.  Persist and expose one value (``off``) while accepting every
+    legacy alias at runtime and at Admin/config boundaries.
+    """
+    raw = default if value is None else str(value)
+    normalized = raw.strip().lower()
+    if not normalized:
+        normalized = str(default).strip().lower() or "adapter"
+    if normalized in TOOLS_ENABLED_DISABLED_ALIASES:
+        return "off"
+    return normalized
+
+
+def tools_enabled_is_disabled(value: Any) -> bool:
+    """Return whether an upstream tools mode disables all tool handling."""
+    return canonical_tools_enabled(value) == "off"
+
 
 def model_capability_defaults() -> dict[str, bool]:
     """Return the canonical default capability set (everything off by default)."""
@@ -327,7 +352,9 @@ def _default_config() -> Json:
             "api_key": os.environ.get("UPSTREAM_API_KEY", ""),
             "model": os.environ.get("UPSTREAM_MODEL", ""),
             "protocol": _env_upstream_protocol(),
-            "tools_enabled": os.environ.get("GATEWAY_TOOLS_ENABLED", "adapter"),
+            "tools_enabled": canonical_tools_enabled(
+                os.environ.get("GATEWAY_TOOLS_ENABLED", "adapter")
+            ),
             "native_tools_verified": False,
             "use_for_coding": True,
             "timeout_seconds": _env_float("UPSTREAM_TIMEOUT", 60.0),
@@ -928,6 +955,7 @@ def _normalize_upstream_profile(profile: Json, *, fallback_name: str = "default"
     _deep_update(merged, raw_profile)
     merged["name"] = str(merged.get("name") or fallback_name or "default")
     merged["id"] = _upstream_profile_id(merged)
+    merged["tools_enabled"] = canonical_tools_enabled(merged.get("tools_enabled"))
     merged.setdefault("paths", {})
     merged.setdefault("capabilities", {})
     merged["capabilities"] = _merge_model_capabilities(
@@ -1320,7 +1348,9 @@ def _profile_from_admin_form(form: dict[str, str], existing: Json | None = None)
         profile["api_key"] = profile.get("api_key", "")
     profile["model"] = form.get("model", "").strip() or profile.get("model", "")
     profile["protocol"] = form.get("protocol", "openai_chat").strip()
-    profile["tools_enabled"] = form.get("tools_enabled", form.get("tool_mode", "adapter")).strip()
+    profile["tools_enabled"] = canonical_tools_enabled(
+        form.get("tools_enabled", form.get("tool_mode", "adapter"))
+    )
     profile["timeout_seconds"] = _admin_form_float(
         form,
         ("upstream_timeout_seconds", "timeout_seconds", "timeout"),

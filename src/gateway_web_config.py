@@ -77,7 +77,7 @@ def _get_config_tabs() -> list[ConfigTab]:
                     options=[
                         {"value": "adapter", "label": "Gateway Adapter"},
                         {"value": "native", "label": "Native"},
-                        {"value": "disabled", "label": "Disabled"},
+                        {"value": "off", "label": "Disabled"},
                     ],
                 ),
                 ConfigField("upstream.timeout_seconds", "请求超时（秒）", "number", default=60.0, min_value=0.1, max_value=600.0),
@@ -341,7 +341,9 @@ def _render_model_capability_matrix(config: dict[str, Any]) -> str:
     from .gateway_config import (
         MODEL_CAPABILITY_SPEC,
         _normalized_profiles,
+        canonical_tools_enabled,
         flatten_profile_models,
+        tools_enabled_is_disabled,
     )
 
     rows = flatten_profile_models(config)
@@ -367,10 +369,12 @@ def _render_model_capability_matrix(config: dict[str, Any]) -> str:
         caps = row.get("capabilities") or {}
         declared = {k for k, v in caps.items() if v}
         profile = profile_settings.get(str(row.get("profile_id") or ""), {})
-        profile_tools = str(profile.get("tools_enabled") or "adapter")
-        if (declared & {"supports_tools", "supports_function_calls"}) and profile_tools == "disabled":
+        profile_tools = canonical_tools_enabled(profile.get("tools_enabled"))
+        if (
+            declared & {"supports_tools", "supports_function_calls"}
+        ) and tools_enabled_is_disabled(profile_tools):
             warnings.append(
-                f"{row['profile_id']}/{row['model']} 声明了 tool 能力，但所在 profile 的 tools_enabled=disabled。"
+                f"{row['profile_id']}/{row['model']} 声明了 tool 能力，但所在 profile 的 tools_enabled=off。"
             )
         if not declared:
             warnings.append(
@@ -506,11 +510,16 @@ def render_web_config_ui(
         config = dict(config)
     raw_upstream = config.get("upstream")
     if isinstance(raw_upstream, dict):
+        from .gateway_config import canonical_tools_enabled
+
         upstream = dict(raw_upstream)
         if not upstream.get("base_url") and upstream.get("url"):
             upstream["base_url"] = upstream.get("url")
         if upstream.get("timeout_seconds") is None and upstream.get("timeout") is not None:
             upstream["timeout_seconds"] = upstream.get("timeout")
+        upstream["tools_enabled"] = canonical_tools_enabled(
+            upstream.get("tools_enabled")
+        )
         config["upstream"] = upstream
 
     tabs = _get_config_tabs()

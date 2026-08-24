@@ -255,6 +255,8 @@ def _sel(cur, val):
 
 def _render_html(**kw):
     """Render the full HTML page."""
+    from .gateway_config import canonical_tools_enabled
+
     upstream = kw["upstream"]
     upstream_profiles = kw["upstream_profiles"]
     active_upstream_id = kw["active_upstream_id"]
@@ -284,6 +286,7 @@ def _render_html(**kw):
     B = _badge
     C = _checked
     S = _sel
+    upstream_tools_mode = canonical_tools_enabled(upstream.get("tools_enabled"))
     raw_cors_origins = gateway_cfg.get("cors_allowed_origins") or []
     cors_origins_value = raw_cors_origins if isinstance(raw_cors_origins, str) else ",".join(str(item) for item in raw_cors_origins)
 
@@ -454,7 +457,7 @@ def _render_html(**kw):
 <div class="k">最大输入</div><div class="v">{E(upstream.get("max_input_tokens",""))}</div>
 <div class="k">最大输出</div><div class="v">{E(upstream.get("max_output_tokens",""))}</div>
 <div class="k">并发</div><div class="v">{E(upstream.get("max_concurrency",""))}</div>
-<div class="k">Tools模式</div><div class="v">{E(upstream.get("tools_enabled",""))}</div>
+<div class="k">Tools模式</div><div class="v">{E(upstream_tools_mode)}</div>
 </div></div>
 <div class="card"><h2>能力声明</h2><div class="badge-wrap">{cap_badges}</div>
 <h3>API 路径</h3><div class="info-table">
@@ -492,7 +495,7 @@ def _render_html(**kw):
 <label class="field"><span>最大输入</span><input name="max_input_tokens" type="number" value="{E(upstream.get("max_input_tokens",1048576))}"></label>
 <label class="field"><span>最大输出</span><input name="max_output_tokens" type="number" value="{E(upstream.get("max_output_tokens",131072))}"></label>
 <label class="field"><span>并发</span><input name="max_concurrency" type="number" value="{E(upstream.get("max_concurrency",32))}"></label>
-<label class="field"><span>Tools</span><select name="tools_enabled"><option value="adapter"{S(upstream.get("tools_enabled","adapter"),"adapter")}>Adapter (default)</option><option value="auto"{S(upstream.get("tools_enabled"),"auto")}>Auto (explicit)</option><option value="native"{S(upstream.get("tools_enabled"),"native")}>Native</option><option value="off"{S(upstream.get("tools_enabled"),"off")}>Off</option></select></label>
+<label class="field"><span>Tools</span><select name="tools_enabled"><option value="adapter"{S(upstream_tools_mode,"adapter")}>Adapter (default)</option><option value="auto"{S(upstream_tools_mode,"auto")}>Auto (explicit)</option><option value="native"{S(upstream_tools_mode,"native")}>Native</option><option value="off"{S(upstream_tools_mode,"off")}>Off</option></select></label>
 <div class="field full"><h3>能力</h3><div class="check-grid">{cap_inputs}</div></div>
 <div class="field full"><h3>多模型列表（JSON）</h3><textarea name="models_json" rows="6" placeholder='[{{"name":"gpt-4o","capabilities":{{"supports_image_recognition":true}}}},{{"name":"mimo-v2.5-pro"}}]' style="font-family:monospace;font-size:12px">{E(models_json_value)}</textarea><p class="muted small">每项至少含 <code>name</code>；可选 <code>capabilities</code>（per-model 能力标志，覆盖 profile 级默认）、<code>description</code>、<code>max_input_tokens</code>。留空则退回上方单 model 字段。</p></div>
 <div class="field full"><button type="submit">保存配置</button></div>

@@ -8,7 +8,12 @@ import threading
 import time
 from typing import Any, Callable, Iterable
 
-from .gateway_config import MODEL_CAPABILITY_KEYS, flatten_profile_models, model_capability_snapshot
+from .gateway_config import (
+    MODEL_CAPABILITY_KEYS,
+    canonical_tools_enabled,
+    flatten_profile_models,
+    model_capability_snapshot,
+)
 from .gateway_errors import ConfigError, UpstreamHTTPError, UpstreamTimeoutError
 
 Json = dict[str, Any]
@@ -432,7 +437,7 @@ class ModelRouter:
         candidates: list[tuple[Json, Json, Json]] = []
         for profile in _normalized_profiles(config):
             profile_id = str(profile.get("id") or "")
-            mode = str(profile.get("tools_enabled") or "adapter").strip().lower()
+            mode = canonical_tools_enabled(profile.get("tools_enabled"))
             for model_entry in profile.get("models") or []:
                 if not isinstance(model_entry, dict):
                     continue

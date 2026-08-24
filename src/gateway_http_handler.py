@@ -20,7 +20,19 @@ from typing import Any
 
 Json = dict[str, Any]
 
-from .gateway_config import SUPPORTED_PATHS, MODEL_LIST_PATHS, TOKEN_COUNT_PATHS, DIRECT_TOOL_CALL_PATHS, WEB2API_PATHS, _gateway_config, _normalize_request_path, _supported_public_paths, _upstream_config
+from .gateway_config import (
+    DIRECT_TOOL_CALL_PATHS,
+    MODEL_LIST_PATHS,
+    SUPPORTED_PATHS,
+    TOKEN_COUNT_PATHS,
+    WEB2API_PATHS,
+    _gateway_config,
+    _normalize_request_path,
+    _supported_public_paths,
+    _upstream_config,
+    canonical_tools_enabled,
+    tools_enabled_is_disabled,
+)
 from .gateway_admin_security import (
     _request_origin,
     _url_origin,
@@ -388,7 +400,9 @@ def _agent_runtime_requirement_audit(
     ownership_model = capabilities.get("ownership_model") if isinstance(capabilities.get("ownership_model"), dict) else {}
     runtime_config = runtime_config if isinstance(runtime_config, dict) else {}
     gateway_mode = str(runtime_config.get("gateway_tool_mode") or "").strip().lower()
-    upstream_tools_enabled = str(runtime_config.get("upstream_tools_enabled") or "").strip().lower()
+    upstream_tools_enabled = canonical_tools_enabled(
+        runtime_config.get("upstream_tools_enabled")
+    )
     upstream_supports_tools = bool(runtime_config.get("upstream_supports_tools", False))
     upstream_supports_function_calls = bool(runtime_config.get("upstream_supports_function_calls", False))
     gateway_execute_user_side_tools = bool(runtime_config.get("gateway_execute_user_side_tools", False))
@@ -398,7 +412,8 @@ def _agent_runtime_requirement_audit(
     upstream_native_tool_authority = (
         upstream_supports_tools
         and upstream_supports_function_calls
-        and upstream_tools_enabled not in {"adapter", "text_only", "prompt", "off", "false", "disabled", "none"}
+        and not tools_enabled_is_disabled(upstream_tools_enabled)
+        and upstream_tools_enabled not in {"adapter", "text_only", "prompt"}
     )
     agent_planner_mode_active = gateway_mode not in {"passthrough", "native_passthrough", "proxy"}
 

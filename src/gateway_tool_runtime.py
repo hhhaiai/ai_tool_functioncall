@@ -38,7 +38,9 @@ from .gateway_config import (
     _configured_max_tool_rounds,
     _gateway_config,
     _upstream_config,
+    canonical_tools_enabled,
     load_config,
+    tools_enabled_is_disabled,
 )
 from .gateway_context import (
     _approx_token_count,
@@ -111,7 +113,7 @@ def _runtime_upstream_config_for_client(client: Any) -> Json | None:
     return {
         "model": str(getattr(client, "model", "") or cfg.get("model") or ""),
         "protocol": str(getattr(client, "protocol", "") or cfg.get("protocol") or ""),
-        "tools_enabled": cfg.get("tools_enabled", "adapter"),
+        "tools_enabled": canonical_tools_enabled(cfg.get("tools_enabled")),
         "max_input_tokens": cfg.get("max_input_tokens", 0),
         "capabilities": dict(capabilities) if isinstance(capabilities, dict) else {},
     }
@@ -1632,8 +1634,8 @@ def _extract_tool_calls(path: str, response: Json) -> list[ToolCall]:
 def _text_tool_call_fallback_enabled() -> bool:
     gateway = _gateway_config()
     upstream = _request_upstream_config()
-    tools_enabled = str(upstream.get("tools_enabled", "adapter") or "adapter").strip().lower()
-    if tools_enabled in {"off", "disabled", "false", "0", "none"}:
+    tools_enabled = canonical_tools_enabled(upstream.get("tools_enabled"))
+    if tools_enabled_is_disabled(tools_enabled):
         return False
     capabilities = upstream.get("capabilities") if isinstance(upstream.get("capabilities"), dict) else {}
     native_capable = bool(capabilities.get("supports_tools", False)) and bool(capabilities.get("supports_function_calls", False))
@@ -1762,10 +1764,10 @@ def _detect_intent_tool_calls(path: str, response: Json, body: Json) -> list[Too
         bool(capabilities.get("supports_tools", upstream_cfg.get("supports_tools", False)))
         and bool(capabilities.get("supports_function_calls", upstream_cfg.get("supports_function_calls", False)))
     )
-    tools_enabled = str(upstream_cfg.get("tools_enabled", "adapter") or "adapter").strip().lower()
-    if tools_enabled in {"off", "disabled", "false", "0", "none"}:
+    tools_enabled = canonical_tools_enabled(upstream_cfg.get("tools_enabled"))
+    if tools_enabled_is_disabled(tools_enabled):
         return []
-    if native_capable and tools_enabled not in {"off", "disabled", "false", "0", "none", "text_only", "adapter"}:
+    if native_capable and tools_enabled not in {"text_only", "adapter", "prompt"}:
         return []  # Native tools supported, no need for intent detection
 
     text = _response_text(path, response)
@@ -3301,7 +3303,7 @@ def _weak_upstream_text_tools_active(gateway_mode: str) -> bool:
     if gateway_mode in {"passthrough", "native_passthrough", "proxy"}:
         return False
     upstream = _request_upstream_config()
-    tools_enabled = str(upstream.get("tools_enabled", "adapter") or "adapter").strip().lower()
+    tools_enabled = canonical_tools_enabled(upstream.get("tools_enabled"))
     capabilities = upstream.get("capabilities") if isinstance(upstream.get("capabilities"), dict) else {}
     native_capable = bool(capabilities.get("supports_tools", False)) and bool(capabilities.get("supports_function_calls", False))
     if tools_enabled in {"text_only", "adapter", "prompt"}:

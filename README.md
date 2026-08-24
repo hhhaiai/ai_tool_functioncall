@@ -414,7 +414,7 @@ git grep -nE 'https?://([0-9]{1,3}\.){3}[0-9]{1,3}' -- ':!docs/archive/**' \
 - 写文件、Shell、GUI/local-agent 等用户侧工具默认下发给客户端；只有本地代理式部署显式开启 `gateway.execute_user_side_tools_in_gateway=true` 时，才会在 Gateway 服务机执行，且写入/Shell 仍需单独授权。
 - `admin.password` 模板字段会在加载/保存时转换为 `password_hash`，避免明文密码被回写。
 - `gateway.client_snippet_api_key` 会自动同步成可认证的 downstream key，避免复制出的客户端配置不可用。
-- 默认按上游**不支持** tool calls/function calls 处理：`upstream.tools_enabled=adapter` 且 `supports_tools=false` / `supports_function_calls=false`。`auto` / `native` 只保留给显式兼容实验，不作为默认路径；Claude Code/Codex 稳定接入默认都走 Gateway Agent Planner adapter。
+- 默认按上游**不支持** tool calls/function calls 处理：`upstream.tools_enabled=adapter` 且 `supports_tools=false` / `supports_function_calls=false`。`auto` / `native` 只保留给显式兼容实验，不作为默认路径；Claude Code/Codex 稳定接入默认都走 Gateway Agent Planner adapter。禁用时统一保存为 `tools_enabled=off`；兼容读取历史值 `disabled` / `false` / `0` / `none`。
 - `gateway.text_tool_adapter_compact_token_limit` 是弱上游文本工具适配前的压缩阈值上限（默认 48000）；实际阈值动态计算为 `max(8000, min(upstream.max_input_tokens * 0.45, 此值))`，设为 0 可关闭。
 - 已存在配置文件如果 JSON 损坏或根节点不是对象，会 fail closed 返回结构化 500；不会回退到默认 `admin/admin` 或无下游鉴权。
 - 请求/响应日志和 Admin 配置展示会递归遮盖常见敏感字段（token、secret、password、cookie、API key、key hash 等），避免运维面泄漏凭据。

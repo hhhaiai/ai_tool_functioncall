@@ -653,10 +653,11 @@ def _run_streaming_orchestration_scoped(
 
 def _tools_enabled_for_upstream() -> str:
     """Check if tools should be enabled for the upstream API."""
+    from .gateway_config import canonical_tools_enabled
     from .gateway_tool_runtime import _request_upstream_config
 
     cfg = _request_upstream_config()
-    return str(cfg.get("tools_enabled", "adapter") or "adapter").strip().lower()
+    return canonical_tools_enabled(cfg.get("tools_enabled"))
 
 
 def _upstream_native_tools_capable() -> bool:
@@ -794,7 +795,7 @@ def _merge_builtin_tools(path: str, body: dict) -> dict:
     if tools_enabled == "native_only" and not native_capable:
         from .gateway_errors import GatewayError
         raise GatewayError("upstream profile is configured as native_only but capabilities disable native tools/function calls")
-    if tools_enabled in {"off", "disabled", "false", "0", "none"}:
+    if tools_enabled == "off":
         body.pop("tools", None)
         body.pop("tool_choice", None)
         return body
