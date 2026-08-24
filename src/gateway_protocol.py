@@ -7,11 +7,16 @@ from __future__ import annotations
 
 import base64
 import copy
+import ipaddress
 import json
+import os
 import re
+import socket
 import urllib.parse
 import uuid
 from typing import Any
+
+from .gateway_errors import BadRequestError
 
 Json = dict[str, Any]
 _TOOL_RESULT_ERROR_PREFIX = "[gateway_tool_result_error]\n"
@@ -81,6 +86,349 @@ def _openai_text_from_content(content: Any) -> str:
 # ---------------------------------------------------------------------------
 
 _DATA_URL_RE = re.compile(r"^data:([^;]+);base64,(.+)$", re.DOTALL)
+_REQUEST_IMAGE_MIME_TYPES = frozenset(
+    {"image/png", "image/jpeg", "image/gif", "image/webp"}
+)
+_OPENAI_CHAT_AUDIO_FORMATS = frozenset({"mp3", "wav"})
+_REQUEST_MEDIA_TYPES = frozenset(
+    {
+        "audio",
+        "audio_url",
+        "image",
+        "image_url",
+        "input_audio",
+        "input_image",
+        "input_video",
+        "video",
+        "video_url",
+    }
+)
+_DEFAULT_MAX_MEDIA_INPUT_BYTES = 20 * 1024 * 1024
+
+
+def _request_media_error(message: str, *, failure_type: str = "invalid_media_input") -> None:
+    raise BadRequestError(message, detail={"failure_type": failure_type})
+
+
+def _max_request_media_input_bytes() -> int:
+    try:
+        value = int(
+            os.environ.get("GATEWAY_MAX_MEDIA_INPUT_BYTES")
+            or _DEFAULT_MAX_MEDIA_INPUT_BYTES
+        )
+    except (TypeError, ValueError):
+        value = _DEFAULT_MAX_MEDIA_INPUT_BYTES
+    return max(1, value)
+
+
+class _RequestMediaBudget:
+    """Request-local decoded-media budget with a pre-decode allocation guard."""
+
+    def __init__(self) -> None:
+        self.limit = _max_request_media_input_bytes()
+        self.used = 0
+
+    def add_base64(self, data: Any, *, label: str) -> None:
+        if not isinstance(data, str) or not data:
+            _request_media_error(f"{label} must be non-empty base64")
+        remaining = self.limit - self.used
+        # Strict base64 needs at most four encoded bytes per three decoded
+        # bytes.  Reject oversized inputs before allocating a decoded copy.
+        max_encoded_bytes = 4 * ((remaining + 2) // 3)
+        if len(data) > max_encoded_bytes:
+            _request_media_error(
+                f"request media inputs exceed max bytes ({self.limit})",
+                failure_type="media_input_too_large",
+            )
+        try:
+            decoded = base64.b64decode(data, validate=True)
+        except (ValueError, TypeError, base64.binascii.Error) as exc:
+            raise BadRequestError(
+                f"invalid {label} base64",
+                detail={"failure_type": "invalid_media_input"},
+            ) from exc
+        if len(decoded) > remaining:
+            _request_media_error(
+                f"request media inputs exceed max bytes ({self.used + len(decoded)} > {self.limit})",
+                failure_type="media_input_too_large",
+            )
+        self.used += len(decoded)
+
+
+def _validate_request_image_mime(media_type: Any) -> str:
+    if not isinstance(media_type, str):
+        _request_media_error("image media type must be a string")
+    normalized = media_type.strip().lower()
+    if normalized not in _REQUEST_IMAGE_MIME_TYPES:
+        _request_media_error(f"unsupported image media type: {normalized or '<empty>'}")
+    return normalized
+
+
+def _validate_public_media_url(url: Any) -> None:
+    if not isinstance(url, str) or not url or url != url.strip():
+        _request_media_error("media URL must be a non-empty absolute URL")
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        hostname = parsed.hostname
+        # Accessing .port also rejects malformed and out-of-range ports.
+        _ = parsed.port
+    except ValueError as exc:
+        raise BadRequestError(
+            "invalid media URL",
+            detail={"failure_type": "invalid_media_input"},
+        ) from exc
+    if parsed.scheme.lower() not in {"http", "https"} or not hostname:
+        _request_media_error("media URL must use http or https and include a hostname")
+    if parsed.username is not None or parsed.password is not None:
+        _request_media_error("media URL must not contain credentials")
+
+    normalized_host = hostname.rstrip(".").lower()
+    if not normalized_host:
+        _request_media_error("media URL must include a hostname")
+    try:
+        normalized_host = normalized_host.encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise BadRequestError(
+            "media URL contains an invalid hostname",
+            detail={"failure_type": "invalid_media_input"},
+        ) from exc
+    if "%" in normalized_host:
+        _request_media_error("media URL contains an invalid hostname")
+    if (
+        normalized_host == "localhost"
+        or normalized_host.endswith(".localhost")
+        or normalized_host.endswith(".local")
+    ):
+        _request_media_error("media URL must target a public host")
+
+    try:
+        address = ipaddress.ip_address(normalized_host.split("%", 1)[0])
+    except ValueError:
+        address = None
+    if address is not None:
+        if not address.is_global:
+            _request_media_error("media URL must target a public IP address")
+        return
+
+    # ``inet_aton`` recognizes legacy IPv4 spellings such as single-integer,
+    # octal and component-wise hexadecimal forms.  They are rejected even when
+    # they decode to a global address because different URL stacks interpret
+    # these non-canonical literals inconsistently.
+    try:
+        socket.inet_aton(normalized_host)
+    except OSError:
+        pass
+    else:
+        _request_media_error("media URL contains a non-canonical IP address")
+
+    # Reject non-canonical numeric addresses (for example 2130706433 or
+    # 0177.0.0.1) instead of allowing URL parsers/resolvers to reinterpret
+    # them as loopback/private literals.  DNS is intentionally not resolved:
+    # the upstream provider, not this Gateway, dereferences the URL.
+    if re.fullmatch(r"[0-9.]+", normalized_host) or re.fullmatch(
+        r"0x[0-9a-f]+", normalized_host
+    ):
+        _request_media_error("media URL contains a non-canonical IP address")
+    if "." not in normalized_host:
+        _request_media_error("media URL must target a public hostname")
+
+
+def _validate_request_image_url(
+    url: Any,
+    *,
+    label: str,
+    budget: _RequestMediaBudget,
+) -> None:
+    if not isinstance(url, str) or not url or url != url.strip():
+        _request_media_error(f"{label} must be a non-empty string")
+    parsed_data = _parse_data_url(url)
+    if parsed_data is not None:
+        media_type, data = parsed_data
+        _validate_request_image_mime(media_type)
+        budget.add_base64(data, label=label)
+        return
+    if url.lower().startswith("data:"):
+        _request_media_error(f"invalid {label} data URL")
+    _validate_public_media_url(url)
+
+
+def _validate_openai_chat_media_part(
+    part: Json,
+    upstream_protocol: str,
+    budget: _RequestMediaBudget,
+) -> None:
+    part_type = str(part.get("type") or "").strip().lower()
+    if part_type == "image_url":
+        image_url = part.get("image_url")
+        if isinstance(image_url, dict):
+            image_url = image_url.get("url")
+        _validate_request_image_url(image_url, label="image_url", budget=budget)
+        return
+    if part_type == "input_audio":
+        if upstream_protocol != "openai_chat":
+            _request_media_error(
+                f"input_audio cannot be transported to {upstream_protocol}",
+                failure_type="unsupported_media_transport",
+            )
+        audio = part.get("input_audio")
+        if not isinstance(audio, dict):
+            _request_media_error("input_audio must be an object")
+        audio_format = str(audio.get("format") or "").strip().lower()
+        if audio_format not in _OPENAI_CHAT_AUDIO_FORMATS:
+            _request_media_error(
+                f"unsupported input_audio format: {audio_format or '<empty>'}"
+            )
+        budget.add_base64(audio.get("data"), label="input_audio")
+        return
+    if part_type in _REQUEST_MEDIA_TYPES:
+        _request_media_error(
+            f"unsupported OpenAI Chat media content type: {part_type}",
+            failure_type="unsupported_media_transport",
+        )
+
+
+def _validate_openai_responses_media_part(
+    part: Json,
+    upstream_protocol: str,
+    budget: _RequestMediaBudget,
+) -> None:
+    part_type = str(part.get("type") or "").strip().lower()
+    if part_type == "input_image":
+        image_url = part.get("image_url")
+        file_id = part.get("file_id")
+        if image_url not in (None, "") and file_id not in (None, ""):
+            _request_media_error("input_image must use exactly one of image_url or file_id")
+        if file_id not in (None, ""):
+            if upstream_protocol != "openai_responses":
+                _request_media_error(
+                    f"input_image.file_id cannot be transported to {upstream_protocol}",
+                    failure_type="unsupported_media_transport",
+                )
+            if (
+                not isinstance(file_id, str)
+                or file_id != file_id.strip()
+                or len(file_id) > 512
+                or any(ord(char) < 0x20 for char in file_id)
+            ):
+                _request_media_error("input_image.file_id must be a valid non-empty string")
+            return
+        _validate_request_image_url(
+            image_url,
+            label="input_image.image_url",
+            budget=budget,
+        )
+        return
+    if part_type in _REQUEST_MEDIA_TYPES:
+        _request_media_error(
+            f"unsupported OpenAI Responses media content type: {part_type}",
+            failure_type="unsupported_media_transport",
+        )
+
+
+def _validate_anthropic_media_part(
+    part: Json,
+    upstream_protocol: str,
+    budget: _RequestMediaBudget,
+) -> None:
+    part_type = str(part.get("type") or "").strip().lower()
+    if part_type == "image":
+        source = part.get("source")
+        if not isinstance(source, dict):
+            _request_media_error("Anthropic image source must be an object")
+        source_type = str(source.get("type") or "").strip().lower()
+        if source_type == "url":
+            _validate_public_media_url(source.get("url"))
+            return
+        if source_type == "base64":
+            _validate_request_image_mime(source.get("media_type"))
+            budget.add_base64(source.get("data"), label="Anthropic image")
+            return
+        _request_media_error(
+            f"unsupported Anthropic image source type: {source_type or '<empty>'}"
+        )
+    if part_type == "tool_result" and isinstance(part.get("content"), list):
+        _validate_request_content_parts(
+            part["content"],
+            source_protocol="anthropic_messages",
+            upstream_protocol=upstream_protocol,
+            budget=budget,
+        )
+        return
+    if part_type in _REQUEST_MEDIA_TYPES:
+        _request_media_error(
+            f"unsupported Anthropic media content type: {part_type}",
+            failure_type="unsupported_media_transport",
+        )
+
+
+def _validate_request_content_parts(
+    parts: Any,
+    *,
+    source_protocol: str,
+    upstream_protocol: str,
+    budget: _RequestMediaBudget,
+) -> None:
+    if not isinstance(parts, list):
+        return
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        if source_protocol == "anthropic_messages":
+            _validate_anthropic_media_part(part, upstream_protocol, budget)
+        elif source_protocol == "openai_responses":
+            _validate_openai_responses_media_part(part, upstream_protocol, budget)
+        else:
+            _validate_openai_chat_media_part(part, upstream_protocol, budget)
+
+
+def _validate_request_media(
+    body: Json,
+    downstream_path: str,
+    upstream_protocol: str,
+) -> None:
+    """Validate downstream media before any protocol passthrough/conversion.
+
+    Validation is request-local and side-effect free.  The Gateway never opens
+    a local path or fetches a media URL here, which keeps the server checkout
+    separate from every downstream user's workspace and request state.
+    """
+    budget = _RequestMediaBudget()
+    if "/messages" in downstream_path:
+        source_protocol = "anthropic_messages"
+        for message in body.get("messages") or []:
+            if isinstance(message, dict):
+                _validate_request_content_parts(
+                    message.get("content"),
+                    source_protocol=source_protocol,
+                    upstream_protocol=upstream_protocol,
+                    budget=budget,
+                )
+        return
+    if "/responses" in downstream_path:
+        source_protocol = "openai_responses"
+        raw_input = body.get("input")
+        input_items = raw_input if isinstance(raw_input, list) else []
+        for item in input_items:
+            if not isinstance(item, dict):
+                continue
+            _validate_openai_responses_media_part(item, upstream_protocol, budget)
+            _validate_request_content_parts(
+                item.get("content"),
+                source_protocol=source_protocol,
+                upstream_protocol=upstream_protocol,
+                budget=budget,
+            )
+        return
+
+    source_protocol = "openai_chat"
+    for message in body.get("messages") or []:
+        if isinstance(message, dict):
+            _validate_request_content_parts(
+                message.get("content"),
+                source_protocol=source_protocol,
+                upstream_protocol=upstream_protocol,
+                budget=budget,
+            )
 
 
 def _parse_data_url(url: str) -> tuple[str, str] | None:
@@ -1221,10 +1569,12 @@ def _strip_gateway_internal_request_fields(body: Json) -> Json:
 def _convert_request_to_upstream(downstream_path: str, body: Json, upstream_protocol: str) -> tuple[str, Json]:
     """Convert downstream request to upstream format. Returns (upstream_path, converted_body)."""
     body = _strip_gateway_internal_request_fields(body)
+    _validate_request_media(body, downstream_path, upstream_protocol)
     if upstream_protocol == "anthropic_messages":
         if "/messages" in downstream_path:
             return "/v1/messages", _strip_gateway_internal_request_fields(body)
-        converted = _openai_chat_to_anthropic_payload(body)
+        chat_body = _responses_to_chat_payload(body) if "/responses" in downstream_path else body
+        converted = _openai_chat_to_anthropic_payload(chat_body)
         return "/v1/messages", _strip_gateway_internal_request_fields(converted)
     if upstream_protocol == "openai_responses":
         if "/responses" in downstream_path:
@@ -1335,7 +1685,13 @@ def _responses_to_chat_payload(body: Json) -> Json:
                 if isinstance(content, str):
                     messages.append({"role": role, "content": content})
                 elif isinstance(content, list):
-                    messages.append({"role": role, "content": content})
+                    normalized = _normalize_content_parts(content, "openai_chat")
+                    messages.append(
+                        {
+                            "role": role,
+                            "content": _content_list_to_openai_user_content(normalized),
+                        }
+                    )
             elif _is_responses_tool_call_type(item.get("type")):
                 name = _responses_tool_call_name(item)
                 if not name:
