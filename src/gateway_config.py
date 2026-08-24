@@ -384,6 +384,19 @@ def _default_config() -> Json:
                 "supports_network": _env_bool("UPSTREAM_SUPPORTS_NETWORK", False),
                 "supports_web_search": _env_bool("UPSTREAM_SUPPORTS_WEB_SEARCH", False),
                 "supports_json_schema": _env_bool("UPSTREAM_SUPPORTS_JSON_SCHEMA", False),
+                "supports_image_recognition": _env_bool(
+                    "UPSTREAM_SUPPORTS_IMAGE_RECOGNITION", False
+                ),
+                "supports_music_recognition": _env_bool(
+                    "UPSTREAM_SUPPORTS_MUSIC_RECOGNITION", False
+                ),
+                "supports_video_recognition": _env_bool(
+                    "UPSTREAM_SUPPORTS_VIDEO_RECOGNITION", False
+                ),
+                "supports_audio_recognition": _env_bool(
+                    "UPSTREAM_SUPPORTS_AUDIO_RECOGNITION", False
+                ),
+                "supports_speech": _env_bool("UPSTREAM_SUPPORTS_SPEECH", False),
             },
             "models": [
                 {
@@ -397,6 +410,21 @@ def _default_config() -> Json:
                         "supports_network": _env_bool("UPSTREAM_SUPPORTS_NETWORK", False),
                         "supports_web_search": _env_bool("UPSTREAM_SUPPORTS_WEB_SEARCH", False),
                         "supports_json_schema": _env_bool("UPSTREAM_SUPPORTS_JSON_SCHEMA", False),
+                        "supports_image_recognition": _env_bool(
+                            "UPSTREAM_SUPPORTS_IMAGE_RECOGNITION", False
+                        ),
+                        "supports_music_recognition": _env_bool(
+                            "UPSTREAM_SUPPORTS_MUSIC_RECOGNITION", False
+                        ),
+                        "supports_video_recognition": _env_bool(
+                            "UPSTREAM_SUPPORTS_VIDEO_RECOGNITION", False
+                        ),
+                        "supports_audio_recognition": _env_bool(
+                            "UPSTREAM_SUPPORTS_AUDIO_RECOGNITION", False
+                        ),
+                        "supports_speech": _env_bool(
+                            "UPSTREAM_SUPPORTS_SPEECH", False
+                        ),
                     },
                 }
             ],

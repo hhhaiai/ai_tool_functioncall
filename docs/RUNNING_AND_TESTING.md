@@ -151,11 +151,21 @@ curl http://127.0.0.1:8885/healthz
       "supports_vision": false,
       "supports_network": false,
       "supports_web_search": false,
-      "supports_json_schema": true
-    }
+      "supports_json_schema": false,
+      "supports_image_recognition": false,
+      "supports_music_recognition": false,
+      "supports_video_recognition": false,
+      "supports_audio_recognition": false,
+      "supports_speech": false
+    },
+    "models": [
+      {
+        "name": "mimo-v2.5-pro",
+        "capability_overrides": {}
+      }
+    ]
   },
   "gateway": {
-    "workspace_root": "./workspace",
     "tool_mode": "orchestrate",
     "allow_write_tools": false,
     "allow_shell_tools": false,
@@ -230,11 +240,13 @@ curl http://127.0.0.1:8885/healthz
 | `upstream.protocol` | openai_chat | 上游协议类型 |
 | `upstream.max_input_tokens` / `max_output_tokens` | 1048576 / 131072（Mimo 模板） | 上游上下文/输出预算声明；客户端片段按 1M 同步 |
 | `upstream.tools_enabled` | adapter（默认） | 默认按上游不支持 tool calls/function calls 处理，走 Gateway Agent Planner adapter；`auto` / `native` 只用于显式兼容实验，不作为默认路径 |
+| `upstream.models` | 默认单模型 | profile 内的 per-model 列表；`capability_overrides` 只保存相对 profile 默认能力的 sparse override，路由时再计算 effective capabilities |
 | `upstream.paths.models` | `/v1/models` | Admin UI 模型自动获取和 `/v1/models` 转发使用的上游路径 |
 | `upstream.capabilities.supports_tools` / `supports_function_calls` | false（Mimo 模板） | 上游是否原生支持当前客户端所需 tools/function calls；Mimo `/v1/messages` forced probe 可返回 `tool_use`，但 `/v1/responses` function_call 未证实，Claude Code/Codex 默认由 Gateway adapter 转成下游原生工具请求 |
 | `upstream.capabilities.supports_vision` | false | 上游是否支持图片/截图/识图输入；在 Admin UI 明确展示和保存 |
 | `upstream.capabilities.supports_network` | false | 上游模型是否具备联网能力；在 Admin UI 明确展示和保存 |
 | `upstream.capabilities.supports_web_search` | false | 上游模型是否支持 web search；在 Admin UI 明确展示和保存 |
+| `upstream.capabilities.supports_*_recognition` / `supports_speech` | false | image/music/video/audio/speech 能力的 profile 默认值；可由 `upstream.models[].capability_overrides` 对单个模型覆盖 |
 | `gateway.workspace_root` | 空（默认）/ 显式配置 root | 工具读写的兜底根目录；当前请求的显式 `workspace_root` / `gateway_workspace` 优先，其次自动识别 Claude Code / Codex 下游项目目录，再其次是 `GATEWAY_WORKSPACE_ROOT`、显式保存配置 root；默认不会回退 Gateway 服务启动目录，缺失 workspace 时使用匿名隔离空间 |
 | `gateway.tool_mode` | orchestrate | 工具模式：`orchestrate` / `native_passthrough` / `proxy`；兼容旧值 `passthrough` |
 | `gateway.allow_write_tools` | false | 是否允许文件写入 |
@@ -265,7 +277,52 @@ curl http://127.0.0.1:8885/healthz
 - 所有正常 HTTP 响应带 `x-request-id`；请求、工具和上游 span 使用同一个请求上下文 ID。
 - 不把 prompt、工具参数、原始 URL、tenant/user、API key 或任意 MCP 名称写入指标标签。
 
-### 3.4 环境变量对照表
+### 3.4 服务端 workspace 与多用户并发边界
+
+- Gateway checkout/WorkingDirectory 只是服务部署代码，绝不是任一用户的 workspace；共享部署不要持久化相对 `gateway.workspace_root`。
+- workspace、client id、tenant/session、prompt、media body、response 和 API credential 都是 request-local；缺少可信 workspace 时使用按请求/客户端隔离的 anonymous workspace，不回退服务进程 cwd。
+- Read/Write/Bash/Skill/GUI/local-agent 以及本地媒体 `path` 默认下发到用户客户端执行；Gateway 只执行服务侧 HTTP Action/MCP/纯函数工具以及 URL/data/base64 recognition。
+- process-wide ModelRouter 只保留加锁的 route health、active request count、latency、unhealthy deadline 和 round-robin cursor，不保留请求内容。
+
+### 3.5 多 profile / per-model 能力示例
+
+```json
+{
+  "active_upstream_id": "primary",
+  "upstream_profiles": [
+    {
+      "id": "primary",
+      "name": "primary",
+      "base_url": "https://provider.example/v1",
+      "api_key": "<YOUR_UPSTREAM_API_KEY>",
+      "model": "text-model",
+      "protocol": "openai_chat",
+      "tools_enabled": "adapter",
+      "capabilities": {
+        "supports_streaming": true,
+        "supports_tools": false,
+        "supports_function_calls": false,
+        "supports_vision": false,
+        "supports_image_recognition": false
+      },
+      "models": [
+        {"name": "text-model", "capability_overrides": {}},
+        {
+          "name": "vision-model",
+          "capability_overrides": {
+            "supports_vision": true,
+            "supports_image_recognition": true
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+同一请求要求多个能力时，必须由同一个 model 同时满足完整能力组合；不会把 `supports_tools` 和 `supports_function_calls` 分别拼到两台模型。`capability_overrides` 未出现的字段始终继承 profile 当前值，因此 profile 能力撤销不会被旧的 materialized model 值“粘住”。Config Center 的 model matrix 和 `POST /api/config/model-capability` 使用 revision/CAS 修改单个 override。
+
+### 3.6 环境变量对照表
 
 | 环境变量 | 配置路径 | 说明 |
 |----------|----------|------|
@@ -275,6 +332,7 @@ curl http://127.0.0.1:8885/healthz
 | `UPSTREAM_MAX_INPUT_TOKENS` / `UPSTREAM_MAX_OUTPUT_TOKENS` | upstream token limits | Mimo 模板为 `1048576` / `131072` |
 | `GATEWAY_TOOLS_ENABLED` | upstream.tools_enabled | Mimo 跨 Claude Code/Codex 稳定接入时设为 `adapter` |
 | `UPSTREAM_SUPPORTS_TOOLS` / `UPSTREAM_SUPPORTS_FUNCTION_CALLS` | upstream.capabilities | Mimo Messages `tool_use` 仅部分证实；Codex Responses function_call 未证实，默认均设为 `0` |
+| `UPSTREAM_SUPPORTS_{IMAGE,MUSIC,VIDEO,AUDIO}_RECOGNITION` / `UPSTREAM_SUPPORTS_SPEECH` | upstream.capabilities | 五个 recognition/speech profile 默认能力；默认均为 `0`，也可在 per-model `capability_overrides` 中开启 |
 | `GATEWAY_EXECUTE_USER_SIDE_TOOLS` | gateway.execute_user_side_tools_in_gateway | 默认 `0`；只有本地代理式部署且确认 Gateway 与用户客户端同机/同 workspace 时才可开启 |
 | `GATEWAY_UPSTREAM_PROTOCOL` | upstream.protocol | 上游协议类型，优先于 legacy `UPSTREAM_PROTOCOL` |
 | `UPSTREAM_PROTOCOL` | upstream.protocol | 兼容旧环境变量，未设置 `GATEWAY_UPSTREAM_PROTOCOL` 时生效 |
@@ -288,6 +346,7 @@ curl http://127.0.0.1:8885/healthz
 | `GATEWAY_SQLITE_LOG_PATH` | gateway.sqlite_log_path | SQLite 请求/工具/记忆日志路径 |
 | `GATEWAY_MAX_TOOL_ROUNDS` | gateway.max_tool_rounds | 最大工具调用轮数；设置后优先于配置文件/Admin UI 保存值 |
 | `GATEWAY_MAX_REQUEST_BODY_BYTES` | gateway.max_request_body_bytes | POST 请求体读取前字节上限，默认 64MB，超限返回 413 |
+| `GATEWAY_MAX_MEDIA_INPUT_BYTES` | request-local media budget | 单请求累计解码媒体上限，默认 20MiB；直接媒体和 recognition 本地输入在分配/读取前校验 |
 | `GATEWAY_MAX_LOG_PAYLOAD_CHARS` | gateway.max_log_payload_chars | 单个 request/response 日志 payload 与 tool failure 内容字符上限，默认 200000 |
 | `GATEWAY_TEXT_TOOL_ADAPTER_COMPACT_TOKEN_LIMIT` | gateway.text_tool_adapter_compact_token_limit | 文本工具适配前的压缩阈值上限，默认 48000；实际阈值动态计算；设为 0 可关闭 |
 | `GATEWAY_CONTEXT_MAX_INPUT_TOKENS` | context.max_input_tokens | Mimo 1M 模板为 `1048576` |
@@ -573,6 +632,12 @@ curl -fsS http://127.0.0.1:8885/v1/tools/call \
   -H 'Content-Type: application/json' \
   -d '{"tool":"calc","arguments":{"expr":"2+2"}}'
 
+# Gateway-owned URL/data/base64 识图；会选择声明 supports_image_recognition 的 model
+curl -fsS http://127.0.0.1:8885/v1/tools/call \
+  -H 'Authorization: Bearer <your-gateway-key>' \
+  -H 'Content-Type: application/json' \
+  -d '{"tool":"recognize_image","arguments":{"url":"https://cdn.example/image.png","question":"描述图片重点"}}'
+
 # Claude Code 走 Gateway /anthropic，不直连 Mimo
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8885/anthropic
 export ANTHROPIC_AUTH_TOKEN=<your-gateway-key>
@@ -581,6 +646,16 @@ export ANTHROPIC_AUTH_TOKEN=<your-gateway-key>
 export OPENAI_BASE_URL=http://127.0.0.1:8885/v1
 export OPENAI_API_KEY=<your-gateway-key>
 ```
+
+recognition transport 是 fail-closed，不会把音频/视频伪装成图片：
+
+| 工具 | 媒体输入 | 实际支持的 upstream transport | 不支持语义 |
+|---|---|---|---|
+| `recognize_image` | public HTTP(S) URL，或受限 data/base64 | OpenAI Chat / Responses / Anthropic image block | 无合法 route 返回 `no_capability` / `no_healthy_route` |
+| `recognize_music` | 受限 MP3/WAV base64；本地 `path` 必须由下游客户端处理 | OpenAI Chat `input_audio` | URL、其他 MIME 或其他协议在发网前返回 `unsupported_media_transport` |
+| `recognize_video` | 仅完成有界输入校验 | 当前没有标准 adapter | 在发网前返回 `unsupported_media_transport` |
+
+媒体 data/base64 采用严格 base64 校验、MIME allowlist 和 request-local 累计解码上限（`GATEWAY_MAX_MEDIA_INPUT_BYTES`，默认 20MiB）。媒体 URL 只接受无 credentials 的 public HTTP(S) literal target；Gateway 不做本机 DNS 解引来替代真正解引 URL 的 Provider。
 
 已复验/回归覆盖：
 
@@ -917,4 +992,4 @@ ai_tool_functioncall/
 
 ---
 
-**最后更新**: 2026-07-29
+**最后更新**: 2026-08-25

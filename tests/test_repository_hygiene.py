@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import glob
+import json
 import re
 import shlex
 from pathlib import Path
@@ -88,6 +89,34 @@ def test_markdown_fences_are_balanced() -> None:
             unbalanced.append(str(markdown_file.relative_to(ROOT)))
 
     assert not unbalanced, "unbalanced Markdown code fences: " + ", ".join(unbalanced)
+
+
+def test_running_guide_complete_config_example_is_valid_and_server_safe() -> None:
+    guide = (ROOT / "docs" / "RUNNING_AND_TESTING.md").read_text(encoding="utf-8")
+    section = guide.split("### 3.2 ", maxsplit=1)[1].split("### 3.3 ", maxsplit=1)[0]
+    match = re.search(r"```json\n(?P<payload>.*?)\n```", section, flags=re.DOTALL)
+
+    assert match is not None
+    payload = json.loads(match.group("payload"))
+    assert "workspace_root" not in payload["gateway"]
+    assert set(payload["upstream"]["capabilities"]) == {
+        "supports_tools",
+        "supports_function_calls",
+        "supports_parallel_tool_calls",
+        "supports_web_search",
+        "supports_image_recognition",
+        "supports_music_recognition",
+        "supports_video_recognition",
+        "supports_audio_recognition",
+        "supports_speech",
+        "supports_streaming",
+        "supports_json_schema",
+        "supports_network",
+        "supports_vision",
+    }
+    assert payload["upstream"]["models"] == [
+        {"name": payload["upstream"]["model"], "capability_overrides": {}}
+    ]
 
 
 def test_all_project_docs_are_reachable_from_the_docs_index() -> None:

@@ -99,6 +99,9 @@ class SyncActiveUpstreamTests(unittest.TestCase):
         root = Path(__file__).resolve().parent.parent
         runtime = gateway._default_config()
         template = json.loads((root / "gateway.config.json").read_text(encoding="utf-8"))
+        yaml_template = yaml.safe_load(
+            (root / "gateway.config.yaml").read_text(encoding="utf-8")
+        )
         self.assertEqual(runtime["upstream"]["max_input_tokens"], template["upstream"]["max_input_tokens"])
         self.assertEqual(runtime["upstream"]["max_output_tokens"], template["upstream"]["max_output_tokens"])
         self.assertEqual(runtime["upstream"]["max_response_bytes"], template["upstream"]["max_response_bytes"])
@@ -127,6 +130,53 @@ class SyncActiveUpstreamTests(unittest.TestCase):
         self.assertEqual(runtime["maintenance"], template["maintenance"])
         self.assertEqual(runtime["context"]["max_input_tokens"], template["context"]["max_input_tokens"])
         self.assertEqual(runtime["context"]["fanout_chunk_tokens"], template["context"]["fanout_chunk_tokens"])
+        capability_keys = set(gateway.MODEL_CAPABILITY_KEYS)
+        self.assertEqual(set(runtime["upstream"]["capabilities"]), capability_keys)
+        self.assertEqual(set(template["upstream"]["capabilities"]), capability_keys)
+        self.assertEqual(set(yaml_template["upstream"]["capabilities"]), capability_keys)
+        self.assertEqual(
+            runtime["upstream"]["capabilities"],
+            template["upstream"]["capabilities"],
+        )
+        self.assertEqual(
+            runtime["upstream"]["capabilities"],
+            yaml_template["upstream"]["capabilities"],
+        )
+        self.assertEqual(
+            template["upstream"]["models"],
+            [{"name": template["upstream"]["model"], "capability_overrides": {}}],
+        )
+        self.assertEqual(
+            yaml_template["upstream"]["models"],
+            [{"name": yaml_template["upstream"]["model"], "capability_overrides": {}}],
+        )
+        env_example = (root / ".env.example").read_text(encoding="utf-8")
+        capability_env_defaults = {
+            "UPSTREAM_SUPPORTS_STREAMING": "1",
+            "UPSTREAM_SUPPORTS_TOOLS": "0",
+            "UPSTREAM_SUPPORTS_FUNCTION_CALLS": "0",
+            "UPSTREAM_SUPPORTS_PARALLEL_TOOL_CALLS": "0",
+            "UPSTREAM_SUPPORTS_JSON_SCHEMA": "0",
+            "UPSTREAM_SUPPORTS_NETWORK": "0",
+            "UPSTREAM_SUPPORTS_WEB_SEARCH": "0",
+            "UPSTREAM_SUPPORTS_VISION": "0",
+            "UPSTREAM_SUPPORTS_IMAGE_RECOGNITION": "0",
+            "UPSTREAM_SUPPORTS_MUSIC_RECOGNITION": "0",
+            "UPSTREAM_SUPPORTS_VIDEO_RECOGNITION": "0",
+            "UPSTREAM_SUPPORTS_AUDIO_RECOGNITION": "0",
+            "UPSTREAM_SUPPORTS_SPEECH": "0",
+        }
+        for name, value in capability_env_defaults.items():
+            self.assertIn(f"{name}={value}", env_example)
+        self.assertIn("GATEWAY_MAX_MEDIA_INPUT_BYTES=20971520", env_example)
+        for filename in ("docker-compose.yml", "docker-compose.prod.yml"):
+            compose = (root / filename).read_text(encoding="utf-8")
+            for name, value in capability_env_defaults.items():
+                self.assertIn(f"{name}=${{{name}:-{value}}}", compose)
+            self.assertIn(
+                "GATEWAY_MAX_MEDIA_INPUT_BYTES=${GATEWAY_MAX_MEDIA_INPUT_BYTES:-20971520}",
+                compose,
+            )
 
         for filename in ("docker-compose.yml", "docker-compose.prod.yml"):
             compose = (root / filename).read_text(encoding="utf-8")
@@ -169,6 +219,29 @@ class SyncActiveUpstreamTests(unittest.TestCase):
             self.assertIn("GATEWAY_RUNTIME_CLEANUP_DRY_RUN=${GATEWAY_RUNTIME_CLEANUP_DRY_RUN:-1}", compose)
             self.assertIn("GATEWAY_CONTEXT_MAX_INPUT_TOKENS=${GATEWAY_CONTEXT_MAX_INPUT_TOKENS:-1048576}", compose)
             self.assertIn("GATEWAY_CONTEXT_FANOUT_CHUNK_TOKENS=${GATEWAY_CONTEXT_FANOUT_CHUNK_TOKENS:-120000}", compose)
+
+    def test_recognition_capability_environment_defaults_reach_profile_and_model(self):
+        env = {
+            "UPSTREAM_SUPPORTS_IMAGE_RECOGNITION": "1",
+            "UPSTREAM_SUPPORTS_MUSIC_RECOGNITION": "1",
+            "UPSTREAM_SUPPORTS_VIDEO_RECOGNITION": "1",
+            "UPSTREAM_SUPPORTS_AUDIO_RECOGNITION": "1",
+            "UPSTREAM_SUPPORTS_SPEECH": "1",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            upstream = gateway._default_config()["upstream"]
+
+        expected = {
+            "supports_image_recognition",
+            "supports_music_recognition",
+            "supports_video_recognition",
+            "supports_audio_recognition",
+            "supports_speech",
+        }
+        self.assertTrue(all(upstream["capabilities"][key] for key in expected))
+        self.assertTrue(
+            all(upstream["models"][0]["capabilities"][key] for key in expected)
+        )
 
     def test_agent_planner_full_gate_removes_mode_override_before_full_pytest(self):
         root = Path(__file__).resolve().parent.parent

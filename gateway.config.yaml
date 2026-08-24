@@ -54,7 +54,18 @@ upstream:
     supports_parallel_tool_calls: false
     supports_vision: false
     supports_network: false
-    supports_json_schema: true
+    supports_web_search: false
+    supports_json_schema: false
+    supports_image_recognition: false
+    supports_music_recognition: false
+    supports_video_recognition: false
+    supports_audio_recognition: false
+    supports_speech: false
+
+  # model 级只保存 sparse override；空对象表示继承上方 profile 能力。
+  models:
+    - name: "mimo-v2.5-pro"
+      capability_overrides: {}
 
 # ----------------------------------------------------------------------------
 # Gateway 核心配置

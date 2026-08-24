@@ -35,8 +35,19 @@
       "supports_vision": false,
       "supports_network": false,
       "supports_web_search": false,
-      "supports_json_schema": false
+      "supports_json_schema": false,
+      "supports_image_recognition": false,
+      "supports_music_recognition": false,
+      "supports_video_recognition": false,
+      "supports_audio_recognition": false,
+      "supports_speech": false
     },
+    "models": [
+      {
+        "name": "mimo-v2.5-pro",
+        "capability_overrides": {}
+      }
+    ],
     "native_tools_verified": false,
     "use_for_coding": true,
     "id": "mimo-chat-only-8885",
